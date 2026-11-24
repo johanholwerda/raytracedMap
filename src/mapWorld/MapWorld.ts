@@ -563,12 +563,25 @@ export default class MapWorld {
     this.dirty = true;
   }
 
-  /** viewDistanceMax to the far plane (beyond it all is fog), the ground quad and the tile streaming. */
+  /** viewDistanceMax to the far plane (see updateFarPlane), the ground quad and the tile streaming. */
   private applyViewDistanceMax(): void {
     const distance = this.viewDistanceMax.value;
-    this.camera.projection.far = distance;
+    this.updateFarPlane();
     this.geometry.setViewDistanceMax(distance);
     this.tileStreamer.setViewDistanceMax(distance);
+  }
+
+  /**
+   * The far plane at the 3d distance of the ground at viewDistanceMax in xz, from the camera height. The fog is of the
+   * horizontal distance (see getFog in deferredShading.wgsl): a fixed far plane at viewDistanceMax would clip the ground
+   * before the fog hides it when the camera is up high, one with room for the highest camera would draw past the fog
+   * when it is low. Every frame, after the camera moves: the readers of the depth take depthParams from the camera of
+   * the frame, the histories hold camera distances, not depths.
+   */
+  private updateFarPlane(): void {
+    const distance = this.viewDistanceMax.value;
+    const height = Math.max(this.camera.worldPosition.y, 0);
+    this.camera.projection.far = Math.sqrt(distance * distance + height * height);
   }
 
   /** The sun angles of the timeOfDay param at the latitude of the projection center, see timeOfDaySunAngles. */
@@ -625,6 +638,7 @@ export default class MapWorld {
       // eases out the bank left over from airplane mode
       this.airplane.settle();
     }
+    this.updateFarPlane();
 
     // the tiles whose building shadows fall into the view load too
     this.tileStreamer.setSunDirection(this.sun.lightDir);

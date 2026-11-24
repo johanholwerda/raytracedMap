@@ -232,6 +232,9 @@ fn isHidden(position : vec4<f32>, d : f32) -> bool {
 
 // The distance fog: exponential (distanceFog per world unit), with a smoothstep from .7 of viewDistanceMax that takes
 // it to 1 at viewDistanceMax, where the loaded map ends (see MapWorld.viewDistanceMax). 0 (not set): only the exp.
+// d is the horizontal (xz) distance to the camera, not the 3d one: the map is loaded in a radius around the camera in
+// xz, and a camera that goes up and looks down gets no more fog (the far plane reaches past it, see
+// MapWorld.applyViewDistanceMax).
 // The same in deferredShading.wgsl, cars.wgsl, reprojectedSSAOComposite.wgsl and mapOSM/shading.wgsl.
 fn getFog(d : f32) -> f32 {
   let end = select(1., 1. - smoothstep(.7 * uniforms.viewDistanceMax, uniforms.viewDistanceMax, d), uniforms.viewDistanceMax > 0.);
@@ -364,7 +367,7 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
   // the fog keeps its light. ground * keep mixed with the fog = image * keep + fog * backgroundColor * (1 - keep), the
   // premultiplied blend of this color and alpha
   let keep = sqrt(select(1., left / lit, lit > 0.));
-  let fog = getFog(d);
+  let fog = getFog(distance(input.world.xz, uniforms.cameraPosition.xz));
   return vec4(fog * uniforms.backgroundColor * (1. - keep), 1. - keep);
 }
 
@@ -486,7 +489,7 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
   var c = albedo * (sunColor * (nDotL * shadow) + skyColor * sky);
   // the windows reflect the sky a little
   c += input.glass * .12 * skyColor * sky;
-  return vec4(finish(c, d), 1.0);
+  return vec4(finish(c, distance(input.world.xz, uniforms.cameraPosition.xz)), 1.0);
 }
 
 #endif

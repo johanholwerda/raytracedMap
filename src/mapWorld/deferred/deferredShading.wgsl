@@ -426,6 +426,9 @@ fn getHalfResReflection(coord : vec2<u32>, rd : vec3<f32>) -> f32 {
 
 // The distance fog: exponential (distanceFog per world unit), with a smoothstep from .7 of viewDistanceMax that takes
 // it to 1 at viewDistanceMax, where the loaded map ends (see MapWorld.viewDistanceMax). 0 (not set): only the exp.
+// d is the horizontal (xz) distance to the camera, not the 3d one: the map is loaded in a radius around the camera in
+// xz, and a camera that goes up and looks down gets no more fog (the far plane reaches past it, see
+// MapWorld.applyViewDistanceMax).
 // The same in deferredShading.wgsl, cars.wgsl, reprojectedSSAOComposite.wgsl and mapOSM/shading.wgsl.
 fn getFog(d : f32) -> f32 {
   let end = select(1., 1. - smoothstep(.7 * uniforms.viewDistanceMax, uniforms.viewDistanceMax, d), uniforms.viewDistanceMax > 0.);
@@ -468,13 +471,15 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
   let albedoSample = materialPalette[materialIndex].rgb;
   let uv = (vec2<f32>(coord) + .5) / uniforms.resolution;
   let d = getGBufferDistance(textureLoad(gBufferDepth, coord, 0), uv, uniforms.inverseProjection, uniforms.depthParams);
+  let world = depthToPosition(d, uv * 2. - 1.);
+  // the fog is of the horizontal distance, see getFog
+  let fog = getFog(distance(world.xz, uniforms.cameraPosition.xz));
   // all fog (beyond viewDistanceMax): the background color, which the full shading ends on too (the contrast is before
   // the fog). Skips the lightmap lookup, the shadows and the reflections. Not in the debug views
-  if (SHADOW_VIEW == 0u && LIGHTMAP_VIEW == 0u && getFog(d) >= 1.) {
+  if (SHADOW_VIEW == 0u && LIGHTMAP_VIEW == 0u && fog >= 1.) {
     let fogged = uniforms.backgroundColor;
     return vec4<f32>(select(fogged, mix(fogged, vec3<f32>(0.9, 0.1, 0.1), 0.6), isGBufferSelected(g)), 1.0);
   }
-  let world = depthToPosition(d, uv * 2. - 1.);
   let n = getGBufferNormal(g);
   let l = uniforms.lightDirection.xyz;
   let nDotL = max(dot(n, l), 0.0);
@@ -579,7 +584,7 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
   c = sqrt(c);
   // the contrast before the fog: the fog ends on the background color of the sky (getSky), without a seam
   c = mix(c, smoothstep(vec3<f32>(0.), vec3<f32>(1.), c), uniforms.contrast);
-  c = mix(c, uniforms.backgroundColor, getFog(d));
+  c = mix(c, uniforms.backgroundColor, fog);
 
 /*  let h = hash22ff(input.position.xy);
   c += (h.y + h.z - 1.) / 255.;
