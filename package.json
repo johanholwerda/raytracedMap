@@ -1,0 +1,24 @@
+{
+  "name": "raytraced-map",
+  "version": "1.0.0",
+  "description": "Worldwide OpenStreetMap city renderer with a raytraced sky visibility lightmap, built on a lightweight WebGPU framework",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host",
+    "build": "vite build",
+    "preview": "vite preview --host",
+    "typecheck": "tsc --project tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@webgpu/types": "^0.1.67",
+    "typescript": "^5.3.3",
+    "vite": "^6.0.7",
+    "vite-plugin-mkcert": "^1.17.6"
+  },
+  "dependencies": {
+    "@mapbox/vector-tile": "^3.0.0",
+    "earcut": "^3.2.3",
+    "pbf": "^5.1.0"
+  }
+}
