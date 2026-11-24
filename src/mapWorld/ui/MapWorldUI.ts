@@ -46,12 +46,15 @@ export default class MapWorldUI {
   private static readonly LOCATION_TITLE_MS = 4000;
   private locationTitleEl?: HTMLDivElement;
   private locationTitleTimer?: number;
-  // touch screens, while flying: centered above the button bar
+  // touch screens: centered above the button bar. Steers the plane while flying, else rotates the camera
   private joystick?: Joystick;
+  private static readonly CONTROLS_HINT_MS = 8000;
+  private controlsHintEl?: HTMLDivElement;
 
   constructor(private parent: HTMLElement, private callbacks: MapWorldUICallbacks) {
     this.buttonBar = this.createButtonBar();
     this.attributionEl = this.createAttribution();
+    if (Joystick.wanted) this.joystick = new Joystick(this.parent, 'mwui-joystick');
   }
 
   /**
@@ -70,6 +73,7 @@ export default class MapWorldUI {
       .mwui-input { width: 220px; padding: 12px 14px; font-size: 15px; }
       .mwui-list { width: max-content; max-width: min(420px, calc(100vw - 32px)); }
       .mwui-joystick { position: absolute; left: 50%; margin-left: -60px; bottom: 120px; z-index: 499; }
+      .mwui-hint { bottom: 120px; }
       .mwui-attribution { font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: calc(100% - 16px); }
       @media (max-width: 600px) {
         .mwui-bar { left: 8px; right: 8px; bottom: calc(28px + env(safe-area-inset-bottom, 0px)); transform: none; gap: 6px; }
@@ -78,6 +82,7 @@ export default class MapWorldUI {
         .mwui-input { width: 100%; min-width: 0; padding: 9px 10px; font-size: 16px; }
         .mwui-list { width: auto; max-width: none; right: 0; }
         .mwui-joystick { bottom: calc(84px + env(safe-area-inset-bottom, 0px)); }
+        .mwui-hint { bottom: calc(84px + env(safe-area-inset-bottom, 0px)); }
         .mwui-attribution { font-size: 9px; }
       }
     `;
@@ -95,7 +100,6 @@ export default class MapWorldUI {
     const airplane = this.createButton(bar, 'Fly', () => {
       const flying = this.callbacks.onToggleAirplane();
       airplane.textContent = flying ? 'Orbit' : 'Fly';
-      this.setJoystick(flying);
       // the arrow keys and space would otherwise act on the focused button
       airplane.blur();
     });
@@ -311,18 +315,9 @@ export default class MapWorldUI {
     if (this.joystick) this.joystick.element.style.display = visible ? '' : 'none';
   }
 
-  /** The flight input of the joystick (x right, y up = climb), undefined without one. */
+  /** The joystick (x right, y up), undefined without one: a mouse has WASD and the arrows. */
   public get joystickValue(): { x: number; y: number } | undefined {
     return this.joystick?.value;
-  }
-
-  // a mouse has WASD and the arrows
-  private setJoystick(flying: boolean): void {
-    if (flying && !this.joystick && Joystick.wanted) this.joystick = new Joystick(this.parent, 'mwui-joystick');
-    else if (!flying && this.joystick) {
-      this.joystick.destruct();
-      this.joystick = undefined;
-    }
   }
 
   /** Open the 2D (Leaflet) location picker, unrestricted: the whole world. */
@@ -462,6 +457,43 @@ export default class MapWorldUI {
     }, MapWorldUI.LOCATION_TITLE_MS);
   }
 
+  // --- controls hint (above the button bar) ------------------------------------
+
+  /** How to rotate and fly, for CONTROLS_HINT_MS after the start. Desktop only: a touch screen has the joystick. */
+  public showControlsHint(): void {
+    if (Joystick.wanted || this.controlsHintEl) return;
+    const el = document.createElement('div');
+    el.className = 'mwui-hint';
+    el.textContent = 'Ctrl + drag or WASD to rotate';
+    Object.assign(el.style, {
+      position: 'absolute',
+      left: '50%',
+      transform: 'translateX(-50%)',
+      zIndex: '500',
+      maxWidth: 'calc(100% - 32px)',
+      textAlign: 'center',
+      fontFamily: 'system-ui, sans-serif',
+      fontSize: '15px',
+      fontWeight: '500',
+      color: '#fff',
+      background: 'rgba(0,0,0,0.45)',
+      padding: '8px 18px',
+      borderRadius: '8px',
+      textShadow: '0 1px 3px rgba(0,0,0,0.6)',
+      pointerEvents: 'none',
+      opacity: '0',
+      transition: 'opacity 0.4s ease',
+    } as CSSStyleDeclaration);
+    this.parent.appendChild(el);
+    this.controlsHintEl = el;
+    requestAnimationFrame(() => { el.style.opacity = '1'; });
+    window.setTimeout(() => {
+      el.style.opacity = '0';
+      setTimeout(() => el.remove(), 400);
+      if (this.controlsHintEl === el) this.controlsHintEl = undefined;
+    }, MapWorldUI.CONTROLS_HINT_MS);
+  }
+
   private hideLocationTitle(): void {
     clearTimeout(this.locationTitleTimer);
     this.locationTitleEl?.remove();
@@ -470,7 +502,8 @@ export default class MapWorldUI {
 
   destruct(): void {
     this.hideLocationTitle();
-    this.setJoystick(false);
+    this.controlsHintEl?.remove();
+    this.joystick?.destruct();
     this.selector?.hide();
     this.tileErrorContainer?.remove();
     this.attributionEl.remove();

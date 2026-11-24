@@ -32,7 +32,7 @@ export default class AirplaneController {
   public turnSpeed = 0.7;
   public maxRoll = 0.45;
   // the look down angle (negative), level flight and while climbing / descending
-  private readonly cruisePitch = -0.45;
+  public cruisePitch = -0.45;
   private readonly pitchRange = 0.12;
   // seconds to reach full speed after entering, so the view doesn't lurch forward
   private readonly accelerationTime = 1.5;
@@ -55,6 +55,11 @@ export default class AirplaneController {
   private climb = 0;
   private turn = 0;
   private keys = new Set<string>();
+  // dragging: the look up / down added to the cruise pitch (the turn goes into the yaw)
+  private lookPitch = 0;
+  // the pitch limits with the look: below -0.1 the view ray has to hit the ground (the pivot)
+  private readonly pitchMin = -1.4;
+  private readonly pitchMax = -0.1;
   private listeners?: AbortController;
 
   constructor(private renderer: Renderer, private camera: MapCamera) {
@@ -87,6 +92,7 @@ export default class AirplaneController {
     this.throttle = 0;
     this.climb = 0;
     this.turn = 0;
+    this.lookPitch = 0;
 
     this.listeners = new AbortController();
     const signal = this.listeners.signal;
@@ -98,6 +104,23 @@ export default class AirplaneController {
     }, { signal });
     window.addEventListener('keyup', (e) => this.keys.delete(e.code), { signal });
     window.addEventListener('blur', () => this.keys.clear(), { signal });
+  }
+
+  /**
+   * Puts the flying plane somewhere, level and at full speed: x, z and height in world units, yaw in radians (0 flies
+   * north, positive turns left). For the video mode of MapWorld, which starts every shot in flight.
+   */
+  public place(x: number, z: number, height: number, yaw: number): void {
+    this.x = x;
+    this.z = z;
+    this.height = height;
+    this.yaw = yaw;
+    this.pitch = this.cruisePitch;
+    this.roll = 0;
+    this.throttle = 1;
+    this.climb = 0;
+    this.turn = 0;
+    this.lookPitch = 0;
   }
 
   /** Back to orbiting the ground point the plane looked at, from the same camera pose. */
@@ -162,8 +185,9 @@ export default class AirplaneController {
     // bank right is a negative roll (clockwise), and turns right: a negative yaw
     this.roll = lerp(this.roll, -this.turn * this.maxRoll, ease);
     this.yaw += this.roll / this.maxRoll * this.turnSpeed * dt;
+    this.dragLook();
     // the nose up while climbing
-    this.pitch = lerp(this.pitch, this.cruisePitch + climb * this.pitchRange, ease);
+    this.pitch = clamp(lerp(this.pitch, this.cruisePitch + this.lookPitch + climb * this.pitchRange, ease), this.pitchMin, this.pitchMax);
 
     this.throttle = Math.min(this.throttle + dt / this.accelerationTime, 1);
     // smoothstep: no sudden start
@@ -183,6 +207,26 @@ export default class AirplaneController {
 
     this.camera.projection.aspectRatio = this.renderer.aspectRatio;
     this.camera.checkChanged();
+  }
+
+  /**
+   * A drag (no Ctrl needed while flying) turns the plane and looks up / down, like Ctrl + drag rotates the orbit camera (StreetviewRotationController):
+   * the drag turns the yaw directly, the look goes into lookPitch, which the pitch keeps.
+   */
+  private dragLook(): void {
+    const mouse = this.renderer.mouseListener;
+    if (!mouse.mouseDown) return;
+    const v = mouse.normalizedVelocity;
+    const fov = this.camera.projection.FOV;
+    const fovH = Math.atan2(this.renderer.aspectRatio * 0.5, 0.5 / Math.tan(fov * 0.5)) * 2;
+    // the orbit camera's speed multiplier and inverted mouse
+    const yaw = -3 * v.x * fovH;
+    const pitch = -3 * v.y * fov;
+    this.yaw += yaw;
+    // the look within the pitch limits (around the cruise pitch, without the climb)
+    const look = clamp(this.lookPitch + pitch, this.pitchMin - this.cruisePitch + this.pitchRange, this.pitchMax - this.cruisePitch - this.pitchRange);
+    this.pitch += look - this.lookPitch;
+    this.lookPitch = look;
   }
 
   private isFlightKey(code: string): boolean {

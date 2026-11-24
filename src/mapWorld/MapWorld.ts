@@ -30,6 +30,7 @@ import TiltShift from './tiltShift/TiltShift';
 import SkyVisibilityLightmap, { LightmapView } from './skyVisibilityLightmap/SkyVisibilityLightmap';
 import type { LightmapBlur } from './skyVisibilityLightmap/SkyVisibilityLightmap';
 import MapWorldBench, { MapWorldFrameState } from './MapWorldBench';
+import MapWorldVideo from './MapWorldVideo';
 import {
   DRAW_MODES, DrawMode, QUALITIES, Quality, qualitySettings, REFLECTION_BLOCKS, REFLECTION_RAYS, ReflectionRays, SHADOW_VIEWS,
   ShadowMode, SKY_VISIBILITY_VIEWS, randomTimeOfDay, TIMES_OF_DAY, TimeOfDay, timeOfDaySettings, timeOfDaySunAngles,
@@ -42,6 +43,7 @@ import BuildingPicker from './BuildingPicker';
 import CarTraffic from './cars/CarTraffic';
 import MapWorldUI from './ui/MapWorldUI';
 import AirplaneController from './AirplaneController';
+import OrbitKeyRotation from './OrbitKeyRotation';
 import { TREE_CROWN_COLORS, TREE_TRUNK_COLOR } from './map/worldTrees';
 import WaterRippleTexture from '../deferredRenderer/scene/waterRipples/WaterRippleTexture';
 import KeyListener from 'webGPU-framework/utils/input/KeyListener';
@@ -91,6 +93,8 @@ export default class MapWorld {
   private camera!: MapCamera;
   // the airplane button: flies the camera with WASD / the arrows instead of orbiting
   private airplane!: AirplaneController;
+  // not flying: WASD / the arrows and the touch joystick rotate the orbit camera
+  private orbitKeys!: OrbitKeyRotation;
   private bounds: LatLngBounds = DEFAULT_BOUNDS;
   private workerPool!: WorldWorkerPool;
   private tileService: OpenFreeMapTileService = new OpenFreeMapTileService();
@@ -179,6 +183,8 @@ export default class MapWorld {
 
   // ?bench: the self-running benchmark, see MapWorldBench
   private bench?: MapWorldBench;
+  // ?video: a frame at a time for video/record.mjs instead of on requestAnimationFrame, see MapWorldVideo
+  private video?: MapWorldVideo;
   private frameState: MapWorldFrameState = {
     newJitter: false, lightmapUpdating: false, ssaoAccumulating: false, renderMap: false, tilesLoading: false, cameraMoving: false,
   };
@@ -206,6 +212,7 @@ export default class MapWorld {
       // for setting params from the console between runs
       (window as any).__mapWorld = this;
     }
+    if (urlParams.has('video')) this.video = this.createVideo();
     this.renderer.setClearColor(0, 0, 0, 1);
 
     // Read the current OpenFreeMap tile URL (it changes with each planet build).
@@ -224,6 +231,7 @@ export default class MapWorld {
     // Geometry is projected relative to the bounds center (world origin).
     this.camera.pivot.position = new Vector3(0, 0, 0);
     this.airplane = new AirplaneController(this.renderer, this.camera);
+    this.orbitKeys = new OrbitKeyRotation(this.renderer, this.camera);
 
     if (SSAO_ENABLED) this.ssao = new ReprojectedSSAO(this.renderer, preloader);
     this.taa = new TAA(this.renderer);
@@ -311,6 +319,7 @@ export default class MapWorld {
     this.bounds = this.boundsAround(city.lat, city.lng);
     LogGL.log(`[MapWorld] centering on ${describeCity(city)}`);
     this.ui.showLocationTitle(city.name, city.landmark || undefined);
+    if (!this.video && !this.bench) this.ui.showControlsHint();
 
     await this.loadFromBounds(this.bounds);
   }
@@ -367,10 +376,39 @@ export default class MapWorld {
     await this.loadFromBounds(this.boundsAround(place.lat, place.lng));
   }
 
+  /** The video mode: what MapWorldVideo needs of the map, the streaming and the plane. */
+  private createVideo(): MapWorldVideo {
+    const defaults = { minHeight: 0, maxHeight: 0 };
+    return new MapWorldVideo(this.renderer, {
+      example: this,
+      step: () => this.update(),
+      load: (lat, lng) => this.loadFromBounds(this.boundsAround(lat, lng)),
+      place: (east, north, height, yaw, speed, pitch) => {
+        const plane = this.airplane;
+        if (!plane.active) {
+          plane.enter(this.projection.metersToNorm);
+          defaults.minHeight = plane.minHeight;
+          defaults.maxHeight = plane.maxHeight;
+        }
+        // a shot may fly lower or higher than the keys can
+        plane.minHeight = Math.min(defaults.minHeight, height);
+        plane.maxHeight = Math.max(defaults.maxHeight, height);
+        plane.speed = speed;
+        plane.cruisePitch = pitch;
+        plane.place(east, -north, height * this.projection.metersToNorm, yaw);
+      },
+      metersToNorm: () => this.projection.metersToNorm,
+      settled: () => this.tileStreamer.isIdle() && !this.skyLightmap.converging,
+      // something over the camera: the roof of the building it is in
+      inside: () => this.skyLightmap.cityScene.pick(this.camera.worldPosition, Vector3.UP) != null,
+    });
+  }
+
   /** Airplane mode on or off, returns whether it is on now. */
   private toggleAirplane(): boolean {
     if (this.airplane.active) this.airplane.exit();
     else this.airplane.enter(this.projection.metersToNorm);
+    this.orbitKeys.reset();
     return this.airplane.active;
   }
 
@@ -526,6 +564,7 @@ export default class MapWorld {
     this.bench?.applyParams(this);
 
     this.update();
+    if (this.video) this.video.ready = true;
   }
 
   /** After a change of drawMode: the debug views of the lightmap and the shadows. */
@@ -631,17 +670,18 @@ export default class MapWorld {
     // Skip the vsyncs less than a 60 fps frame after the last rendered one. The 4 ms slack keeps a frame that is a
     // bit early (rAF times jitter) from being skipped: on a 120 Hz screen that renders every 2nd vsync, at 60 Hz every one.
     // Off while the profiler records: the idle vsyncs let the GPU clock down, so the passes time 1.5-3x too long.
-    if (this.cap60.value && !this.bench && !this.renderer.profiler.recording && time - this.lastFrameTime < 1000 / 60 - 4) {
+    if (this.cap60.value && !this.bench && !this.video && !this.renderer.profiler.recording && time - this.lastFrameTime < 1000 / 60 - 4) {
       window.requestAnimationFrame((t) => this.update(t));
       return;
     }
     this.lastFrameTime = time;
-    this.renderer.update(this.bench ? this.bench.nextTime() : time);
+    this.renderer.update(this.bench ? this.bench.nextTime() : this.video ? this.video.nextTime() : time);
     // Without the jitter of the last frame, so camera.changed only sees the camera motion. draw() jitters it.
     this.camera.projection.resetJitter();
     this.bench?.moveCamera(this.camera);
-    if (this.airplane.active) this.airplane.update(this.projection.metersToNorm, this.ui?.joystickValue);
+    if (this.airplane.active) this.airplane.update(this.projection.metersToNorm, this.video?.stick ?? this.ui?.joystickValue);
     else {
+      if (!this.video && !this.bench) this.orbitKeys.update(this.ui?.joystickValue);
       this.camera.update();
       // eases out the bank left over from airplane mode
       this.airplane.settle();
@@ -681,7 +721,8 @@ export default class MapWorld {
 
     if (this.drawBuildings.value) this.picker.update(this.camera.viewProjection, this.camera.worldPosition, this.tileStreamer);
 
-    window.requestAnimationFrame((t) => this.update(t));
+    // the video steps the frames itself
+    if (!this.video) window.requestAnimationFrame((t) => this.update(t));
   }
 
   /**
@@ -951,6 +992,7 @@ export default class MapWorld {
 
   destruct(): void {
     this.ui?.destruct();
+    this.orbitKeys?.destruct();
     this.picker?.destruct();
     this.tileStreamer.destruct();
     this.workerPool?.destroy();

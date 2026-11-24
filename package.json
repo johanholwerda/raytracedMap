@@ -8,10 +8,12 @@
     "dev": "vite --host",
     "build": "vite build",
     "preview": "vite preview --host",
-    "typecheck": "tsc --project tsconfig.json --noEmit"
+    "typecheck": "tsc --project tsconfig.json --noEmit",
+    "video": "node video/record.mjs"
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.67",
+    "puppeteer-core": "^25.18.1",
     "typescript": "^5.3.3",
     "vite": "^6.0.7",
     "vite-plugin-mkcert": "^1.17.6"
