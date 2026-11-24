@@ -13,7 +13,7 @@ The geometry is streamed as vector tiles while the camera moves, so nothing is b
 
 [![Central Park at sunset, trees casting shadows](docs/images/park.webp)](docs/images/park.webp)
 
-[![A harbor at sunset, long penumbras, the ray count graph in the bottom left](docs/images/sunset.webp)](docs/images/sunset.webp)
+[![A waterfront city at sunset with tilt-shift depth of field](docs/images/sunset.webp)](docs/images/sunset.webp)
 
 The frame
 ---------
@@ -30,7 +30,7 @@ Charts
 A lightmap needs a 2D parametrization of the surfaces. It is made per map tile in the worker that builds the geometry (`cityLayout.ts`), and a point on it is a 32 bit surface id plus a 2D position in world units:
 
 - The ground is 1 chart for the whole map: world xz.
-- The roofs are world xz too, 1 chart per roof height in steps of 25 cm. With the ground and the roofs in 1 chart, a texel on the outline of a roof averages the open roof and the occluded ground at the foot of its walls.
+- The roofs are world xz too, but not in the chart of the ground: 1 chart per roof height, in steps of 25 cm. The chart id is part of the tile hash, so a roof and the ground under it get different tiles and never share a texel. Roofs of the same height that touch do share theirs. (In 1 chart with the ground, a texel on the outline of a roof would average the open roof and the occluded ground at the foot of its walls.)
 - The walls of a map tile are unrolled into strips, 1 per footprint ring: u along the ring, v the height above the base. The strips are cut at corners into chunks of at most 64 m and packed in rows into an atlas per map tile, in Morton order of their buildings, so a coarse texel that spans 2 chunks mixes walls that are near each other in the world.
 
 Ground and roof pixels get their chart position from the depth. Wall pixels read it from the gBuffer, 19 bits per axis in steps of 1 cm. The atlas is as large as it needs to be: only the parts that pixels use take room in the lightmap.
@@ -43,7 +43,7 @@ The virtual lightmap
 - **Eviction.** A tile is stamped with the frame it was last used in. When the probe sequence of a new tile has no empty slot, it takes the place of the tile that is unused the longest, if that is more than `evictFrames` (30, down to 2 while the camera travels). When nothing can be evicted, the cell uses the texel of a coarser level.
 - **Texels.** 1 `u32` per texel, holding ray counts: sky rays that reached the sky (9 bits), sky rays (9 bits), sun rays that reached the sun (7 bits), sun rays (7 bits). The visibility is hits / rays. The cap is 508 sky paths and 127 sun rays per texel. All writes are a compare exchange on that 1 word, so the sky and the sun of a batch go in together and a field can not overflow into the next.
 
-A lightmap of 4096 x 4096 texels (high quality) is 262144 tiles and 64 MB, plus the same again for the claims.
+A lightmap of 4096 x 4096 texels (high quality) is 262144 tiles. Its lighting buffer is 64 MB, at 4 bytes per texel. The update needs a second buffer of the same size: 1 word per texel for the bids of the cells (see claim below), which also records the frame the texel was last sampled in. So 128 MB in all.
 
 The update
 ----------
