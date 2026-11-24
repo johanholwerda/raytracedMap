@@ -205,10 +205,18 @@ export default class Renderer {
 
     this.options.requiredLimits = this.checkRequiredLimitsAgainstAdapterLimits(adapter, this.options.requiredLimits);
 
-    this.device = await adapter.requestDevice({
-      requiredFeatures: this.options.requiredFeatures,
-      requiredLimits: this.options.requiredLimits,
-    });
+    // An adapter is no guarantee of a device (e.g. a blocklisted or broken driver): show the message instead of a black screen
+    try {
+      this.device = await adapter.requestDevice({
+        requiredFeatures: this.options.requiredFeatures,
+        requiredLimits: this.options.requiredLimits,
+      });
+    } catch (e) {
+      console.error('Renderer: requestDevice failed', e);
+      this.canvasManager.canvas.remove();
+      this.showWebgpuNotSupportedMessage(canvasParent);
+      return;
+    }
 
     LogGL.log('Renderer: requiredFeatures', this.options.requiredFeatures);
     // LogGL.log('Renderer: device.features', Object.fromEntries(Array.from(this.device.features).map(f => [f, true])));
