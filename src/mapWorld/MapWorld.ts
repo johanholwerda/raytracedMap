@@ -22,7 +22,7 @@ import MapGBuffer from './deferred/MapGBuffer';
 import DeferredShading from './deferred/DeferredShading';
 import WaterReflectionHalfRes from './deferred/WaterReflectionHalfRes';
 import { NOTABLE_BUILDINGS } from './map/notableBuildings';
-import { describeCity, findCity, pickRandomCity } from './map/worldCities';
+import { describeCity, findCity, pickRandomCity, pickStartCity } from './map/worldCities';
 import OpenFreeMapTileService from './map/OpenFreeMapTileService';
 import WorldWorkerPool from './map/WorldWorkerPool';
 import WorldTileStreamer from './map/WorldTileStreamer';
@@ -44,6 +44,9 @@ import MapWorldUI from './ui/MapWorldUI';
 import AirplaneController from './AirplaneController';
 import { TREE_CROWN_COLORS, TREE_TRUNK_COLOR } from './map/worldTrees';
 import WaterRippleTexture from '../deferredRenderer/scene/waterRipples/WaterRippleTexture';
+import KeyListener from 'webGPU-framework/utils/input/KeyListener';
+import { KEY_P } from 'webGPU-framework/utils/input/Key';
+import { saveCanvasToDisk } from 'webGPU-framework/utils/image/ImageUtils';
 
 // The SSAO (ReprojectedSSAO): off since 2026-11-23, on the sky term alone it is too subtle next to the sky visibility
 // lightmap. Not constructed (nor in the GUI) while false. Its params then take their defaults, no quality sets them; the
@@ -164,6 +167,9 @@ export default class MapWorld {
   // The forward quality's image, with the depth its shading tests. Created when the forward quality is first drawn.
   private forwardRT?: RenderTexture;
   private dirty: boolean = true;
+  // P saves the canvas as a png, right after the next drawn frame: a WebGPU canvas only holds its image in the task
+  // that drew it.
+  private screenshotRequested: boolean = false;
   // The forward image in forwardRT is not of the current view: the deferred path drew while it was not.
   private forwardStale: boolean = true;
   // The shadow map was not updated in a frame (ray traced shadows, overdraw): it may miss casters that came or went.
@@ -266,6 +272,8 @@ export default class MapWorld {
     // Click-to-select buildings; the address comes from Nominatim.
     this.picker = new BuildingPicker(this.renderer, canvasParent, () => this.dirty = true);
 
+    KeyListener.addKeyHitEvent(KEY_P, () => this.screenshotRequested = true);
+
     this.sun = new SunShadows(this.renderer);
     this.wallAtlasView = new WallAtlasView(this.renderer);
     for (const material of this.materials) this.sun.bindResources(material);
@@ -295,11 +303,11 @@ export default class MapWorld {
       roads: this.traffic,
     });
 
-    // Start on a random city >100k (weighted by sqrt(population)). The projection
+    // Start on one of a few well-known cities (pickStartCity). The projection
     // is centered on it so vertex coordinates stay small (fp32 precision).
     // ?city=Paris: always the same city, for timings
     const cityName = urlParams.get('city');
-    const city = (cityName ? await findCity(cityName) : undefined) ?? await pickRandomCity();
+    const city = (cityName ? await findCity(cityName) : undefined) ?? pickStartCity();
     this.bounds = this.boundsAround(city.lat, city.lng);
     LogGL.log(`[MapWorld] centering on ${describeCity(city)}`);
     this.ui.showLocationTitle(city.name, city.landmark || undefined);
@@ -660,6 +668,11 @@ export default class MapWorld {
 
     this.draw(this.dirty, cameraMoving, tilesLoading, cityTilesChanged);
     this.dirty = false;
+    if (this.screenshotRequested) {
+      this.screenshotRequested = false;
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
+      saveCanvasToDisk(this.renderer.canvas, `raytracedmap-${stamp}.png`);
+    }
     if (this.bench) {
       const lm = this.skyLightmap;
       this.bench.afterFrame(this.frameState, this.tileStreamer.isIdle(), lm.unconvergedCells / Math.max(lm.cellCount, 1));

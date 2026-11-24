@@ -53,6 +53,30 @@ export async function pickRandomCity(reject?: (city: City) => boolean): Promise<
   return city;
 }
 
+/**
+ * The cities a page load starts on (uniformly at random). Spelled out here rather than looked up in worldCitiesData:
+ * Venice isn't in it, and "London" there also matches London, Ontario.
+ */
+const START_CITIES: City[] = [
+  { name: 'London', landmark: 'Trafalgar Square', lat: 51.50806, lng: -0.12806, population: 8961989 },
+  { name: 'Paris', landmark: 'Notre-Dame de Paris', lat: 48.853, lng: 2.3498, population: 2138551 },
+  { name: 'Amsterdam', landmark: 'Royal Palace of Amsterdam', lat: 52.37317, lng: 4.89136, population: 741636 },
+  { name: 'New York City', landmark: 'World Trade Center', lat: 40.71139, lng: -74.0125, population: 8804190 },
+  { name: 'Tokyo', landmark: 'Mode Gakuen Cocoon Tower', lat: 35.69167, lng: 139.69694, population: 9733276 },
+  { name: 'Hong Kong', landmark: 'Central Plaza', lat: 22.28, lng: 114.17361, population: 7396076 },
+  { name: 'Moscow', landmark: 'Kremlin', lat: 55.75167, lng: 37.61778, population: 10381222 },
+  { name: 'Berlin', landmark: 'Fernsehturm Berlin', lat: 52.52083, lng: 13.40944, population: 3426354 },
+  { name: 'Kuala Lumpur', landmark: 'National Mosque of Malaysia', lat: 3.14194, lng: 101.69167, population: 1453975 },
+  { name: 'Venice', landmark: "St Mark's Basilica", lat: 45.4345, lng: 12.3397, population: 258685 },
+  { name: 'Shanghai', landmark: 'Shimao International Plaza', lat: 31.23444, lng: 121.47167, population: 24874500 },
+  { name: 'Taipei', landmark: 'Legislative Yuan', lat: 25.04417, lng: 121.51972, population: 7871900 },
+];
+
+/** A random one of START_CITIES, for the first location after a page load. */
+export function pickStartCity(): City {
+  return START_CITIES[Math.floor(Math.random() * START_CITIES.length)];
+}
+
 /** City by name (case-insensitive); the most populous one when the name is ambiguous. */
 export async function findCity(name: string): Promise<City | undefined> {
   const { cities } = await loadTable();
