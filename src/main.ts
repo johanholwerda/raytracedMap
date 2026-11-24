@@ -29,7 +29,11 @@ async function main() {
 
   const mapWorld = new MapWorld();
 
-  await mapWorld.start(canvasContainer, preloader, true);
+  if (!(await mapWorld.start(canvasContainer, preloader, true))) {
+    // no WebGPU: hide the loading bar so it doesn't cover the Renderer's message
+    handlePreloadProgress(1);
+    return;
+  }
 
   preloader.load(
     () => {

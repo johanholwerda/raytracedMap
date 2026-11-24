@@ -189,7 +189,8 @@ export default class MapWorld {
     newJitter: false, lightmapUpdating: false, ssaoAccumulating: false, renderMap: false, tilesLoading: false, cameraMoving: false,
   };
 
-  async start(canvasParent: HTMLElement, preloader: WebGPUPreLoader, uiVisible: boolean): Promise<void> {
+  // false when WebGPU isn't available: the Renderer then shows its "WebGPU Not Supported" message and nothing else starts
+  async start(canvasParent: HTMLElement, preloader: WebGPUPreLoader, uiVisible: boolean): Promise<boolean> {
     LogGL.ENABLED = true;
 
     // router5 strips query params on start; bootstrap.ts keeps the original.
@@ -206,6 +207,7 @@ export default class MapWorld {
     // SkyVisibilityLightmap. CityScene stays at its 128 MiB whatever the limit
     const requiredLimits: Record<string, GPUSize64> = isMobile() ? {} : { maxStorageBufferBindingSize: 2 ** 32 };
     await this.renderer.init(canvasParent, { sampleCount: 1, pixelRatio: -1, requiredLimits });
+    if (!this.renderer.device) return false;
     // await this.renderer.init(canvasParent, { sampleCount: 1, pixelRatio: 1});
     if (urlParams.has('bench')) {
       this.bench = new MapWorldBench(this.renderer, urlParams);
@@ -322,6 +324,7 @@ export default class MapWorld {
     if (!this.video && !this.bench) this.ui.showControlsHint();
 
     await this.loadFromBounds(this.bounds);
+    return true;
   }
 
   /** Bounds centered on the camera pivot, keeping the current span. */
