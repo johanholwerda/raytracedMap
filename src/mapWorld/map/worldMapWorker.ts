@@ -1,7 +1,7 @@
 import { buildWorldTile } from './worldGeometryCore';
 import type { WorldTileResult } from './worldGeometryCore';
-import type { LatLngBounds } from '../../mapOSM/osmGeometryCore';
-import type { TileCoord } from '../../mapOSM/PDOKTileService';
+import type { LatLngBounds } from '../osm/osmGeometryCore';
+import type { TileCoord } from '../osm/PDOKTileService';
 
 /**
  * World map Web Worker: decodes one OpenMapTiles vector tile (.pbf, fetched on
@@ -22,7 +22,7 @@ export type WorldWorkerRequest = {
   heights: Float32Array | null;
 };
 
-// Minimal worker-scope typing (see mapOSM/mapWorker.ts for why).
+// Minimal worker-scope typing (see osm/mapWorker.ts for why).
 type WorkerCtx = {
   onmessage: ((e: MessageEvent<WorldWorkerRequest>) => void) | null;
   postMessage(message: any, transfer?: Transferable[]): void;

@@ -1,7 +1,7 @@
 import LogGL from 'webGPU-framework/renderer/core/LogGL';
 import decodePngRgba8 from 'webGPU-framework/utils/image/decodePngRgba8';
-import { tileToLatLon } from '../../mapOSM/pdokDecodeCore';
-import type { TileCoord } from '../../mapOSM/PDOKTileService';
+import { tileToLatLon } from '../osm/pdokDecodeCore';
+import type { TileCoord } from '../osm/PDOKTileService';
 
 /*
 The height of the ground, from the terrarium elevation tiles of the AWS Open Data terrain tiles (Mapzen, Tilezen joerd):

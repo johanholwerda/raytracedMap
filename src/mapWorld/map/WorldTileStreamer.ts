@@ -9,11 +9,11 @@ import ParamGroup from 'webGPU-framework/utils/params/ParamGroup';
 import ParamFloat from 'webGPU-framework/utils/params/ParamFloat';
 import ParamBool from 'webGPU-framework/utils/params/ParamBool';
 import { isMobile } from 'webGPU-framework/renderer/utils/Browser';
-import MapProjection from '../../mapOSM/MapProjection';
-import type { LatLngBounds } from '../../mapOSM/osmGeometryCore';
-import type { TileCoord } from '../../mapOSM/PDOKTileService';
-import type { BuildingInfo } from '../../mapOSM/cityGlTFCore';
-import type { LayerRuntime } from '../../mapOSM/layerDefs';
+import MapProjection from '../osm/MapProjection';
+import type { LatLngBounds } from '../osm/osmGeometryCore';
+import type { TileCoord } from '../osm/PDOKTileService';
+import type { BuildingInfo } from '../osm/cityGlTFCore';
+import type { LayerRuntime } from '../osm/layerDefs';
 import type { WorldBuildingResult, WorldTileResult } from './worldGeometryCore';
 import type { WallAtlasMeshData } from '../city/WallAtlasView';
 import OpenFreeMapTileService from './OpenFreeMapTileService';
@@ -21,7 +21,7 @@ import WorldWorkerPool from './WorldWorkerPool';
 import type ElevationService from './ElevationService';
 import type TerrainHeightField from './TerrainHeightField';
 import type CityScene from '../city/CityScene';
-import type TerrainLayerBuffer from '../../mapOSM/TerrainLayerBuffer';
+import type TerrainLayerBuffer from '../osm/TerrainLayerBuffer';
 
 export type WorldTileStreamerConfig = {
   renderer: Renderer;
@@ -126,6 +126,8 @@ export default class WorldTileStreamer {
   // mesh of its own from it
   public lastCityTile: { key: string; result: WallAtlasMeshData } | null = null;
   private cityTilesChanged = false;
+  // a ground mesh came or went: the sun's views of the ground are stale, see consumeGroundChanged
+  private groundChanged = false;
 
   // --- streaming state ---
   private frustum: Frustum = new Frustum();
@@ -230,6 +232,13 @@ export default class WorldTileStreamer {
     return changed;
   }
 
+  /** Whether a ground mesh came or went since the last call. */
+  public consumeGroundChanged(): boolean {
+    const changed = this.groundChanged;
+    this.groundChanged = false;
+    return changed;
+  }
+
   public get activeWorkers(): number {
     return this.pool.activeJobs;
   }
@@ -243,6 +252,7 @@ export default class WorldTileStreamer {
   public clearAllTerrainTiles(): void {
     for (const layer of this.layers) layer.buffer.clear();
     this.ground?.clear();
+    this.groundChanged = true;
     this.heightField?.clear();
     this.roads?.clear();
     this.loadedTerrainTiles.clear();
@@ -445,6 +455,7 @@ export default class WorldTileStreamer {
     if (terrainRemove.length) {
       for (const layer of this.layers) layer.buffer.removeTiles(terrainRemove);
       this.ground?.removeTiles(terrainRemove);
+      this.groundChanged = true;
       for (const key of terrainRemove) {
         this.heightField?.removeTile(key);
         this.loadedTerrainTiles.delete(key);
@@ -540,6 +551,7 @@ export default class WorldTileStreamer {
       }
       if (result?.ground && this.ground) {
         this.ground.addTile(key, result.ground.vertices, result.ground.indices, result.ground.floats);
+        this.groundChanged = true;
         bytes += result.ground.vertices.byteLength + result.ground.indices.byteLength;
       }
       if (heights) this.heightField?.addTile(entry.tile, heights);

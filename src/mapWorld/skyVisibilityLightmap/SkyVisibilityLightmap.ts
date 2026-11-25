@@ -15,7 +15,7 @@ import BlueNoiseTexture2D16Bits from 'webGPU-framework/utils/texture/BlueNoiseTe
 import { isMobile } from 'webGPU-framework/renderer/utils/Browser';
 import hash from 'webGPU-framework/shaders/hash.wgsl?raw';
 import r2 from 'webGPU-framework/shaders/r2.wgsl?raw';
-import cameraRay from '../../irradianceCache/includes/cameraRay.wgsl?raw';
+import cameraRay from '../cameraRay.wgsl?raw';
 import cityLightmapSurface from '../city/cityLightmapSurface.wgsl?raw';
 import gBufferPacking from '../deferred/mapGBufferPacking.wgsl?raw';
 import cityLightmap from '../city/cityLightmap.wgsl?raw';

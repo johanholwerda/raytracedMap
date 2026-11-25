@@ -3,7 +3,7 @@ import ShaderBase from 'webGPU-framework/renderer/material/ShaderBase';
 import LogGL from 'webGPU-framework/renderer/core/LogGL';
 import Vector3 from 'webGPU-framework/renderer/math/Vector3';
 import { isMobile } from 'webGPU-framework/renderer/utils/Browser';
-import ModelBVH from '../../irradianceCache/scene/ModelBVH';
+import ModelBVH from './ModelBVH';
 import { CITY_LEAF, TOP_DEPTH_MAX } from './cityLayout';
 import type { CityTraceBlock } from './cityLayout';
 import { intersectTraceBlock } from './cityPick';

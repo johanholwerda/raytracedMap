@@ -14,9 +14,9 @@ import MapCamera from 'webGPU-framework/utils/camera/MapCamera';
 import RenderTexture from 'webGPU-framework/renderer/texture/RenderTexture';
 import { isMobile } from 'webGPU-framework/renderer/utils/Browser';
 import { clamp } from 'webGPU-framework/renderer/utils/MathUtils';
-import type { LatLngBounds } from '../mapOSM/osmGeometryCore';
-import { DEFAULT_BOUNDS } from '../mapOSM/layerDefs';
-import MapProjection from '../mapOSM/MapProjection';
+import type { LatLngBounds } from './osm/osmGeometryCore';
+import { DEFAULT_BOUNDS } from './osm/layerDefs';
+import MapProjection from './osm/MapProjection';
 import ReprojectedSSAO, { SSAOMode } from './ssao/ReprojectedSSAO';
 import TAA from './taa/TAA';
 import MapGBuffer from './deferred/MapGBuffer';
@@ -41,14 +41,14 @@ import {
 import MapGeometry, { CityMeshes } from './MapGeometry';
 import SunShadows from './SunShadows';
 import WallAtlasView from './city/WallAtlasView';
-import type { ShadowMapAhead } from '../mapOSM/shadowMap/ShadowMap';
+import type { ShadowMapAhead } from './osm/shadowMap/ShadowMap';
 import BuildingPicker from './BuildingPicker';
 import CarTraffic from './cars/CarTraffic';
 import MapWorldUI from './ui/MapWorldUI';
 import AirplaneController from './AirplaneController';
 import OrbitKeyRotation from './OrbitKeyRotation';
 import { TREE_CROWN_COLORS, TREE_TRUNK_COLOR } from './map/worldTrees';
-import WaterRippleTexture from '../deferredRenderer/scene/waterRipples/WaterRippleTexture';
+import WaterRippleTexture from './deferred/waterRipples/WaterRippleTexture';
 import KeyListener from 'webGPU-framework/utils/input/KeyListener';
 import { KEY_P } from 'webGPU-framework/utils/input/Key';
 import { saveCanvasToDisk } from 'webGPU-framework/utils/image/ImageUtils';
@@ -333,6 +333,8 @@ export default class MapWorld {
     this.sun = new SunShadows(this.renderer);
     this.wallAtlasView = new WallAtlasView(this.renderer);
     for (const material of this.materials) this.sun.bindResources(material);
+    // the hills for the ray traced sun shadows, which trace only the buildings and the trees
+    for (const material of [...this.deferred.materials, ...this.traffic.materials]) this.sun.terrainSun.bind(material);
 
     this.ui = new MapWorldUI(canvasParent, {
       getViewBounds: () => this.currentViewBounds(),
@@ -708,7 +710,7 @@ export default class MapWorld {
     this.skyLightmap.view = SKY_VISIBILITY_VIEWS[mode] ?? LightmapView.Shaded;
     const shadowView = SHADOW_VIEWS[mode] ?? 0;
     this.deferred.shadowView = shadowView;
-    // the forward shading (mapOSM/shading.wgsl) only has the cascades view
+    // the forward shading (osm/shading.wgsl) only has the cascades view
     for (const m of this.geometry.forwardMaterials) m.setFloat('shadowDebug', mode === DrawMode.ShadowMapCascades ? 1 : 0);
     this.dirty = true;
   }
@@ -912,6 +914,10 @@ export default class MapWorld {
 
   private draw(dirty: boolean, cameraMoving: boolean, tilesLoading: boolean, cityTilesChanged: boolean) {
     let shadowsSettled = true;
+    // the ground casts shadows too, with elevation (without it the flat ground is at 0, what an empty texel means)
+    const ground = this.geometry.elevation ? this.geometry.groundBuffer : null;
+    const groundChanged = this.tileStreamer.consumeGroundChanged();
+    if (groundChanged) this.sun.terrainSun.setDirty();
     // only the shadowMap mode and the debug views of the shadow map need it
     const mode = this.drawMode.value as DrawMode;
     const shadowMapNeeded = this.shadowMode === ShadowMode.ShadowMap || mode === DrawMode.ShadowMap || mode === DrawMode.ShadowMapCascades;
@@ -919,11 +925,14 @@ export default class MapWorld {
       // the casters may have changed while it was skipped
       if (this.shadowMapSkipped) this.sun.shadowMap.reset();
       this.shadowMapSkipped = false;
-      shadowsSettled = this.sun.update(this.camera, cityTilesChanged,
-        { meshes: this.tileStreamer.cityMeshes, quantization: this.tileStreamer.cityMeshQuantization }, this.shadowsAhead());
+      shadowsSettled = this.sun.update(this.camera, cityTilesChanged || groundChanged,
+        { meshes: this.tileStreamer.cityMeshes, quantization: this.tileStreamer.cityMeshQuantization }, ground, this.shadowsAhead());
     } else {
       this.shadowMapSkipped = true;
     }
+    // the rays of the ray traced sun shadows don't trace the ground: the hills come from the sun's view of it
+    const rayTracedSun = this.shadowMode === ShadowMode.LightmapRaytrace || this.shadowMode === ShadowMode.Raytrace;
+    if (!this.showOverdraw && rayTracedSun) this.sun.updateTerrainSun(this.camera, this.viewDistanceMax.value, ground);
 
     if (this.drawMode.value === DrawMode.ShadowMap) {
       // instead of the scene, applyDrawMode draws it again when the mode changes back

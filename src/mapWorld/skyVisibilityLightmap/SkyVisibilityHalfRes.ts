@@ -4,7 +4,7 @@ import VertexFragmentShader from 'webGPU-framework/renderer/material/VertexFragm
 import Camera from 'webGPU-framework/renderer/camera/Camera';
 import Vector2 from 'webGPU-framework/renderer/math/Vector2';
 import Vector3 from 'webGPU-framework/renderer/math/Vector3';
-import cameraRay from '../../irradianceCache/includes/cameraRay.wgsl?raw';
+import cameraRay from '../cameraRay.wgsl?raw';
 import MapGBuffer from '../deferred/MapGBuffer';
 import shader from './skyVisibilityHalfRes.wgsl?raw';
 

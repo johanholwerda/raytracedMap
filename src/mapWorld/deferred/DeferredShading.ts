@@ -2,7 +2,7 @@ import Renderer from 'webGPU-framework/renderer/render/Renderer';
 import RenderTexture from 'webGPU-framework/renderer/texture/RenderTexture';
 import VertexFragmentShader from 'webGPU-framework/renderer/material/VertexFragmentShader';
 import Camera from 'webGPU-framework/renderer/camera/Camera';
-import cameraRay from '../../irradianceCache/includes/cameraRay.wgsl?raw';
+import cameraRay from '../cameraRay.wgsl?raw';
 import toneMap from 'webGPU-framework/shaders/toneMap.wgsl?raw';
 import r2 from 'webGPU-framework/shaders/r2.wgsl?raw';
 import Texture2D from 'webGPU-framework/renderer/texture/Texture2D';
@@ -13,11 +13,12 @@ import Vector2 from 'webGPU-framework/renderer/math/Vector2';
 import shader from './deferredShading.wgsl?raw';
 import skyVisibilityTrace from '../skyVisibilityLightmap/skyVisibilityTrace.wgsl?raw';
 import CityScene from '../city/CityScene';
-import WaterRippleTexture from '../../deferredRenderer/scene/waterRipples/WaterRippleTexture';
+import WaterRippleTexture from './waterRipples/WaterRippleTexture';
 import { ShadowMode } from '../MapWorldSettings';
 import ReprojectedSSAO, { SSAO_FADE_COUNT } from '../ssao/ReprojectedSSAO';
 import WaterReflectionHalfRes from './WaterReflectionHalfRes';
 import waterReflection from './waterReflection.wgsl?raw';
+import terrainSun from '../terrainSun.wgsl?raw';
 
 /**
  * Shades the gBuffer of MapWorld into the scene color, once per pixel: see deferredShading.wgsl. The materials take
@@ -40,7 +41,7 @@ export default class DeferredShading {
   constructor(renderer: Renderer) {
     this.renderer = renderer;
     this.material = new VertexFragmentShader(renderer, 'mapDeferredShading', shader, {
-      includes: [toneMap, r2, cameraRay, ...SkyVisibilityLightmap.resolveIncludes, waterReflection, skyVisibilityTrace],
+      includes: [toneMap, r2, cameraRay, ...SkyVisibilityLightmap.resolveIncludes, waterReflection, skyVisibilityTrace, terrainSun],
       defines: CityScene.traceDefines,
     });
     this.material.depthWriteEnabled = false;

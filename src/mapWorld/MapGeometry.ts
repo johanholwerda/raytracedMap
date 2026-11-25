@@ -10,14 +10,14 @@ import ParamBool from 'webGPU-framework/utils/params/ParamBool';
 import MapCamera from 'webGPU-framework/utils/camera/MapCamera';
 import Frustum from 'webGPU-framework/utils/camera/Frustum';
 import hash from 'webGPU-framework/shaders/hash.wgsl?raw';
-import overdraw from '../mapOSM/overdraw.wgsl?raw';
+import overdraw from './osm/overdraw.wgsl?raw';
 import terrainNormal from './map/terrainNormal.wgsl?raw';
-import forwardShading from '../mapOSM/shading.wgsl?raw';
-import { LayerRuntime } from '../mapOSM/layerDefs';
-import TerrainLayerBuffer from '../mapOSM/TerrainLayerBuffer';
-import BoundingBoxViewer, { BBoxEntry } from '../mapOSM/BoundingBoxViewer';
-import MapProjection from '../mapOSM/MapProjection';
-import GroundQuad from '../mapOSM/GroundQuad';
+import forwardShading from './osm/shading.wgsl?raw';
+import { LayerRuntime } from './osm/layerDefs';
+import TerrainLayerBuffer from './osm/TerrainLayerBuffer';
+import BoundingBoxViewer, { BBoxEntry } from './osm/BoundingBoxViewer';
+import MapProjection from './osm/MapProjection';
+import GroundQuad from './osm/GroundQuad';
 import MapGBuffer from './deferred/MapGBuffer';
 import { WORLD_LAYERS } from './map/worldGeometryCore';
 import { setMeshQuantization } from './city/meshQuantization';
@@ -33,7 +33,7 @@ export type DrawStats = { meshCount: number; vertexCount: number; culledCount: n
 /**
  * The geometry of the map and how it is drawn: the ground layers (one packed buffer + gBuffer material each), the
  * ground quad under them and the buildings (meshes of the WorldTileStreamer, frustum culled with meshBounds). Draws
- * them into the gBuffer, forward shaded (mapOSM/shading.wgsl: sun with shadows and the sky term, see forwardMaterials),
+ * them into the gBuffer, forward shaded (osm/shading.wgsl: sun with shadows and the sky term, see forwardMaterials),
  * or as debug views (overdraw, bounding boxes).
  */
 export default class MapGeometry {

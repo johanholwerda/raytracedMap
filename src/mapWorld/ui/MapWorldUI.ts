@@ -1,11 +1,11 @@
-import type { LatLngBounds } from '../../mapOSM/osmGeometryCore';
-import MapSelector from '../../mapOSM/MapSelector';
+import type { LatLngBounds } from '../osm/osmGeometryCore';
+import MapSelector from '../osm/MapSelector';
 import { ATTRIBUTION } from '../map/OpenFreeMapTileService';
 import { ELEVATION_ATTRIBUTION } from '../map/ElevationService';
 import { searchCities } from '../map/worldCities';
 import { searchNotableBuildings } from '../map/notableBuildings';
 import { searchNominatim } from '../map/nominatimSearch';
-import Joystick from '../../deferredRenderer/scene/Joystick';
+import Joystick from './Joystick';
 
 /** A place picked in the search box. */
 export type SearchedPlace = { lat: number; lng: number; title: string; subtitle?: string };

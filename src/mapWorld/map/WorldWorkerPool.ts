@@ -1,6 +1,6 @@
 import LogGL from 'webGPU-framework/renderer/core/LogGL';
-import type { LatLngBounds } from '../../mapOSM/osmGeometryCore';
-import type { TileCoord } from '../../mapOSM/PDOKTileService';
+import type { LatLngBounds } from '../osm/osmGeometryCore';
+import type { TileCoord } from '../osm/PDOKTileService';
 import type { WorldTileResult } from './worldGeometryCore';
 import type { WorldWorkerRequest } from './worldMapWorker';
 
@@ -8,7 +8,7 @@ import type { WorldWorkerRequest } from './worldMapWorker';
  * Pool of {@link worldMapWorker} Web Workers (`hardwareConcurrency - 1`, one
  * core left for the render thread). Jobs go to the next free worker; the .pbf
  * is fetched by the caller and transferred in, so workers never wait on the
- * network. Same design as mapOSM/MapWorkerPool, with a single job type.
+ * network. Same design as osm/MapWorkerPool, with a single job type.
  */
 
 type Pending = { resolve: (v: WorldTileResult) => void; reject: (e: any) => void };

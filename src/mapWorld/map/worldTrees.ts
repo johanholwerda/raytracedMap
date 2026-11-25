@@ -1,6 +1,6 @@
 import type { VectorTile } from '@mapbox/vector-tile';
-import { classifyRings, clipLineToTile } from '../../mapOSM/pdokDecodeCore';
-import type { TilePoint } from '../../mapOSM/pdokDecodeCore';
+import { classifyRings, clipLineToTile } from '../osm/pdokDecodeCore';
+import type { TilePoint } from '../osm/pdokDecodeCore';
 
 /*
 Random trees in the wood areas of a tile (the landcover class wood of OpenMapTiles: OpenFreeMap has no single trees).

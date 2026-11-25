@@ -1,6 +1,6 @@
 import LogGL from 'webGPU-framework/renderer/core/LogGL';
-import type { LatLngBounds } from '../../mapOSM/osmGeometryCore';
-import type { TileCoord } from '../../mapOSM/PDOKTileService';
+import type { LatLngBounds } from '../osm/osmGeometryCore';
+import type { TileCoord } from '../osm/PDOKTileService';
 
 /**
  * Worldwide vector tiles from OpenFreeMap (https://openfreemap.org): free, no

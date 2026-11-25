@@ -24,6 +24,8 @@ struct Uniforms {
   viewProjection : mat4x4<f32>,
   // of the camera the gBuffer was drawn with, for getGBufferDistance
   inverseProjection : mat4x4<f32>,
+  // the sun's view of the ground for the rays (SUN_SHADOWS 2), see terrainSun.wgsl
+  terrainSunViewProjection : mat4x4<f32>,
   cameraPosition : vec3<f32>,
   resolution : vec2<f32>,
   depthParams : vec2<f32>,
@@ -65,6 +67,8 @@ struct Uniforms {
   levelBlend : f32,
   atlasStep : f32,
   lightmapHalfRes : u32,
+  // how far a point goes off its surface before it is compared with terrainSunMap, see getTerrainSunShadow
+  terrainSunOffset : f32,
 #ifdef PER_PIXEL
   // the city of the rays, see CityScene.bind
   cityTileCount : u32,
@@ -89,6 +93,8 @@ struct ShadowMapData {
 @group(0) @binding(9) var gBufferDepth : texture_depth_2d;
 // 3 per car: (x, z, heading x, heading z), (half length, half width, height, type), (ground, slope, 0, 0), see CarTraffic
 @group(0) @binding(10) var<storage, read> cars : array<vec4<f32>>;
+// the ground as the sun sees it (TerrainSunMap.ts): the hills, which the rays don't trace, see terrainSun.wgsl
+@group(0) @binding(13) var terrainSunMap : texture_2d<f32>;
 #ifdef PER_PIXEL
 // the buildings and trees of the rays, see CityScene and skyVisibilityTrace.wgsl
 @group(0) @binding(11) var<storage, read> cityBuffer : array<vec4<f32>>;
@@ -152,15 +158,25 @@ fn shadowCascade(uv : vec2<f32>, i : u32, dist : f32) -> f32 {
   return smoothstep(uniforms.VSMBleedThreshold, 1.0, max(lit, s));
 }
 
+// how many texels of a cascade a point goes off its surface along its normal before the lookup: the ground at a low sun
+// spans many texels along the sun (tens of meters each in the far cascades), its own heights in them would shadow it
+const SHADOW_NORMAL_OFFSET = 1.5;
+
+// the size of a texel of cascade i in world units: its half-extent is 1 over the length of the first row of its matrix
+fn shadowTexelSize(i : u32) -> f32 {
+  let m = shadowMapData[i].shadowMapViewProjection;
+  return 2.0 / (f32(textureDimensions(shadowMaps).x) * length(vec3<f32>(m[0].x, m[1].x, m[2].x)));
+}
+
 // The cascades front to back, each taking its weight (1 inside, fading out over its edge) of what the ones before it
 // left. Each cascade is re-rendered around a center of its own, so the next one need not cover the edge of the one
 // before it: that point goes on to the first one that does. What no cascade covers is lit, so past the last cascade the
 // shadows fade out instead of ending at a hard edge.
-fn getShadowMap(p : vec3<f32>) -> f32 {
+fn getShadowMap(p : vec3<f32>, n : vec3<f32>) -> f32 {
   var shadow = 0.0;
   var remaining = 1.0;
   for (var i = 0u; i < 4u; i++) {
-    let u = shadowUVDepthStrength(p, i);
+    let u = shadowUVDepthStrength(p + n * (SHADOW_NORMAL_OFFSET * shadowTexelSize(i)), i);
     if (u.w > 0.0) {
       shadow += remaining * u.w * shadowCascade(u.xy, i, u.z);
       remaining *= 1.0 - u.w;
@@ -183,12 +199,12 @@ fn getSunShadow(p : vec3<f32>, n : vec3<f32>, d : f32, raySun : f32) -> f32 {
   }
   if (SUN_SHADOWS == 2u) {
 #ifdef PER_PIXEL
-    return select(1., 0., isOccluded(p + n * (d * 1e-4), uniforms.lightDirection));
+    return select(1., 0., isOccluded(p + n * (d * 1e-4), uniforms.lightDirection)) * getTerrainSunShadow(p, n);
 #else
-    return raySun;
+    return raySun * getTerrainSunShadow(p, n);
 #endif
   }
-  return getShadowMap(p);
+  return getShadowMap(p, n);
 }
 
 #ifdef PER_PIXEL
@@ -240,7 +256,7 @@ fn isHidden(position : vec4<f32>, d : f32) -> bool {
 // d is the horizontal (xz) distance to the camera, not the 3d one: the map is loaded in a radius around the camera in
 // xz, and a camera that goes up and looks down gets no more fog (the far plane reaches past it, see
 // MapWorld.applyViewDistanceMax).
-// The same in deferredShading.wgsl, cars.wgsl, reprojectedSSAOComposite.wgsl and mapOSM/shading.wgsl.
+// The same in deferredShading.wgsl, cars.wgsl, reprojectedSSAOComposite.wgsl and osm/shading.wgsl.
 fn getFog(d : f32) -> f32 {
   let end = select(1., 1. - smoothstep(.7 * uniforms.viewDistanceMax, uniforms.viewDistanceMax, d), uniforms.viewDistanceMax > 0.);
   return 1. - exp(-d * uniforms.distanceFog) * end;

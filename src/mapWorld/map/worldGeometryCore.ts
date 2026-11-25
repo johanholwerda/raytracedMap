@@ -1,17 +1,17 @@
 import earcut from 'earcut';
 import { VectorTile } from '@mapbox/vector-tile';
 import { PbfReader } from 'pbf';
-import MapProjection from '../../mapOSM/MapProjection';
+import MapProjection from '../osm/MapProjection';
 import {
   classifyRings,
   clipLineToTile,
   clipRingToTile,
   tileToLatLon,
-} from '../../mapOSM/pdokDecodeCore';
-import type { TilePoint } from '../../mapOSM/pdokDecodeCore';
-import type { LatLngBounds } from '../../mapOSM/osmGeometryCore';
-import type { TileCoord } from '../../mapOSM/PDOKTileService';
-import type { BuildingInfo } from '../../mapOSM/cityGlTFCore';
+} from '../osm/pdokDecodeCore';
+import type { TilePoint } from '../osm/pdokDecodeCore';
+import type { LatLngBounds } from '../osm/osmGeometryCore';
+import type { TileCoord } from '../osm/PDOKTileService';
+import type { BuildingInfo } from '../osm/cityGlTFCore';
 import { buildTraceBlock, GBUFFER_ATLAS_MAX, GBUFFER_ATLAS_STEP_M, getRoofChart, layoutWalls } from '../city/cityLayout';
 import type { TraceTree } from '../city/cityLayout';
 import type { BuildingPolygon, CityTraceBlock } from '../city/cityLayout';

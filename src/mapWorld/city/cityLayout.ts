@@ -1,5 +1,5 @@
 import Vector3 from 'webGPU-framework/renderer/math/Vector3';
-import ModelBVH from '../../irradianceCache/scene/ModelBVH';
+import ModelBVH from './ModelBVH';
 
 /*
 The lightmap charts and the ray tracing data of the buildings of a map tile, see SkyVisibilityLightmap.ts. Runs in the worker,

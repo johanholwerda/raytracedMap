@@ -1,5 +1,5 @@
-import MapProjection from '../../mapOSM/MapProjection';
-import type { TileCoord } from '../../mapOSM/PDOKTileService';
+import MapProjection from '../osm/MapProjection';
+import type { TileCoord } from '../osm/PDOKTileService';
 import TerrainGrid from './terrainGrid';
 import { createTerrainGrid } from './worldGeometryCore';
 

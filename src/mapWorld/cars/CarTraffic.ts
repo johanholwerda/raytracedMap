@@ -12,13 +12,14 @@ import ParamGroup from 'webGPU-framework/utils/params/ParamGroup';
 import ParamBool from 'webGPU-framework/utils/params/ParamBool';
 import ParamFloat from 'webGPU-framework/utils/params/ParamFloat';
 import { isMobile } from 'webGPU-framework/renderer/utils/Browser';
-import MapProjection from '../../mapOSM/MapProjection';
+import MapProjection from '../osm/MapProjection';
 import SkyVisibilityLightmap from '../skyVisibilityLightmap/SkyVisibilityLightmap';
 import MapGBuffer from '../deferred/MapGBuffer';
 import type { RoadTileSink } from '../map/WorldTileStreamer';
 import RoadGraph, { RoadEdge } from './RoadGraph';
 import { GROUND_TOP_Y, LAYER_GAP } from '../map/worldGeometryCore';
 import skyVisibilityTrace from '../skyVisibilityLightmap/skyVisibilityTrace.wgsl?raw';
+import terrainSun from '../terrainSun.wgsl?raw';
 import CityScene from '../city/CityScene';
 import type TerrainHeightField from '../map/TerrainHeightField';
 import carsShader from './cars.wgsl?raw';
@@ -191,7 +192,8 @@ export default class CarTraffic implements RoadTileSink {
   private createMaterials(suffix: string, perPixel: boolean): CarMaterials {
     const create = (name: string, shadow: boolean) => new VertexFragmentShader(this.renderer, name + suffix, carsShader, {
       // getGBufferDistance (mapGBufferPacking.wgsl is one of them); per car the lightmap lookup is in lightingShader
-      includes: perPixel ? [...SkyVisibilityLightmap.resolveIncludes, skyVisibilityTrace] : SkyVisibilityLightmap.resolveIncludes,
+      // terrainSun.wgsl: the hills in the way of the sun, which the rays don't trace
+      includes: perPixel ? [...SkyVisibilityLightmap.resolveIncludes, skyVisibilityTrace, terrainSun] : [...SkyVisibilityLightmap.resolveIncludes, terrainSun],
       defines: { SHADOW: shadow, PER_PIXEL: perPixel, ...(perPixel ? CityScene.traceDefines : {}) },
     });
     const car = create('cars', false);
