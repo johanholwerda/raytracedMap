@@ -19,6 +19,8 @@ import ReprojectedSSAO, { SSAO_FADE_COUNT } from '../ssao/ReprojectedSSAO';
 import WaterReflectionHalfRes from './WaterReflectionHalfRes';
 import waterReflection from './waterReflection.wgsl?raw';
 import terrainSun from '../terrainSun.wgsl?raw';
+import snow from '../snow.wgsl?raw';
+import type { SnowParams } from '../map/snowLine';
 
 /**
  * Shades the gBuffer of MapWorld into the scene color, once per pixel: see deferredShading.wgsl. The materials take
@@ -41,7 +43,7 @@ export default class DeferredShading {
   constructor(renderer: Renderer) {
     this.renderer = renderer;
     this.material = new VertexFragmentShader(renderer, 'mapDeferredShading', shader, {
-      includes: [toneMap, r2, cameraRay, ...SkyVisibilityLightmap.resolveIncludes, waterReflection, skyVisibilityTrace, terrainSun],
+      includes: [toneMap, r2, cameraRay, ...SkyVisibilityLightmap.resolveIncludes, waterReflection, skyVisibilityTrace, terrainSun, snow],
       defines: CityScene.traceDefines,
       // about 600 ms to compile on a cold shader cache: the first frames are empty instead of stalled
       asyncPipeline: true,
@@ -143,6 +145,17 @@ export default class DeferredShading {
       m.setFloat('waterMaterials', waterMaterials);
       m.setFloat('reflectionDarkening', darkening);
       m.setFloat('rippleTile', rippleTile);
+    }
+  }
+
+  /** The snow on the ground, see SnowParams and snow.wgsl. materials: the gBuffer materials it lies on, a bit each. */
+  public setSnow(materials: number, params: SnowParams): void {
+    for (const m of this.materials) {
+      m.setFloat('snowMaterials', params.enabled ? materials : 0);
+      m.setFloat('snowLine', params.line);
+      m.setFloat('snowNoise', params.noise);
+      m.setFloat('snowMetersPerUnit', params.metersPerUnit);
+      m.setVector3('snowColor', params.color);
     }
   }
 

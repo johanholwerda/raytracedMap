@@ -29,6 +29,7 @@ import OpenFreeMapTileService from './map/OpenFreeMapTileService';
 import WorldWorkerPool from './map/WorldWorkerPool';
 import WorldTileStreamer, { PreviewCamera } from './map/WorldTileStreamer';
 import ElevationClient from './map/ElevationClient';
+import { SNOW_SKIP_MARGIN_M, snowLineMeters, SnowParams } from './map/snowLine';
 import TerrainHeightField from './map/TerrainHeightField';
 import TiltShift from './tiltShift/TiltShift';
 import SkyVisibilityLightmap, { LightmapView } from './skyVisibilityLightmap/SkyVisibilityLightmap';
@@ -199,6 +200,14 @@ export default class MapWorld {
   private sunReflectionPower!: ParamFloat;
   // the gBuffer materials of the water layers, a bit each
   private waterMaterials: number = 0;
+  // the snow on the ground above the snow line of the latitude of the pivot, see updateSnow
+  private snow!: ParamBool;
+  // added to the snow line of snowLine.ts, m
+  private snowLineOffset!: ParamFloat;
+  // how far (m) the noise moves the snow line up and down
+  private snowLineNoise!: ParamFloat;
+  private snowColor!: ParamColor;
+  private snowParams: SnowParams = { enabled: false, line: 0, noise: 0, metersPerUnit: 1, color: new Vector3(1, 1, 1) };
   private projection: MapProjection = new MapProjection();
 
   private geometry!: MapGeometry;
@@ -702,11 +711,26 @@ export default class MapWorld {
     colorParam('buildings', new Vector3(1, 1, 1), (v) => this.geometry.setBuildingColor(v));
     colorParam('ground', new Vector3(.5, .5, .5), (v) => this.geometry.setGroundColor(v));
     this.geometry.layers.forEach((layer, i) => {
+      // the glaciers take the snowColor param
+      if (layer.def.key === 'glacier') return;
       colorParam(layer.def.label, toVector3(layer.def.color), (v) => this.geometry.setLayerColor(i, v));
     });
     colorParam('treeTrunks', toVector3(TREE_TRUNK_COLOR), (v) => this.geometry.setTreeTrunkColor(v));
     const crownAverage = TREE_CROWN_COLORS.reduce((a, c) => a.add(toVector3(c)), new Vector3(0, 0, 0));
     colorParam('treeCrowns', crownAverage.multiplyScalar(1 / TREE_CROWN_COLORS.length), (v) => this.geometry.setTreeCrownColor(v));
+
+    // the snow above the snow line (see map/snowLine.ts), on the ground and the layers of MapGeometry's SNOW_LAYERS
+    const pgSnow = paramGroup.addGroup('Snow');
+    this.snow = pgSnow.addParamBool('snow', true, { callback: setDirty });
+    this.snowLineOffset = pgSnow.addParamFloat('snowLineOffset', 0, -2000, 2000, { callback: setDirty });
+    this.snowLineNoise = pgSnow.addParamFloat('snowLineNoise', 150, 0, 500, { callback: setDirty });
+    // also the albedo of the glaciers (the layer of the landcover class ice)
+    const glacier = this.geometry.layers.findIndex((layer) => layer.def.key === 'glacier');
+    this.snowColor = pgSnow.addParamColor('snowColor', Color.fromHex('#eef2f7').vector3, { callback: (v) => {
+      this.geometry.setLayerColor(glacier, v);
+      this.dirty = true;
+    } });
+    this.geometry.setLayerColor(glacier, this.snowColor.value);
 
     const pgShading = paramGroup.addGroup('Shading');
     const params = { materials: this.materials, callback: setDirty };
@@ -954,6 +978,7 @@ export default class MapWorld {
       this.traffic.update(this.renderer.time.dt, this.camera, this.renderer.canvas.height);
     }
 
+    this.updateSnow();
     this.draw(this.dirty, cameraMoving, tilesLoading, cityTilesChanged);
     this.dirty = false;
     // all map workers from here on, see startTiles
@@ -973,6 +998,31 @@ export default class MapWorld {
 
     // the video steps the frames itself
     if (!this.video) window.requestAnimationFrame((t) => this.update(t));
+  }
+
+  /**
+   * The snow line at the latitude of the pivot (snowLineMeters, it hardly changes across the view) into the shading, in
+   * world y: relative to the ground at the projection center. Without elevation the ground is flat at 0: no snow. Dirty
+   * when the line moved, e.g. when the height of the center came in.
+   */
+  private updateSnow(): void {
+    const p = this.snowParams;
+    const metersToNorm = this.projection.metersToNorm;
+    const { lat } = this.projection.worldToLatLng(this.camera.pivot.position.x, this.camera.pivot.position.z);
+    const lineM = snowLineMeters(lat) + this.snowLineOffset.value - this.elevation.originHeight;
+    // off while even the highest loaded ground, at the top of the noise, is below the line: no snow in view, the shading
+    // skips it (most cities)
+    const reachable = this.heightField.maxHeightM + this.snowLineNoise.value > lineM - SNOW_SKIP_MARGIN_M;
+    const enabled = this.snow.value && this.geometry.elevation && reachable;
+    const line = lineM * metersToNorm;
+    if (enabled !== p.enabled || Math.abs(line - p.line) > .5 * metersToNorm) this.dirty = true;
+    p.enabled = enabled;
+    p.line = line;
+    p.noise = this.snowLineNoise.value;
+    p.metersPerUnit = 1 / metersToNorm;
+    p.color = this.snowColor.value;
+    this.deferred.setSnow(this.geometry.snowMaterials, p);
+    this.geometry.setSnow(p);
   }
 
   /**

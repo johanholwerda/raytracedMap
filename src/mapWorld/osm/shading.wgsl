@@ -54,6 +54,12 @@ struct Uniforms {
   // QUANTIZED: the decoding of the vertices
   positionScale : vec4<f32>,
   positionOffset : vec4<f32>,
+  // SNOW: the snow on the ground of mapWorld, see mapWorld/snow.wgsl (included with the define) and setSnow of its
+  // DeferredShading
+  snowLine : f32,
+  snowNoise : f32,
+  snowMetersPerUnit : f32,
+  snowColor : vec3<f32>,
 };
 
 struct ShadowMapData {
@@ -251,6 +257,21 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
 #ifdef TREE_COLORS
 	if (input.treeMaterial != 0xFFFFFFFFu) {
 		baseColor = materialPalette[input.treeMaterial].rgb;
+	}
+#endif
+#ifdef SNOW
+	// The hard edge of the snow, antialiased over the change of its field to the next pixels: the field at the point and
+	// normal one pixel over, from their derivatives. Those are taken here, in uniform control flow, so the field is only
+	// evaluated where the snow can reach (isSnowPossible), which fwidth of the field couldn't be in, and at the neighbours
+	// only near the edge (getSnowCoverAt)
+	let dWorldX = dpdx(input.world);
+	let dWorldY = dpdy(input.world);
+	let dNormalX = dpdx(n);
+	let dNormalY = dpdy(n);
+	if (isSnowPossible(input.world.y, uniforms.snowLine, uniforms.snowNoise, uniforms.snowMetersPerUnit)) {
+		let cover = getSnowCoverAt(input.world, n, dWorldX, dNormalX, dWorldY, dNormalY, uniforms.snowLine, uniforms.snowNoise,
+			uniforms.snowMetersPerUnit);
+		baseColor = mix(baseColor, uniforms.snowColor, cover);
 	}
 #endif
 	let albedo = baseColor * baseColor;

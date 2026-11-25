@@ -22,6 +22,12 @@ import MapGBuffer from './deferred/MapGBuffer';
 import { WORLD_LAYERS } from './map/worldGeometryCore';
 import { setMeshQuantization } from './city/meshQuantization';
 import { TREE_COLORS, TREE_CROWN_COLORS, TREE_TRUNK_COLOR } from './map/worldTrees';
+import snow from './snow.wgsl?raw';
+import type { SnowParams } from './map/snowLine';
+
+// the ground layers the snow lies on (and the ground under them), see snow.wgsl. Not the water, the roads (cleared) or
+// the railways, nor the urban areas
+const SNOW_LAYERS = new Set(['farmland', 'sand', 'green', 'forest', 'paths']);
 
 /** The building meshes to draw, with their picking slots (parallel), see WorldTileStreamer. */
 // tiles: per mesh the map tile of its wall atlas, x and y after each other (the uniform wallTile of the gBuffer).
@@ -90,12 +96,14 @@ export default class MapGeometry {
     const treeMaterial = this.treeMaterial = gBuffer.addPaletteColors(TREE_COLORS);
     this.cityGBufferMaterial.setFloat('treeMaterial', treeMaterial);
 
-    const createForwardMaterial = (color: Vector3, cullMode: GPUCullMode, city = false) => {
+    const createForwardMaterial = (color: Vector3, cullMode: GPUCullMode, city = false, snowy = false) => {
       const material = new VertexFragmentShader(renderer, 'osm', forwardShading, {
-        includes: city ? [hash] : [hash, terrainNormal],
+        includes: city ? [hash] : snowy ? [hash, terrainNormal, snow] : [hash, terrainNormal],
         // SKY_ALBEDO: the sky term with the albedo, like the deferred shading. TREE_COLORS: the albedos of the trees.
-        // TERRAIN_NORMALS: the ground's smooth normal from .w, the buildings keep the flat one of the triangle
-        defines: city ? { FEATURE_IDS: true, SKY_ALBEDO: true, TREE_COLORS: true, QUANTIZED: true } : { SKY_ALBEDO: true, TERRAIN_NORMALS: true },
+        // TERRAIN_NORMALS: the ground's smooth normal from .w, the buildings keep the flat one of the triangle. SNOW: the
+        // snow above the snow line, see setSnow
+        defines: city ? { FEATURE_IDS: true, SKY_ALBEDO: true, TREE_COLORS: true, QUANTIZED: true }
+          : snowy ? { SKY_ALBEDO: true, TERRAIN_NORMALS: true, SNOW: true } : { SKY_ALBEDO: true, TERRAIN_NORMALS: true },
       });
       if (city) {
         material.setBuffer('materialPalette', gBuffer.paletteBuffer);
@@ -106,9 +114,9 @@ export default class MapGeometry {
       return material;
     };
     for (const def of WORLD_LAYERS) {
-      this.forwardLayerMaterials.push(createForwardMaterial(Color.fromHex(def.color).vector3, 'back'));
+      this.forwardLayerMaterials.push(createForwardMaterial(Color.fromHex(def.color).vector3, 'back', false, SNOW_LAYERS.has(def.key)));
     }
-    this.forwardGroundMaterial = createForwardMaterial(new Vector3(.5, .5, .5), 'none');
+    this.forwardGroundMaterial = createForwardMaterial(new Vector3(.5, .5, .5), 'none', false, true);
     this.forwardCityMaterial = createForwardMaterial(new Vector3(1, 1, 1), 'back', true);
     this.forwardCityMaterial.setFloat('selectedID', -1);
     this.forwardCityMaterial.setFloat('tileID', 0);
@@ -167,6 +175,27 @@ export default class MapGeometry {
   private setMaterialColor(gBufferMaterial: VertexFragmentShader, forwardMaterial: VertexFragmentShader, color: Vector3): void {
     this.gBuffer.setPaletteColor(this.gBuffer.materialIndex(gBufferMaterial), [color.x, color.y, color.z]);
     forwardMaterial.setVector3('baseColor', color);
+  }
+
+  /** The gBuffer materials the snow lies on, a bit each (see MapGBuffer.materialIndex): the ground and SNOW_LAYERS. */
+  public get snowMaterials(): number {
+    let bits = 1 << this.gBuffer.materialIndex(this.groundGBufferMaterial);
+    for (const layer of this.layers) {
+      if (SNOW_LAYERS.has(layer.def.key)) bits |= 1 << this.gBuffer.materialIndex(layer.material);
+    }
+    return bits;
+  }
+
+  /** The snow of the forward shading, like DeferredShading.setSnow: on the ground and SNOW_LAYERS, which have the define. */
+  public setSnow(params: SnowParams): void {
+    // off: the line out of reach
+    const line = params.enabled ? params.line : 1e9;
+    for (const m of this.forwardMaterials) {
+      m.setFloat('snowLine', line);
+      m.setFloat('snowNoise', params.noise);
+      m.setFloat('snowMetersPerUnit', params.metersPerUnit);
+      m.setVector3('snowColor', params.color);
+    }
   }
 
   /** The materials of drawForward: they take the shading params (sky, sun, fog, shadows) by name, like the deferred shading. */

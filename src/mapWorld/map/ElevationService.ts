@@ -65,6 +65,11 @@ export default class ElevationService {
     return this.origin;
   }
 
+  /** The ground height (m above sea level) the heights are relative to, 0 until it is loaded, see setOrigin. */
+  public get originHeight(): number {
+    return this.originM;
+  }
+
   /** The ground height (m) the heights are relative to: the one at lat/lng, the projection center. */
   public setOrigin(lat: number, lng: number): void {
     const origin = this.sample(new Float64Array([lat]), new Float64Array([lng]))

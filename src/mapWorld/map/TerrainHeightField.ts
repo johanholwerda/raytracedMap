@@ -16,6 +16,10 @@ export default class TerrainHeightField {
   private grids = new Map<number, TerrainGrid>();
   private zoom = 14;
   private last: TerrainGrid | null = null;
+  // the highest height (m, relative to the origin) of each grid, by its key, and of them all (maxHeightM)
+  private maxHeights = new Map<number, number>();
+  private maxHeight = -Infinity;
+  private maxDirty = false;
 
   constructor(private projection: MapProjection) {
   }
@@ -24,7 +28,25 @@ export default class TerrainHeightField {
   public addTile(tile: TileCoord, heightsM: Float32Array): void {
     if (tile.z !== this.zoom) this.clear();
     this.zoom = tile.z;
-    this.grids.set(this.key(tile.x, tile.y), createTerrainGrid(tile, this.projection, heightsM));
+    const k = this.key(tile.x, tile.y);
+    this.grids.set(k, createTerrainGrid(tile, this.projection, heightsM));
+    let max = -Infinity;
+    for (let i = 0; i < heightsM.length; i++) if (heightsM[i] > max) max = heightsM[i];
+    this.maxHeights.set(k, max);
+    this.maxDirty = true;
+  }
+
+  /**
+   * The highest ground (m, relative to the origin of the ElevationService) of the loaded tiles, with their rings:
+   * -Infinity without tiles.
+   */
+  public get maxHeightM(): number {
+    if (this.maxDirty) {
+      this.maxDirty = false;
+      this.maxHeight = -Infinity;
+      for (const h of this.maxHeights.values()) if (h > this.maxHeight) this.maxHeight = h;
+    }
+    return this.maxHeight;
   }
 
   /** key: z/x/y, as OpenFreeMapTileService.tileKey. */
@@ -34,10 +56,14 @@ export default class TerrainHeightField {
     const k = this.key(x, y);
     if (this.grids.get(k) === this.last) this.last = null;
     this.grids.delete(k);
+    this.maxHeights.delete(k);
+    this.maxDirty = true;
   }
 
   public clear(): void {
     this.grids.clear();
+    this.maxHeights.clear();
+    this.maxDirty = true;
     this.last = null;
   }
 

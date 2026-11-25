@@ -66,6 +66,8 @@ export const WORLD_LAYERS: WorldLayerConfig[] = [
   { key: 'sand',      label: 'sand',        color: '#dbcc9e', defaultOn: true },
   { key: 'green',     label: 'parks & grass', color: '#70965e', defaultOn: true },
   { key: 'forest',    label: 'forest',      color: '#547a4d', defaultOn: true },
+  // the landcover class ice (glaciers, ice shelves): the snow color, MapWorld keeps it at its snowColor param
+  { key: 'glacier',   label: 'glaciers',    color: '#eef2f7', defaultOn: true },
   { key: 'water',     label: 'water',       color: '#546579', defaultOn: true },
   // the color of the water: the lines of the rivers and canals lie over the water areas, a lighter color showed them
   { key: 'waterways', label: 'waterways',   color: '#546579', defaultOn: true },
@@ -197,7 +199,8 @@ function classifyFill(layer: string, p: Props): FillClass | null {
       if (cls === 'grass' || cls === 'wetland') return { key: 'green' };
       if (cls === 'farmland') return { key: 'farmland' };
       if (cls === 'sand') return { key: 'sand' };
-      return null; // ice / rock: rare in capitals, left to the ground colour
+      if (cls === 'ice') return { key: 'glacier' };
+      return null; // rock: left to the ground colour
     case 'landuse':
       if (GREEN_LANDUSE.has(cls)) return { key: 'green' };
       if (URBAN_LANDUSE.has(cls)) return { key: 'urban' };
