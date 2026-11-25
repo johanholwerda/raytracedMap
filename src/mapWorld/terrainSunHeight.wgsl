@@ -1,8 +1,10 @@
 // The passes of TerrainSunMap.ts over the height map of the ground (rendered top down, per texel -height: the depth
-// material of the cascades, -1e9 where no ground). Two kernels, one per material (the entry points are picked by the
-// defines):
-//   MAX_HEIGHTS: per cell of COARSE x COARSE texels the highest ground in it and a texel around it (a bilinear sample in
-//     the cell reads one texel past it), so the march skips the cells it passes over
+// material of the cascades, -1e9 where no ground). Two kernels, picked by the defines:
+//   MAX_HEIGHTS: the highest ground per block of factor x factor texels of the level below, one level of a chain
+//     1024 -> 256 -> 64 -> 16 -> 1 (TerrainSunMap.ts). The first level reads a texel around its block too (a bilinear
+//     sample in the block reads one texel past it), so every level holds the ground a sample in its cells can see. The
+//     64 level is the cells the march skips, the 1 level the highest ground of the map, where it stops. Many small
+//     passes rather than one that reads its 18 x 18 texels a pixel: 64 x 64 pixels leave most of the GPU idle
 //   SHADOW_HEIGHT: per texel the height a point there has to be at to see the sun, see fs_main
 
 // texels of the height map per cell of maxHeights, mirrors COARSE of TerrainSunMap.ts
@@ -21,6 +23,21 @@ struct VertexOutput {
   @builtin(position) position : vec4<f32>,
 }
 
+#ifdef MAX_HEIGHTS
+struct Uniforms {
+  // texels of source per side of the block of a pixel
+  factor : i32,
+  // 1: a texel around the block too
+  apron : i32,
+  // the source has -height (the height map): -1, else 1
+  sign : f32,
+}
+
+@group(0) @binding(0) var<uniform> uniforms : Uniforms;
+@group(0) @binding(1) var source : texture_2d<f32>;
+#endif
+
+#ifdef SHADOW_HEIGHT
 struct Uniforms {
   // the direction toward the sun across the map, in texels (x along +x, y along +z), normalized. 0: the sun is overhead
   sunDirection : vec2<f32>,
@@ -34,8 +51,9 @@ struct Uniforms {
 
 @group(0) @binding(0) var<uniform> uniforms : Uniforms;
 @group(0) @binding(1) var heights : texture_2d<f32>;
-#ifdef SHADOW_HEIGHT
+// the highest ground per cell of COARSE texels, and of the whole map (1 x 1)
 @group(0) @binding(2) var maxHeights : texture_2d<f32>;
+@group(0) @binding(3) var maxHeight : texture_2d<f32>;
 #endif
 
 @vertex
@@ -48,13 +66,12 @@ fn vs_main(input : VertexInput) -> VertexOutput {
 #ifdef MAX_HEIGHTS
 @fragment
 fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
-  let size = vec2<i32>(textureDimensions(heights));
-  let c = vec2<i32>(input.position.xy) * COARSE;
+  let last = vec2<i32>(textureDimensions(source)) - 1;
+  let c = vec2<i32>(input.position.xy) * uniforms.factor;
   var m = -1e30;
-  for (var y = c.y - 1; y <= c.y + COARSE; y++) {
-    for (var x = c.x - 1; x <= c.x + COARSE; x++) {
-      let t = clamp(vec2<i32>(x, y), vec2<i32>(0), size - 1);
-      m = max(m, -textureLoad(heights, t, 0).x);
+  for (var y = c.y - uniforms.apron; y < c.y + uniforms.factor + uniforms.apron; y++) {
+    for (var x = c.x - uniforms.apron; x < c.x + uniforms.factor + uniforms.apron; x++) {
+      m = max(m, uniforms.sign * textureLoad(source, clamp(vec2<i32>(x, y), vec2<i32>(0), last), 0).x);
     }
   }
   return vec4<f32>(m, 0.0, 0.0, 1.0);
@@ -99,10 +116,13 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
   let coarseLast = vec2<i32>(textureDimensions(maxHeights)) - 1;
   var best = -1e30;
   var bestS = 0.0;
+  let top = textureLoad(maxHeight, vec2<i32>(0), 0).x;
   var s = 1.0;
   for (var i = 0; i < MAX_STEPS; i++) {
     let p = p0 + d * s;
-    if (any(p < vec2<f32>(0.0)) || any(p >= sizeF)) {
+    // past the map, or the ray above all the ground of it: nothing further raises H. On flat ground the cells don't
+    // skip (the ray stays about as high as the ground), without this the march went on to the edge of the map
+    if (any(p < vec2<f32>(0.0)) || any(p >= sizeF) || best + s * rise >= top) {
       break;
     }
     // the ground further along raises H only where it is above best + s * rise, which only grows with s: skip to where
