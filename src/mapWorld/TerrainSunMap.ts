@@ -1,53 +1,72 @@
 import Renderer from 'webGPU-framework/renderer/render/Renderer';
-import Camera from 'webGPU-framework/renderer/camera/Camera';
-import ProjectionOrthographic from 'webGPU-framework/renderer/camera/ProjectionOrthographic';
 import RenderTexture from 'webGPU-framework/renderer/texture/RenderTexture';
 import VertexFragmentShader from 'webGPU-framework/renderer/material/VertexFragmentShader';
 import ShaderBase from 'webGPU-framework/renderer/material/ShaderBase';
 import Color from 'webGPU-framework/renderer/math/Color';
+import Matrix4x4 from 'webGPU-framework/renderer/math/Matrix4x4';
+import Vector2 from 'webGPU-framework/renderer/math/Vector2';
 import Vector3 from 'webGPU-framework/renderer/math/Vector3';
-import Transform from 'webGPU-framework/renderer/scene/Transform';
 import TerrainLayerBuffer from './osm/TerrainLayerBuffer';
+import heightShaderSource from './terrainSunHeight.wgsl?raw';
 
 /**
- * The ground as the sun sees it, for the ray traced sun shadows: their rays trace only the buildings and the trees of
- * CityScene, so without this a hill casts no shadow while the trees on it do. One orthographic view down the sun,
- * centered under the camera and as large as the view distance, of the ground meshes (MapGeometry.groundBuffer) with the
- * depth material of the cascades with SUN_DEPTH: per texel how far toward the sun the ground nearest to it is. The
- * shading compares that of a point with it (getTerrainSunShadow of terrainSun.wgsl). Not the height, as the cascades:
- * a point compared with the texels next to its own would be up to a texel higher or lower than them, which at a low sun
- * is many texels along it, and the slopes shadowed themselves in stripes. The ground is about 30 m per elevation sample and
- * smooth, a map of it is as good as tracing it.
+ * The hills in the way of the sun, for the ray traced sun shadows: their rays trace only the buildings and the trees of
+ * CityScene, so without this a hill casts no shadow while the trees on it do. A map of the ground top down, centered
+ * under the camera and as large as the view distance, per texel the height a point there has to be at to see the sun
+ * (terrainSunHeight.wgsl); the shading compares the height of a point with it (getTerrainSunShadow of terrainSun.wgsl).
+ * That height is continuous over the map, so interpolated the edge of a shadow is a smooth curve. A depth map from the
+ * sun (as this was before) jumps at every ridge, its edges are the texel grid, stretched to long stairs at a low sun.
+ * Three passes: the ground meshes (MapGeometry.groundBuffer) top down with the depth material of the cascades (-height),
+ * the highest ground per cell of COARSE texels, and the march toward the sun per texel, which skips the cells below the
+ * ray.
  * Rendered again only when the sun moves, the ground tiles change or the camera drifts off its center.
  */
 export default class TerrainSunMap {
-  private static readonly RESOLUTION = 2048;
+  private static readonly RESOLUTION = 1024;
+  // texels per cell of the highest ground, mirrors COARSE of terrainSunHeight.wgsl
+  private static readonly COARSE = 16;
   // the half-extent of the map is this many times the view distance: the ground in view stays in it while the camera
   // drifts up to REDRAW_DRIFT of the view distance from its center
   private static readonly SIZE_SCALE = 1.25;
   private static readonly REDRAW_DRIFT = 0.2;
   // the offset of the point off its surface along the normal, in texels, see getTerrainSunShadow
-  private static readonly NORMAL_OFFSET_TEXELS = 1.5;
-  // world units of depth past the ground footprint along the sun: the casters in front of the near plane are clamped onto
-  // it (DEPTH_CLAMP of shading.wgsl), the far plane only has to be past the points it shades
-  private static readonly DEPTH_MARGIN = 1;
-  // no ground: far away from the sun, lit
-  private static readonly CLEAR = new Color(-1e9, 0, 0, 0);
+  private static readonly NORMAL_OFFSET_TEXELS = 0.25;
+  // the least half width of the penumbra: the rise of a ray toward the sun over this many texels, an edge about twice
+  // this wide across the ground behind a hill. Below a texel the interpolation of the map shows
+  private static readonly PENUMBRA_MIN_TEXELS = 0.5;
+  // no ground: -height far below anything
+  private static readonly CLEAR = new Color(1e9, 0, 0, 0);
 
+  // the ground top down: -height, and the depth to keep the highest
+  private readonly heights: RenderTexture;
+  // the highest ground per cell of COARSE texels
+  private readonly maxHeights: RenderTexture;
+  // the height to see the sun at and the penumbra, what the shading reads
   private readonly target: RenderTexture;
-  private readonly camera: Camera;
-  private readonly pivot = new Transform();
+  private readonly maxHeightsMaterial: VertexFragmentShader;
+  private readonly shadowHeightMaterial: VertexFragmentShader;
+  private readonly viewProjection = new Matrix4x4();
   private readonly materials: ShaderBase[] = [];
   private center = new Vector3(1e9, 1e9, 1e9);
   private size = 0;
   private lightKey = '';
   private dirty = true;
 
-  constructor(private renderer: Renderer, private depthMaterial: VertexFragmentShader) {
+  /** heightMaterial: the depth material of the cascades (DRAW_DEPTH, DEPTH_CLAMP, no culling), it writes -height. */
+  constructor(private renderer: Renderer, private heightMaterial: VertexFragmentShader) {
     const resolution = TerrainSunMap.RESOLUTION;
-    this.target = new RenderTexture(renderer, resolution, resolution, { formats: ['r32float'], depth: true });
-    this.camera = new Camera({ nearPlane: -1, farPlane: 1, orthographic: true, fov: 0.5 });
-    this.camera.parent = this.pivot;
+    const coarse = resolution / TerrainSunMap.COARSE;
+    this.heights = new RenderTexture(renderer, resolution, resolution, { formats: ['r32float'], depth: true, depthFormat: 'depth32float' });
+    this.maxHeights = new RenderTexture(renderer, coarse, coarse, { formats: ['r32float'] });
+    this.target = new RenderTexture(renderer, resolution, resolution, { formats: ['rg32float'] });
+
+    this.maxHeightsMaterial = new VertexFragmentShader(renderer, 'terrainSunMaxHeights', heightShaderSource, { defines: { MAX_HEIGHTS: true } });
+    this.maxHeightsMaterial.depthWriteEnabled = false;
+    this.maxHeightsMaterial.setTexture('heights', this.heights);
+    this.shadowHeightMaterial = new VertexFragmentShader(renderer, 'terrainSunShadowHeight', heightShaderSource, { defines: { SHADOW_HEIGHT: true } });
+    this.shadowHeightMaterial.depthWriteEnabled = false;
+    this.shadowHeightMaterial.setTexture('heights', this.heights);
+    this.shadowHeightMaterial.setTexture('maxHeights', this.maxHeights);
   }
 
   /** The map on a material that reads it with getTerrainSunShadow: its texture now, its matrix on every render. */
@@ -64,10 +83,11 @@ export default class TerrainSunMap {
 
   /**
    * Renders the map again when it is stale. lightDirection: toward the sun. center: under the camera. viewDistance: how
-   * far from it (world units, xz) the shading needs it. ground null: no elevation, the map is cleared (all lit).
+   * far from it (world units, xz) the shading needs it. sunRadius: the angular radius of the sun (radians), the
+   * penumbra. ground null: no elevation, nothing in the way.
    */
-  public update(lightDirection: Vector3, center: Vector3, viewDistance: number, ground: TerrainLayerBuffer | null): void {
-    const lightKey = `${lightDirection.x.toFixed(4)},${lightDirection.y.toFixed(4)},${lightDirection.z.toFixed(4)}`;
+  public update(lightDirection: Vector3, center: Vector3, viewDistance: number, sunRadius: number, ground: TerrainLayerBuffer | null): void {
+    const lightKey = `${lightDirection.x.toFixed(4)},${lightDirection.y.toFixed(4)},${lightDirection.z.toFixed(4)},${sunRadius}`;
     if (lightKey !== this.lightKey) {
       this.lightKey = lightKey;
       this.dirty = true;
@@ -81,45 +101,60 @@ export default class TerrainSunMap {
     this.dirty = false;
     this.size = size;
     this.center = center.clone();
-    this.render(lightDirection, ground);
+    this.render(lightDirection, sunRadius, ground);
   }
 
-  private render(toSun: Vector3, ground: TerrainLayerBuffer | null): void {
+  private render(toSun: Vector3, sunRadius: number, ground: TerrainLayerBuffer | null): void {
     const size = this.size;
-    // the center snapped to the texel grid across the sun, as the cascades do (ShadowMap.renderCascade): a render around
-    // a new center puts the ground on the same texels, the edges of the shadows don't move
-    const center = this.center;
-    this.pivot.lookAt(center, Vector3.subtract(center, toSun));
     const texel = (2 * size) / TerrainSunMap.RESOLUTION;
-    const snapped = center.clone();
-    for (const axis of [this.pivot.right, this.pivot.up]) {
-      const d = Vector3.dot(center, axis);
-      snapped.add(axis.multiplyScalar(Math.round(d / texel) * texel - d));
-    }
-    this.pivot.lookAt(snapped, Vector3.subtract(snapped, toSun));
+    // the center snapped to the texel grid, as the cascades do (ShadowMap.renderCascade): a render around a new center
+    // puts the ground on the same texels, the edges of the shadows don't move
+    const cx = Math.round(this.center.x / texel) * texel;
+    const cz = Math.round(this.center.z / texel) * texel;
+    // top down: clip x along +x, clip y along -z (texture v runs down, so v along +z), depth 0 at top, growing down. The
+    // ground above top is clamped onto it (DEPTH_CLAMP), so top is far above any: the highest ground has to win the depth
+    // test, a tie at 0 would keep the first one drawn
+    const top = this.center.y + 100 * size;
+    const range = 200 * size;
+    this.viewProjection.setValues(
+      1 / size, 0, 0, 0,
+      0, 0, -1 / range, 0,
+      0, -1 / size, 0, 0,
+      -cx / size, cz / size, top / range, 1,
+    );
 
-    // the depth range: the ground within size of the center (√2 size at the corners), along the sun at most that
-    const extent = size * Math.SQRT2 + TerrainSunMap.DEPTH_MARGIN;
-    const projection = this.camera.projection as ProjectionOrthographic;
-    projection.setSize(size, size);
-    projection.near = -extent;
-    projection.far = extent;
-
-    this.renderer.startRenderPass(this.target, { clearColor: TerrainSunMap.CLEAR });
+    this.renderer.startRenderPass(this.heights, { clearColor: TerrainSunMap.CLEAR });
     if (ground) {
-      this.depthMaterial.setMatrix('viewProjection', this.camera.viewProjection);
-      this.depthMaterial.setVector3('lightDirection', toSun);
-      ground.draw(this.depthMaterial);
+      this.heightMaterial.setMatrix('viewProjection', this.viewProjection);
+      ground.draw(this.heightMaterial);
     }
-    for (const m of this.materials) this.setUniforms(m);
+    this.renderer.blit(null, this.maxHeights, this.maxHeightsMaterial);
+
+    // the sun across the map in texels: a texel is a step of texel world units in x or z
+    const horizontal = Math.hypot(toSun.x, toSun.z);
+    const m = this.shadowHeightMaterial;
+    m.setVector2('sunDirection', horizontal < 1e-5 ? new Vector2(0, 0) : new Vector2(toSun.x / horizontal, toSun.z / horizontal));
+    const rise = horizontal < 1e-5 ? 0 : (toSun.y / horizontal) * texel;
+    m.setFloat('risePerTexel', rise);
+    // a sun higher or lower by sunRadius changes the rise over s texels by about s * texel * sunRadius / cos^2
+    const cos = Math.max(horizontal / toSun.length(), 0.05);
+    m.setFloat('penumbraPerTexel', (texel * sunRadius) / (cos * cos));
+    m.setFloat('penumbraMin', Math.max(rise, 0) * TerrainSunMap.PENUMBRA_MIN_TEXELS + texel * 1e-3);
+    this.renderer.blit(null, this.target, m);
+
+    for (const material of this.materials) this.setUniforms(material);
   }
 
   private setUniforms(material: ShaderBase): void {
-    material.setMatrix('terrainSunViewProjection', this.camera.viewProjection);
+    material.setMatrix('terrainSunViewProjection', this.viewProjection);
     material.setFloat('terrainSunOffset', TerrainSunMap.NORMAL_OFFSET_TEXELS * (2 * this.size) / TerrainSunMap.RESOLUTION);
   }
 
   public destruct(): void {
+    this.heights.destruct();
+    this.maxHeights.destruct();
     this.target.destruct();
+    this.maxHeightsMaterial.destruct();
+    this.shadowHeightMaterial.destruct();
   }
 }
