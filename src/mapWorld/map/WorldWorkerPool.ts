@@ -42,7 +42,7 @@ export default class WorldWorkerPool {
     return this.pending.size;
   }
 
-  /** Decode + build one tile. Transfers `pbf` in. */
+  /** Decode + build one tile. Transfers `pbf` (and `heights`) in. */
   public buildTile(
     pbf: ArrayBuffer,
     tile: TileCoord,
@@ -50,14 +50,16 @@ export default class WorldWorkerPool {
     wantTerrain: boolean,
     wantBuildings: boolean,
     wantTrees: boolean,
+    heights: Float32Array | null = null,
   ): Promise<WorldTileResult> {
     const id = this.nextId++;
-    const req: WorldWorkerRequest = { id, pbf, tile, bounds, wantTerrain, wantBuildings, wantTrees };
+    const req: WorldWorkerRequest = { id, pbf, tile, bounds, wantTerrain, wantBuildings, wantTrees, heights };
+    const transfer: Transferable[] = heights ? [pbf, heights.buffer] : [pbf];
     return new Promise<WorldTileResult>((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
       const worker = this.idle.pop();
-      if (worker) worker.postMessage(req, [pbf]);
-      else this.queue.push({ req, transfer: [pbf] });
+      if (worker) worker.postMessage(req, transfer);
+      else this.queue.push({ req, transfer });
     });
   }
 

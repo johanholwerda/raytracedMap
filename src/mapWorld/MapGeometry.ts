@@ -37,6 +37,10 @@ export type DrawStats = { meshCount: number; vertexCount: number; culledCount: n
  */
 export default class MapGeometry {
   public readonly layers: LayerRuntime[] = [];
+  // The ground meshes of the tiles with heights (see ElevationService), filled by the WorldTileStreamer. Drawn instead of
+  // the ground quad while elevation is on
+  public readonly groundBuffer: TerrainLayerBuffer;
+  public elevation = false;
   // The bounds of the building meshes, filled by the WorldTileStreamer.
   public readonly meshBounds: Map<Mesh, AABox> = new Map();
   public stats: DrawStats = { meshCount: 0, vertexCount: 0, culledCount: 0 };
@@ -64,6 +68,7 @@ export default class MapGeometry {
     this.groundQuad = new GroundQuad(renderer, projection, 0);
     // under the camera, as far as the view reaches, see setViewDistanceMax
     this.groundQuad.centerOnCamera = true;
+    this.groundBuffer = new TerrainLayerBuffer(renderer);
     this.groundGBufferMaterial = gBuffer.createMaterial(new Vector3(.5, .5, .5), false, 'none');
     this.cityGBufferMaterial = gBuffer.createMaterial(new Vector3(1, 1, 1), true);
 
@@ -197,7 +202,7 @@ export default class MapGeometry {
     this.drawGround(camera, this.forwardLayerMaterials, this.forwardGroundMaterial);
   }
 
-  /** The layers top first (layerMaterials parallel to layers), the ground quad under them last. */
+  /** The layers top first (layerMaterials parallel to layers), the ground (quad or meshes) under them last. */
   private drawGround(camera: MapCamera, layerMaterials: VertexFragmentShader[], groundMaterial: VertexFragmentShader): void {
     const stats = this.stats;
     for (let j = this.layers.length - 1; j >= 0; j--) {
@@ -206,6 +211,13 @@ export default class MapGeometry {
       layer.buffer.draw(layerMaterials[j]);
       stats.meshCount++;
       stats.vertexCount += layer.buffer.vertexCount;
+    }
+    if (this.elevation) {
+      if (this.groundBuffer.vertexCount === 0) return;
+      this.groundBuffer.draw(groundMaterial);
+      stats.meshCount++;
+      stats.vertexCount += this.groundBuffer.vertexCount;
+      return;
     }
     this.groundQuad.drawGBuffer(camera, groundMaterial);
     stats.meshCount++;
@@ -253,7 +265,8 @@ export default class MapGeometry {
     this.overdrawMaterial.setMatrix('viewProjection', camera.viewProjection);
     this.overdrawCityMaterial.setMatrix('viewProjection', camera.viewProjection);
     this.renderer.startRenderPass();
-    this.groundQuad.draw(camera, this.overdrawMaterial);
+    if (this.elevation) this.groundBuffer.draw(this.overdrawMaterial);
+    else this.groundQuad.draw(camera, this.overdrawMaterial);
     for (const layer of this.layers) {
       if (!layer.enabled.value || layer.buffer.vertexCount === 0) continue;
       layer.buffer.draw(this.overdrawMaterial);
@@ -283,6 +296,7 @@ export default class MapGeometry {
 
   destruct(): void {
     this.groundQuad.destruct();
+    this.groundBuffer.destruct();
     for (const layer of this.layers) layer.buffer.destruct();
     this.boundingBoxViewer.destruct();
   }

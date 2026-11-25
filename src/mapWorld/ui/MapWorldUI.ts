@@ -1,6 +1,7 @@
 import type { LatLngBounds } from '../../mapOSM/osmGeometryCore';
 import MapSelector from '../../mapOSM/MapSelector';
 import { ATTRIBUTION } from '../map/OpenFreeMapTileService';
+import { ELEVATION_ATTRIBUTION } from '../map/ElevationService';
 import { searchCities } from '../map/worldCities';
 import { searchNotableBuildings } from '../map/notableBuildings';
 import { searchNominatim } from '../map/nominatimSearch';
@@ -341,7 +342,7 @@ export default class MapWorldUI {
   /** OpenStreetMap / OpenMapTiles attribution (required by the data licence). */
   private createAttribution(): HTMLDivElement {
     const el = document.createElement('div');
-    el.textContent = ATTRIBUTION;
+    el.textContent = `${ATTRIBUTION} · ${ELEVATION_ATTRIBUTION}`;
     // one line: the font shrinks on a narrow screen (stylesheet)
     el.className = 'mwui-attribution';
     Object.assign(el.style, {

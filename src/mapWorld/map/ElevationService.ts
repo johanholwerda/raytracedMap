@@ -1,0 +1,190 @@
+import LogGL from 'webGPU-framework/renderer/core/LogGL';
+import decodePngRgba8 from 'webGPU-framework/utils/image/decodePngRgba8';
+import { tileToLatLon } from '../../mapOSM/pdokDecodeCore';
+import type { TileCoord } from '../../mapOSM/PDOKTileService';
+
+/*
+The height of the ground, from the terrarium elevation tiles of the AWS Open Data terrain tiles (Mapzen, Tilezen joerd):
+256 x 256 png in web mercator, the height in m = R * 256 + G + B / 256 - 32768. Free, no key, CORS enabled. The sources
+differ per region (https://github.com/tilezen/joerd/blob/master/docs/data-sources.md): in the US the NED (bare earth, 3
+to 10 m), elsewhere mostly SRTM (30 to 90 m) and the like, which are surface models: buildings and forests are in it
+as bumps, smoothed at the resolution used here.
+
+The tiles are fetched and decoded on the main thread, once per ELEVATION_ZOOM tile (a z12 tile covers 4 x 4 of the z14
+map tiles). For each map tile getTileGrid samples a grid of TERRAIN_GRID_CELLS + 1 heights over it, uniform in lat and
+lng (the projection is equirectangular, so uniform in world x and z too), which the worker builds the ground mesh from
+and drapes the ground layers, buildings and trees on (see terrainGrid.ts). The grids of 2 neighbours sample their
+shared edge at the same lat/lng, so they meet without cracks.
+
+Heights are relative to the ground at the projection center (setOrigin): there the ground is at y 0, as before, so the
+camera pivot and everything that assumes y 0 stays close to the ground around the center.
+ */
+
+const TERRARIUM_URL = 'https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png';
+// the sources are listed in the data-sources doc above
+export const ELEVATION_ATTRIBUTION = 'Terrain Tiles © Mapzen';
+/** The zoom of the elevation tiles: about 38 m per pixel at the equator, 24 m at 50 degrees. */
+export const ELEVATION_ZOOM = 12;
+const DEM_SIZE = 256;
+/**
+ * The cells per side of the height grid of a map tile, see getTileGrid: 2 elevation pixels each (about 76 m at the
+ * equator, 47 m at 52 degrees). 64 (1 per pixel) about doubles the vertices of the draped ground layers again: the
+ * ground of a tile took 0.9 to 1.8 MB with 32, 1.7 to 3.4 MB with 64, and 0.3 to 0.4 MB flat (San Francisco, Amsterdam).
+ */
+export const TERRAIN_GRID_CELLS = 32;
+// decoded tiles kept (256 KB each)
+const CACHE_MAX = 96;
+// The heights are clamped to the sea level: the tiles have the depth of the sea (ETOPO1), the water layer lies on the
+// ground. Land below the sea level (polders, the Dead Sea) becomes flat at 0.
+const MIN_HEIGHT_M = 0;
+
+type DemTile = { heights: Float32Array; min: number; max: number };
+
+export default class ElevationService {
+  // per tile key: the tile, null where there is none (404). LRU: a hit moves the key to the end
+  private tiles = new Map<string, Promise<DemTile | null>>();
+  private decoded = new Map<string, DemTile | null>();
+  private origin: Promise<number> = Promise.resolve(0);
+  private originM = 0;
+
+  /** The ground height (m) the heights are relative to: the one at lat/lng, the projection center. */
+  public setOrigin(lat: number, lng: number): void {
+    const origin = this.sample(new Float64Array([lat]), new Float64Array([lng]))
+      .then((h) => h[0])
+      .catch((e) => {
+        LogGL.warn('[MapWorld] no elevation at the center, heights from sea level:', e);
+        return 0;
+      });
+    this.origin = origin;
+    void origin.then((h) => {
+      if (this.origin === origin) this.originM = h;
+    });
+  }
+
+  /**
+   * The heights (m, relative to the origin) of the grid over a map tile: (cells + 1)^2, row j (from the south) after
+   * row, column i from the west. Lat and lng are uniform over the tile, the last row and column at its edge exactly.
+   * Rejects when an elevation tile can't be loaded (the map tile retries later).
+   */
+  public async getTileGrid(tile: TileCoord, cells = TERRAIN_GRID_CELLS): Promise<Float32Array> {
+    const sw = tileToLatLon(0, 1, 1, tile), ne = tileToLatLon(1, 0, 1, tile);
+    const side = cells + 1;
+    const lats = new Float64Array(side * side), lngs = new Float64Array(side * side);
+    for (let j = 0; j < side; j++) {
+      const lat = j === cells ? ne.lat : sw.lat + (ne.lat - sw.lat) * j / cells;
+      for (let i = 0; i < side; i++) {
+        lats[j * side + i] = lat;
+        lngs[j * side + i] = i === cells ? ne.lon : sw.lon + (ne.lon - sw.lon) * i / cells;
+      }
+    }
+    const origin = this.origin;
+    const heights = await this.sample(lats, lngs);
+    const h0 = await origin;
+    for (let k = 0; k < heights.length; k++) heights[k] -= h0;
+    return heights;
+  }
+
+  /**
+   * The range of the ground heights (m, relative to the origin) around a map tile: of the whole elevation tile it is
+   * in. Null while that isn't loaded.
+   */
+  public tileRange(tile: TileCoord): [number, number] | null {
+    const shift = tile.z - ELEVATION_ZOOM;
+    const x = shift >= 0 ? tile.x >> shift : tile.x << -shift;
+    const y = shift >= 0 ? tile.y >> shift : tile.y << -shift;
+    const dem = this.decoded.get(this.key(x, y));
+    if (dem === undefined) return null;
+    if (dem === null) return [-this.originM, -this.originM];
+    return [dem.min - this.originM, dem.max - this.originM];
+  }
+
+  /** The heights (m) at the points, bilinear between the pixel centers of the elevation tiles. */
+  private async sample(lats: Float64Array, lngs: Float64Array): Promise<Float32Array> {
+    const n = 1 << ELEVATION_ZOOM;
+    const world = n * DEM_SIZE;
+    const count = lats.length;
+    // the pixel coordinates, from the pixel centers
+    const px = new Float64Array(count), py = new Float64Array(count);
+    const needed = new Map<string, [number, number]>();
+    for (let k = 0; k < count; k++) {
+      const latRad = Math.max(Math.min(lats[k], 85.05), -85.05) * Math.PI / 180;
+      px[k] = (lngs[k] + 180) / 360 * world - .5;
+      py[k] = (1 - Math.asinh(Math.tan(latRad)) / Math.PI) / 2 * world - .5;
+      const x0 = Math.floor(px[k]), y0 = Math.floor(py[k]);
+      for (const [x, y] of [[x0, y0], [x0 + 1, y0], [x0, y0 + 1], [x0 + 1, y0 + 1]]) {
+        const tx = this.wrap(Math.floor(x / DEM_SIZE), n), ty = Math.min(Math.max(Math.floor(y / DEM_SIZE), 0), n - 1);
+        const key = this.key(tx, ty);
+        if (!needed.has(key)) needed.set(key, [tx, ty]);
+      }
+    }
+    const tiles = new Map<string, DemTile | null>();
+    await Promise.all([...needed].map(async ([key, [tx, ty]]) => tiles.set(key, await this.load(tx, ty))));
+
+    const pixel = (x: number, y: number): number => {
+      const tx = this.wrap(Math.floor(x / DEM_SIZE), n);
+      const yc = Math.min(Math.max(y, 0), world - 1);
+      const ty = Math.floor(yc / DEM_SIZE);
+      const dem = tiles.get(this.key(tx, ty));
+      if (!dem) return MIN_HEIGHT_M;
+      const lx = x - Math.floor(x / DEM_SIZE) * DEM_SIZE, ly = yc - ty * DEM_SIZE;
+      return dem.heights[ly * DEM_SIZE + lx];
+    };
+    const out = new Float32Array(count);
+    for (let k = 0; k < count; k++) {
+      const x0 = Math.floor(px[k]), y0 = Math.floor(py[k]);
+      const fx = px[k] - x0, fy = py[k] - y0;
+      const top = pixel(x0, y0) * (1 - fx) + pixel(x0 + 1, y0) * fx;
+      const bottom = pixel(x0, y0 + 1) * (1 - fx) + pixel(x0 + 1, y0 + 1) * fx;
+      out[k] = top * (1 - fy) + bottom * fy;
+    }
+    return out;
+  }
+
+  private wrap(x: number, n: number): number {
+    return ((x % n) + n) % n;
+  }
+
+  private key(x: number, y: number): string {
+    return `${x}/${y}`;
+  }
+
+  /** The elevation tile (x, y) at ELEVATION_ZOOM, cached. Null where there is none, rejects on a network error. */
+  private load(x: number, y: number): Promise<DemTile | null> {
+    const key = this.key(x, y);
+    const cached = this.tiles.get(key);
+    if (cached) {
+      this.tiles.delete(key);
+      this.tiles.set(key, cached);
+      return cached;
+    }
+    const url = TERRARIUM_URL.replace('{z}', String(ELEVATION_ZOOM)).replace('{x}', String(x)).replace('{y}', String(y));
+    const promise = (async (): Promise<DemTile | null> => {
+      const response = await fetch(url);
+      if (response.status === 404 || response.status === 403) return null;
+      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+      const png = await decodePngRgba8(await response.arrayBuffer());
+      if (png.width !== DEM_SIZE || png.height !== DEM_SIZE) throw new Error(`elevation tile ${key} is ${png.width} x ${png.height}`);
+      const heights = new Float32Array(DEM_SIZE * DEM_SIZE);
+      let min = Infinity, max = -Infinity;
+      for (let i = 0; i < heights.length; i++) {
+        const d = png.data;
+        const h = Math.max(d[i * 4] * 256 + d[i * 4 + 1] + d[i * 4 + 2] / 256 - 32768, MIN_HEIGHT_M);
+        heights[i] = h;
+        if (h < min) min = h;
+        if (h > max) max = h;
+      }
+      return { heights, min, max };
+    })();
+    this.tiles.set(key, promise);
+    promise.then(
+      (dem) => { if (this.tiles.get(key) === promise) this.decoded.set(key, dem); },
+      () => { if (this.tiles.get(key) === promise) this.tiles.delete(key); },
+    );
+    while (this.tiles.size > CACHE_MAX) {
+      const oldest = this.tiles.keys().next().value as string;
+      this.tiles.delete(oldest);
+      this.decoded.delete(oldest);
+    }
+    return promise;
+  }
+}

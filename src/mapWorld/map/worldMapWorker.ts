@@ -18,6 +18,8 @@ export type WorldWorkerRequest = {
   wantBuildings: boolean;
   // the trees of the wood areas, with the buildings, see worldTrees.ts
   wantTrees: boolean;
+  // the heights of the ground (m), see ElevationService.getTileGrid. Null: flat
+  heights: Float32Array | null;
 };
 
 // Minimal worker-scope typing (see mapOSM/mapWorker.ts for why).
@@ -38,9 +40,11 @@ ctx.onmessage = (e: MessageEvent<WorldWorkerRequest>) => {
       msg.wantTerrain,
       msg.wantBuildings,
       msg.wantTrees,
+      msg.heights,
     );
     const transfers: Transferable[] = [];
     if (result.terrain) for (const l of Object.values(result.terrain)) transfers.push(l.vertices.buffer, l.indices.buffer);
+    if (result.ground) transfers.push(result.ground.vertices.buffer, result.ground.indices.buffer);
     if (result.roads) transfers.push(result.roads.buffer);
     if (result.buildings) {
       transfers.push(result.buildings.vertices.buffer, result.buildings.lightmap.buffer, result.buildings.indices.buffer);

@@ -26,6 +26,7 @@ import { describeCity, findCity, pickRandomCity, pickStartCity } from './map/wor
 import OpenFreeMapTileService from './map/OpenFreeMapTileService';
 import WorldWorkerPool from './map/WorldWorkerPool';
 import WorldTileStreamer from './map/WorldTileStreamer';
+import ElevationService from './map/ElevationService';
 import TiltShift from './tiltShift/TiltShift';
 import SkyVisibilityLightmap, { LightmapView } from './skyVisibilityLightmap/SkyVisibilityLightmap';
 import type { LightmapBlur } from './skyVisibilityLightmap/SkyVisibilityLightmap';
@@ -98,6 +99,9 @@ export default class MapWorld {
   private bounds: LatLngBounds = DEFAULT_BOUNDS;
   private workerPool!: WorldWorkerPool;
   private tileService: OpenFreeMapTileService = new OpenFreeMapTileService();
+  // The heights of the ground: the tiles are built on it while the elevation param is on, see applyElevation
+  private elevation: ElevationService = new ElevationService();
+  private elevationParam!: ParamBool;
   private drawMode!: ParamSelect;
   private quality!: ParamSelect;
   private timeOfDay!: ParamSelect;
@@ -311,7 +315,11 @@ export default class MapWorld {
       onTileError: (msg) => this.ui.showTileError(msg),
       cityScene: this.skyLightmap.cityScene,
       roads: this.traffic,
+      ground: this.geometry.groundBuffer,
     });
+    // on by default, see the elevation param
+    this.tileStreamer.setElevation(this.elevation);
+    this.geometry.elevation = true;
 
     // Start on one of a few well-known cities (pickStartCity). The projection
     // is centered on it so vertex coordinates stay small (fp32 precision).
@@ -425,6 +433,8 @@ export default class MapWorld {
 
     this.projection.setBounds(bounds);
     this.bounds = bounds;
+    // the ground at the center is at y 0
+    this.elevation.setOrigin(this.projection.latMid, this.projection.lngMid);
     // the sun stands elsewhere at another latitude (before init, applyTimeOfDay does it)
     if (this.timeOfDay) this.applySunAngles();
     // Another projection center: everything the lightmap holds is somewhere else now.
@@ -477,6 +487,9 @@ export default class MapWorld {
       this.tileStreamer.setTreesEnabled(trees.value);
     } });
     this.tileStreamer.setTreesEnabled(trees.value);
+    // the heights of the ground (ElevationService), off: the flat ground at 0. The tiles load again
+    this.elevationParam = layersGroup.addParamBool('elevation', true, { callback: () => this.applyElevation() });
+    if (this.elevationParam.value !== this.geometry.elevation) this.applyElevation();
 
     // the albedos of the map (as the params, not squared), in the gBuffer palette and the forward materials
     const pgColors = paramGroup.addGroup('Map colors');
@@ -610,6 +623,23 @@ export default class MapWorld {
     this.skyColor.setValue(Color.fromHex(settings.skyColor).vector3);
     this.sunColor.setValue(Color.fromHex(settings.sunColor).vector3);
     this.backgroundColor.setValue(Color.fromHex(settings.backgroundColor).vector3);
+    this.dirty = true;
+  }
+
+  /** The elevation param to the tiles (they load again) and the ground (meshes or the flat quad). */
+  private applyElevation(): void {
+    const on = this.elevationParam.value;
+    this.geometry.elevation = on;
+    this.tileStreamer.setElevation(on ? this.elevation : null);
+    this.tileStreamer.clearAllTerrainTiles();
+    this.tileStreamer.clearAllCityTiles();
+    this.picker.clearSelection();
+    // the ground and the buildings move: what the lightmap and the histories hold is somewhere else now
+    this.skyLightmap.reset();
+    this.sun?.shadowMap.reset();
+    this.taa.invalidate();
+    this.ssao?.reset();
+    this.tileStreamer.resetStreamingPosition();
     this.dirty = true;
   }
 

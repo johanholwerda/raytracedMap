@@ -17,12 +17,15 @@ import type { TraceTree } from '../city/cityLayout';
 import type { BuildingPolygon, CityTraceBlock } from '../city/cityLayout';
 import { buildTrees, TREE_MATERIAL_BASE_ID } from './worldTrees';
 import { findWallBottoms } from '../city/hiddenWalls';
+import TerrainGrid, { insideRing } from './terrainGrid';
 
 /**
  * Pure (renderer-free) geometry core for the world map. Decodes one
  * OpenMapTiles-schema vector tile (as served by OpenFreeMap) into
  *  - flat ground layers (water, green, roads, …) as indexed xyz meshes, one per
  *    render layer, ready for {@link TerrainLayerBuffer}, and
+ *  - with the heights of the ground (see ElevationService), the ground mesh, with
+ *    the layers draped on it and the buildings and trees standing on it, and
  *  - extruded 3D buildings as one stride-4 `(x, up, -y, featureId)` soup plus
  *    per-building attributes, the same layout the 3DBAG path produces, so the
  *    shared osm shader / GPU picking / highlight work unchanged.
@@ -86,6 +89,10 @@ export const LAYER_GAP = 1e-4;
 
 const LAYER_Y: Record<string, number> = Object.fromEntries(WORLD_LAYERS.map((l, i) => [l.key, (i + 1) * LAYER_GAP]));
 
+// How far (world units) a ground layer may be off the ground where it is draped on the terrain without the cuts of the
+// grid (see TerrainGrid.drapeTriangles): twice this. A quarter of the gap, so 2 layers stay half of it apart
+const DRAPE_TOLERANCE = LAYER_GAP / 8;
+
 /** The height of the top ground layer (paths), in world units: the cars stand on it. */
 export const GROUND_TOP_Y = WORLD_LAYERS.length * LAYER_GAP;
 
@@ -122,6 +129,8 @@ export type WorldTerrainLayer = {
 export type WorldTileResult = {
   /** Per-layer indexed meshes (only when terrain was requested). */
   terrain?: Record<string, WorldTerrainLayer>;
+  /** The ground mesh under the layers (only with the terrain and heights), see TerrainGrid.buildMesh. */
+  ground?: WorldTerrainLayer;
   /**
    * The center lines of the roads cars drive on (only with the terrain), see packRoad: per line its point count, width
    * (m), speed (m/s) and oneway (1: only from the first point to the last), then the points in map (x, north) coords.
@@ -226,6 +235,7 @@ const LINE_LAYERS = ['waterway', 'transportation', 'aeroway'];
 /**
  * Decode an OpenMapTiles vector tile and build the requested geometry,
  * projected relative to `bounds` (the shared {@link MapProjection} frame).
+ * heights: the ground of the tile (m), see ElevationService.getTileGrid. Null: the flat ground at 0.
  */
 export function buildWorldTile(
   bytes: Uint8Array,
@@ -234,11 +244,13 @@ export function buildWorldTile(
   wantTerrain: boolean,
   wantBuildings: boolean,
   wantTrees = false,
+  heights: Float32Array | null = null,
 ): WorldTileResult {
   const vt = new VectorTile(new PbfReader(bytes));
   const proj = new MapProjection();
   proj.setBounds(bounds);
   const metersToNorm = proj.metersToNorm;
+  const terrain = heights ? createTerrainGrid(tile, proj, heights) : null;
 
   // Tile-local MVT point -> projected map (x, north) coords.
   const toMap = (pt: TilePoint, extent: number, out: number[]): void => {
@@ -251,9 +263,10 @@ export function buildWorldTile(
 
   if (wantTerrain) {
     // Indexed like the buildings: earcut already returns indices, so a polygon point is one vertex instead of one per
-    // triangle corner (about 3x fewer vertices), and a ribbon segment is 4 vertices instead of 6.
-    const acc: Record<string, { vertices: number[]; indices: number[] }> = {};
-    for (const key of WORLD_LAYER_KEYS) acc[key] = { vertices: [], indices: [] };
+    // triangle corner (about 3x fewer vertices), and a ribbon segment is 4 vertices instead of 6. Flat (x, north) first:
+    // on the terrain the triangles are cut by the ground grid at the end (see TerrainGrid.drapeTriangles)
+    const acc: Record<string, FlatMesh> = {};
+    for (const key of WORLD_LAYER_KEYS) acc[key] = { coords: [], indices: [] };
 
     for (const layerName of FILL_LAYERS) {
       const layer = vt.layers[layerName];
@@ -264,16 +277,15 @@ export function buildWorldTile(
         if (f.type !== 3) continue;
         const c = classifyFill(layerName, f.properties as Props);
         if (!c) continue;
-        const z = LAYER_Y[c.key];
         for (const poly of classifyRings(f.loadGeometry())) {
           const flat = polygonToMap(poly, extent, toMap);
           if (!flat) continue;
           const tris = earcut(flat.coords, flat.holes.length ? flat.holes : undefined, 2);
           if (tris.length === 0) continue;
           const out = acc[c.key];
-          const first = out.vertices.length / 3;
+          const first = out.coords.length / 2;
           const coords = flat.coords;
-          for (let k = 0; k < coords.length; k += 2) out.vertices.push(coords[k], z, -coords[k + 1]);
+          for (let k = 0; k < coords.length; k++) out.coords.push(coords[k]);
           for (let t = 0; t < tris.length; t++) out.indices.push(first + tris[t]);
         }
       }
@@ -290,7 +302,6 @@ export function buildWorldTile(
         if (f.type !== 2) continue;
         const c = classifyLine(layerName, f.properties as Props);
         if (!c) continue;
-        const z = LAYER_Y[c.key];
         const halfW = c.width * 0.5 * metersToNorm;
         const props = f.properties as Props;
         const speed = layerName === 'transportation' && c.key === 'roads' ? ROAD_SPEEDS[str(props.class)] : undefined;
@@ -301,26 +312,53 @@ export function buildWorldTile(
           for (const seg of clipLineToTile(ring, extent)) {
             line.length = 0;
             for (const pt of seg) toMap(pt, extent, line);
-            addRibbon(acc[c.key], line, halfW, z);
+            addRibbon(acc[c.key], line, halfW);
             if (speed !== undefined) packRoad(roads, line, c.width, speed, oneway);
           }
         }
       }
     }
 
-    const terrain: Record<string, WorldTerrainLayer> = {};
+    const layers: Record<string, WorldTerrainLayer> = {};
     for (const key of WORLD_LAYER_KEYS) {
-      terrain[key] = { vertices: new Float32Array(acc[key].vertices), indices: new Uint32Array(acc[key].indices) };
+      const { coords, indices } = acc[key];
+      const y = LAYER_Y[key];
+      if (terrain) {
+        const out = { vertices: [] as number[], indices: [] as number[] };
+        terrain.drapeTriangles(coords, indices, y, DRAPE_TOLERANCE, out);
+        layers[key] = { vertices: new Float32Array(out.vertices), indices: new Uint32Array(out.indices) };
+      } else {
+        const vertices = new Float32Array(coords.length / 2 * 3);
+        for (let k = 0, o = 0; k < coords.length; k += 2, o += 3) {
+          vertices[o] = coords[k]; vertices[o + 1] = y; vertices[o + 2] = -coords[k + 1];
+        }
+        layers[key] = { vertices, indices: new Uint32Array(indices) };
+      }
     }
-    result.terrain = terrain;
+    result.terrain = layers;
+    if (terrain) result.ground = terrain.buildMesh();
     result.roads = new Float32Array(roads);
   }
 
   if (wantBuildings) {
-    result.buildings = buildBuildings(vt, tile, proj, toMap, wantTrees);
+    result.buildings = buildBuildings(vt, tile, proj, toMap, wantTrees, terrain);
   }
 
   return result;
+}
+
+/** A ground layer before the terrain: the points (x, north) and the triangles, 3 point indices each. */
+type FlatMesh = { coords: number[]; indices: number[] };
+
+/** The ground grid of the tile, from its heights in m (see ElevationService.getTileGrid). */
+function createTerrainGrid(tile: TileCoord, proj: MapProjection, heightsM: Float32Array): TerrainGrid {
+  // the same corners as getTileGrid: the edges of 2 neighbours are at the same lat/lng
+  const sw = tileToLatLon(0, 1, 1, tile), ne = tileToLatLon(1, 0, 1, tile);
+  const [x0, y0] = proj.project(sw.lon, sw.lat);
+  const [x1, y1] = proj.project(ne.lon, ne.lat);
+  const heights = new Float32Array(heightsM.length);
+  for (let k = 0; k < heights.length; k++) heights[k] = heightsM[k] * proj.metersToNorm;
+  return new TerrainGrid(x0, y0, x1, y1, heights);
 }
 
 /**
@@ -380,11 +418,11 @@ function polygonToMap(
 const MITER_LIMIT = 2;
 
 /**
- * Flat ribbon along a projected polyline (same winding as osmGeometryCore): 2 vertices (left, right) per point, shared
+ * Flat ribbon along a projected polyline (same winding as osmGeometryCore): 2 points (left, right) per point, shared
  * by the segments on both sides of it, offset along the miter so the ribbon keeps its width around the bend. A closed
  * line (first point = last) is mitered where it closes too.
  */
-function addRibbon(out: { vertices: number[]; indices: number[] }, line: number[], halfW: number, z: number): void {
+function addRibbon(out: FlatMesh, line: number[], halfW: number): void {
   // the points without repeats (a zero length segment has no direction)
   const xs: number[] = [], ys: number[] = [];
   for (let i = 0; i < line.length; i += 2) {
@@ -408,11 +446,11 @@ function addRibbon(out: { vertices: number[]; indices: number[] }, line: number[
     dxs[i] = dx / len; dys[i] = dy / len;
   }
 
-  const verts = out.vertices;
-  // the vertices p + o (left) and p - o (right), returns the index of the left one
+  const points = out.coords;
+  // the points p + o (left) and p - o (right), returns the index of the left one
   const pair = (x: number, y: number, ox: number, oy: number): number => {
-    const v = verts.length / 3;
-    verts.push(x + ox, z, -(y + oy), x - ox, z, -(y - oy));
+    const v = points.length / 2;
+    points.push(x + ox, y + oy, x - ox, y - oy);
     return v;
   };
 
@@ -465,6 +503,7 @@ export function buildBuildings(
   proj: MapProjection,
   toMap: (pt: TilePoint, extent: number, out: number[]) => void,
   wantTrees = false,
+  terrain: TerrainGrid | null = null,
 ): WorldBuildingResult {
   const verts: number[] = [];
   // Per vertex the lightmap chart, see SkyVisibilityLightmap: (atlas u, atlas v) of the start of a wall, (roof chart, -1)
@@ -520,12 +559,16 @@ export function buildBuildings(
     toMap({ x: 1, y: 1 } as TilePoint, extent, unit);
     const tolerance = Math.max(Math.abs(unit[2] - unit[0]), Math.abs(unit[3] - unit[1]));
 
-    for (const part of mergeCoincidentParts(parts, tolerance)) {
+    const merged = mergeCoincidentParts(parts, tolerance);
+    // the ground under each part (world units): base and top are over it
+    const grounds = terrain ? partGrounds(merged, terrain) : new Float64Array(merged.length);
+    merged.forEach((part, pi) => {
       const { coords, holes, ringStarts, ringEnds, area, base, top } = part;
+      const ground = grounds[pi];
       const id = buildings.length <= MAX_FEATURE_ID ? buildings.length : NO_FEATURE_ID;
       footprints.push({
-        coords, holes, ringStarts, ringEnds, base: base * metersToNorm, top: top * metersToNorm, roofChart: getRoofChart(top), id,
-        roof: true,
+        coords, holes, ringStarts, ringEnds, base: ground + base * metersToNorm, top: ground + top * metersToNorm,
+        roofChart: getRoofChart(ground / metersToNorm + top), id, roof: true,
       });
 
       if (id !== NO_FEATURE_ID) {
@@ -544,7 +587,7 @@ export function buildBuildings(
           height: top,
         });
       }
-    }
+    });
   }
 
   // The tallest first: seen from above they are in front, so the depth test drops the covered roofs and walls of the
@@ -557,20 +600,23 @@ export function buildBuildings(
   const traceTrees: TraceTree[] = [];
   if (wantTrees) {
     const boxes = buildTrees(vt, toMap, polygonToMap, metersToNorm);
+    // the ground at the center of each tree (its trunk and crown are a pair of boxes)
+    const grounds = boxes.map((box) => terrain ? terrain.heightAt(box.x, box.y) : 0);
     for (let i = 0; i + 1 < boxes.length; i += 2) {
-      const trunk = boxes[i], crown = boxes[i + 1];
+      const trunk = boxes[i], crown = boxes[i + 1], ground = grounds[i];
       traceTrees.push({
-        x: crown.x, y: crown.y, angle: crown.angle, trunkHalf: trunk.half, crownHalf: crown.half,
-        crownBase: crown.base * metersToNorm, top: crown.top * metersToNorm,
+        x: crown.x, y: crown.y, base: ground, angle: crown.angle, trunkHalf: trunk.half, crownHalf: crown.half,
+        crownBase: ground + crown.base * metersToNorm, top: ground + crown.top * metersToNorm,
       });
     }
-    for (const box of boxes) {
+    boxes.forEach((box, i) => {
+      const ground = grounds[i];
       footprints.push({
-        coords: box.coords, holes: [], ringStarts: [0], ringEnds: [4], base: box.base * metersToNorm,
-        top: box.top * metersToNorm, roofChart: getRoofChart(box.top), id: TREE_MATERIAL_BASE_ID - box.material,
-        roof: box.material !== 0,
+        coords: box.coords, holes: [], ringStarts: [0], ringEnds: [4], base: ground + box.base * metersToNorm,
+        top: ground + box.top * metersToNorm, roofChart: getRoofChart(ground / metersToNorm + box.top),
+        id: TREE_MATERIAL_BASE_ID - box.material, roof: box.material !== 0,
       });
-    }
+    });
   }
 
   // The walls inside other parts, see findWallBottoms. Per edge the bottom of its wall, NaN when it isn't drawn. Per
@@ -679,9 +725,10 @@ export function buildBuildings(
     min[0] = min[1] = min[2] = 0;
     max[0] = max[1] = max[2] = 0;
   }
-  // The ground plane of the ray tracing is the ground quad (y 0), the layers lie a few cm over it (see LAYER_GAP)
+  // The ground plane of the ray tracing is the ground quad (y 0), the layers lie a few cm over it (see LAYER_GAP). On
+  // the terrain the bases are on the ground already
   const buildingFootprints = footprints.slice(0, treeStart);
-  const trace = buildTraceBlock(buildingFootprints, traceTrees, 0, buildingFootprints.map((fp) => fp.id));
+  const trace = buildTraceBlock(buildingFootprints, traceTrees, terrain ? null : 0, buildingFootprints.map((fp) => fp.id));
   const { vertices, quantization } = quantizeVertices(verts, min, max);
   return {
     vertices, quantization, lightmap: new Float32Array(lightmap), indices: new Uint32Array(indices), trace, buildings, min, max,
@@ -725,6 +772,50 @@ function buildingHeights(p: Props, tile: TileCoord, index: number): { base: numb
   let base = Number(p.render_min_height);
   if (!isFinite(base) || base < 0 || base >= top) base = 0;
   return { base, top };
+}
+
+/**
+ * The ground (world units) under each building part: the lowest under its footprint, so no wall stops above the slope.
+ * A part over the ground (render_min_height > 0, the upper part of a tower) stands on the ground of the part on the ground
+ * around its center, so the parts of a building stack without a step. Without one, its own.
+ */
+function partGrounds(parts: BuildingPart[], terrain: TerrainGrid): Float64Array {
+  const own = new Float64Array(parts.length);
+  parts.forEach((p, i) => own[i] = terrain.minHeight(p.coords, p.ringStarts[0], p.ringEnds[0]));
+  if (parts.every((p) => p.base <= 0)) return own;
+
+  // the parts on the ground in a grid of buckets over the tile, by their boxes
+  const B = 32;
+  const bx = (x: number) => Math.min(Math.max(Math.floor((x - terrain.x0) / (terrain.x1 - terrain.x0) * B), 0), B - 1);
+  const by = (y: number) => Math.min(Math.max(Math.floor((y - terrain.y0) / (terrain.y1 - terrain.y0) * B), 0), B - 1);
+  const buckets: number[][] = Array.from({ length: B * B }, () => []);
+  const boxes = new Float64Array(parts.length * 4);
+  parts.forEach((p, i) => {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (let k = p.ringStarts[0]; k < p.ringEnds[0]; k++) {
+      const x = p.coords[k * 2], y = p.coords[k * 2 + 1];
+      x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y);
+    }
+    boxes.set([x0, y0, x1, y1], i * 4);
+    if (p.base > 0) return;
+    for (let j = by(y0); j <= by(y1); j++) for (let k = bx(x0); k <= bx(x1); k++) buckets[j * B + k].push(i);
+  });
+
+  const grounds = Float64Array.from(own);
+  parts.forEach((p, i) => {
+    if (p.base <= 0) return;
+    const s = p.ringStarts[0], e = p.ringEnds[0];
+    let cx = 0, cy = 0;
+    for (let k = s; k < e; k++) { cx += p.coords[k * 2]; cy += p.coords[k * 2 + 1]; }
+    cx /= e - s; cy /= e - s;
+    for (const q of buckets[by(cy) * B + bx(cx)]) {
+      if (cx < boxes[q * 4] || cx > boxes[q * 4 + 2] || cy < boxes[q * 4 + 1] || cy > boxes[q * 4 + 3]) continue;
+      if (!insideRing(parts[q].coords, parts[q].ringStarts[0], parts[q].ringEnds[0], cx, cy)) continue;
+      grounds[i] = own[q];
+      break;
+    }
+  });
+  return grounds;
 }
 
 /** A building polygon before mergeCoincidentParts: map coords (rings normalised), base and top in meters. */

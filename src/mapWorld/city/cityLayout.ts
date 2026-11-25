@@ -37,6 +37,9 @@ export const GBUFFER_ATLAS_MAX = 0x7FFFF;
 export const SURFACE_WALL = 0x40000000;
 //the heights of the roof charts, in m: roofs closer than this in height can share a chart
 const ROOF_CHART_STEP_M = .25;
+//added to the height of a roof before getRoofChart makes it a chart: with the terrain the heights are relative to the
+//ground at the projection center (see ElevationService), a roof in a valley below it has a negative one
+const ROOF_CHART_OFFSET_M = 10000;
 //a child of a BVH node that is a record, see isOccluded in skyVisibilityTrace.wgsl
 export const CITY_LEAF = 0x80000000;
 //the count of a tree record, see CityTraceBlock
@@ -95,6 +98,8 @@ export type CityTraceBlock = {
 export type TraceTree = {
   x: number;
   y: number;
+  //the bottom of the trunk: the ground under the tree
+  base: number;
   angle: number;
   trunkHalf: number;
   crownHalf: number;
@@ -116,13 +121,14 @@ export function getWallSurfaceId(tileX: number, tileY: number): number {
 }
 
 /**
- * The roof chart of a building of height topM (m): its height in steps of ROOF_CHART_STEP_M, an integer, so the roof
+ * The roof chart of a building of height topM (m, over the projection center's ground): its height (plus
+ * ROOF_CHART_OFFSET_M) in steps of ROOF_CHART_STEP_M, an integer, so the roof
  * vertices (lightmap attribute x, a float) and the building record of the ray tracing (a u32) get the same one.
  * getRoofSurface in cityLightmapSurface.wgsl makes it a surface id. Not from the height in world units in the shader: the
  * interpolated height of a roof that lies on a step boundary would flicker between 2 charts.
  */
 export function getRoofChart(topM: number): number {
-  return Math.min(Math.max(Math.round(topM / ROOF_CHART_STEP_M), 0), 0xFFFFFF);
+  return Math.min(Math.max(Math.round((topM + ROOF_CHART_OFFSET_M) / ROOF_CHART_STEP_M), 0), 0xFFFFFF);
 }
 
 //the bits of x and y interleaved, 16 each
@@ -291,10 +297,10 @@ export function layoutWalls(polygons: BuildingPolygon[], tileX: number, tileY: n
 /**
  * The BVH, records, edges and tree shapes of the tile (see CityTraceBlock). groundY: the height of the ground plane of the
  * ray tracing, a building or tree that stands on the ground (base 0) goes down to it, so no ray passes under its walls
- * between the ground layers. ids: per polygon its feature id, see CityTraceBlock (-1 for all without). Null without
- * buildings and trees
+ * between the ground layers. Null on the terrain: the bases are on the ground already (see terrainGrid.ts). ids: per
+ * polygon its feature id, see CityTraceBlock (-1 for all without). Null without buildings and trees
  */
-export function buildTraceBlock(polygons: BuildingPolygon[], trees: TraceTree[], groundY: number, ids?: ArrayLike<number>): CityTraceBlock | null {
+export function buildTraceBlock(polygons: BuildingPolygon[], trees: TraceTree[], groundY: number | null, ids?: ArrayLike<number>): CityTraceBlock | null {
   const buildingCount = polygons.length;
   const treeCount = trees.length;
   if (buildingCount + treeCount === 0) return null;
@@ -315,7 +321,7 @@ export function buildTraceBlock(polygons: BuildingPolygon[], trees: TraceTree[],
         if (p.coords[ia * 2] !== p.coords[ib * 2] || p.coords[ia * 2 + 1] !== p.coords[ib * 2 + 1]) edgeCount++;
       }
     }
-    const base = p.base <= 0 ? groundY : p.base;
+    const base = groundY !== null && p.base <= 0 ? groundY : p.base;
     boxMin.push(new Vector3(minX, base, minZ));
     boxMax.push(new Vector3(maxX, p.top, maxZ));
   }
@@ -323,7 +329,7 @@ export function buildTraceBlock(polygons: BuildingPolygon[], trees: TraceTree[],
   //(cos, -sin) * crownHalf (the corners of square in worldTrees.ts, z = -north), its box reaches |cos| + |sin| of it
   for (const t of trees) {
     const reach = (Math.abs(Math.cos(t.angle)) + Math.abs(Math.sin(t.angle))) * t.crownHalf;
-    boxMin.push(new Vector3(t.x - reach, groundY, -t.y - reach));
+    boxMin.push(new Vector3(t.x - reach, groundY ?? t.base, -t.y - reach));
     boxMax.push(new Vector3(t.x + reach, t.top, -t.y + reach));
   }
 
@@ -377,7 +383,7 @@ export function buildTraceBlock(polygons: BuildingPolygon[], trees: TraceTree[],
   trees.forEach((t, ti) => {
     const record = (recordStart + buildingCount + ti) * 4;
     const shape = shapeStart + ti * 2;
-    f[record] = groundY;
+    f[record] = groundY ?? t.base;
     f[record + 1] = t.top;
     u[record + 2] = shape;
     u[record + 3] = CITY_TREE;

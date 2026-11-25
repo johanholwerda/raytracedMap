@@ -18,7 +18,9 @@ import type { WorldBuildingResult, WorldTileResult } from './worldGeometryCore';
 import type { WallAtlasMeshData } from '../city/WallAtlasView';
 import OpenFreeMapTileService from './OpenFreeMapTileService';
 import WorldWorkerPool from './WorldWorkerPool';
+import type ElevationService from './ElevationService';
 import type CityScene from '../city/CityScene';
+import type TerrainLayerBuffer from '../../mapOSM/TerrainLayerBuffer';
 
 export type WorldTileStreamerConfig = {
   renderer: Renderer;
@@ -33,6 +35,8 @@ export type WorldTileStreamerConfig = {
   cityScene?: CityScene;
   /** Gets the road center lines of the terrain tiles that come and go, see CarTraffic. */
   roads?: RoadTileSink;
+  /** Gets the ground meshes of the terrain tiles with heights (see setElevation). */
+  ground?: TerrainLayerBuffer;
 };
 
 /** Takes the road center lines of the terrain tiles (WorldTileResult.roads), by tile key. */
@@ -64,6 +68,9 @@ export default class WorldTileStreamer {
   private static readonly MAX_CONCURRENT_FETCHES = 8;
   // Tallest buildings we expect, used for the tile-vs-frustum test.
   private static readonly MAX_BUILDING_HEIGHT_M = 400;
+  // The range of the ground (m, relative to the projection center's) of the tile-vs-frustum test while its elevation tile
+  // isn't loaded
+  private static readonly UNKNOWN_GROUND_M: [number, number] = [-1000, 1000];
 
   private renderer: Renderer;
   private camera: MapCamera;
@@ -75,6 +82,9 @@ export default class WorldTileStreamer {
   private onTileError?: (message: string) => void;
   private cityScene?: CityScene;
   private roads?: RoadTileSink;
+  private ground?: TerrainLayerBuffer;
+  // the heights of the ground, null: the flat ground at 0. See setElevation
+  private elevation: ElevationService | null = null;
 
   // --- tile state ---
   private loadedTerrainTiles: Set<string> = new Set();
@@ -143,6 +153,7 @@ export default class WorldTileStreamer {
     this.onTileError = config.onTileError;
     this.cityScene = config.cityScene;
     this.roads = config.roads;
+    this.ground = config.ground;
   }
 
   public init(paramGroup: ParamGroup): void {
@@ -162,6 +173,14 @@ export default class WorldTileStreamer {
 
   public setCityStreamingEnabled(enabled: boolean): void {
     this.cityStreamingEnabled = enabled;
+  }
+
+  /**
+   * The heights of the ground the tiles are built on (null: flat at 0). Takes effect for the tiles requested from now
+   * on: the host clears the loaded ones.
+   */
+  public setElevation(elevation: ElevationService | null): void {
+    this.elevation = elevation;
   }
 
   /**
@@ -211,6 +230,7 @@ export default class WorldTileStreamer {
 
   public clearAllTerrainTiles(): void {
     for (const layer of this.layers) layer.buffer.clear();
+    this.ground?.clear();
     this.roads?.clear();
     this.loadedTerrainTiles.clear();
     this.dropStale();
@@ -309,13 +329,17 @@ export default class WorldTileStreamer {
     return Math.sqrt(dx * dx + dz * dz);
   }
 
-  private tileVisible(bounds: LatLngBounds, maxHeightMeters: number): boolean {
+  private tileVisible(tile: TileCoord, bounds: LatLngBounds, maxHeightMeters: number): boolean {
     const sw = this.swScratch, ne = this.neScratch;
     this.projection.latLngToWorldInto(bounds.south, bounds.west, sw);
     this.projection.latLngToWorldInto(bounds.north, bounds.east, ne);
     const h = maxHeightMeters / this.projection.metersPerUnit;
-    const min = this.minScratch.setValues(Math.min(sw.x, ne.x), 0, Math.min(sw.z, ne.z));
-    const max = this.maxScratch.setValues(Math.max(sw.x, ne.x), h, Math.max(sw.z, ne.z));
+    // the ground: from the elevation tile around it, a wide range until that is loaded
+    let ground: [number, number] = [0, 0];
+    if (this.elevation) ground = this.elevation.tileRange(tile) ?? WorldTileStreamer.UNKNOWN_GROUND_M;
+    const lo = ground[0] / this.projection.metersPerUnit, hi = ground[1] / this.projection.metersPerUnit;
+    const min = this.minScratch.setValues(Math.min(sw.x, ne.x), lo, Math.min(sw.z, ne.z));
+    const max = this.maxScratch.setValues(Math.max(sw.x, ne.x), hi + h, Math.max(sw.z, ne.z));
     const sun = this.sunDirection;
     if (sun && sun.y > 0) {
       // the box grown by the shadow on the ground of its top, away from the sun. Its length is capped (the sun at
@@ -378,7 +402,7 @@ export default class WorldTileStreamer {
         const failedAt = this.failedTiles.get(key);
         if (failedAt && now - failedAt < WorldTileStreamer.RETRY_COOLDOWN_MS) continue;
 
-        const visible = this.tileVisible(bounds, needCity ? WorldTileStreamer.MAX_BUILDING_HEIGHT_M : 1) ? 0 : 1;
+        const visible = this.tileVisible(tile, bounds, needCity ? WorldTileStreamer.MAX_BUILDING_HEIGHT_M : 1) ? 0 : 1;
         if (frustumOnly && visible === 1) continue;
         candidates.push({ tile, key, terrain: needTerrain, city: needCity, visible, distSq: dx * dx + dy * dy });
       }
@@ -389,6 +413,7 @@ export default class WorldTileStreamer {
     for (const key of this.loadedTerrainTiles) if (!this.terrainDesired.has(key)) terrainRemove.push(key);
     if (terrainRemove.length) {
       for (const layer of this.layers) layer.buffer.removeTiles(terrainRemove);
+      this.ground?.removeTiles(terrainRemove);
       for (const key of terrainRemove) {
         this.loadedTerrainTiles.delete(key);
         this.roads?.removeTile(key);
@@ -425,15 +450,25 @@ export default class WorldTileStreamer {
     const bounds = this.projection.bounds;
     this.inFlight.set(key, { terrain: entry.terrain, city: entry.city });
     const url = this.tiles.tileUrl(tile);
+    // the heights of the ground, in parallel with the vector tile
+    const heightsPromise = this.elevation ? this.elevation.getTileGrid(tile) : Promise.resolve(null);
+    // rejections are handled where it is awaited, not when the vector tile fails first
+    heightsPromise.catch(() => {});
 
     void (async (): Promise<WorldTileResult | null> => {
       const response = await fetch(url);
-      // No data for this tile (open ocean at high zoom, …).
-      if (response.status === 204 || response.status === 404) return null;
-      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-      const pbf = await response.arrayBuffer();
+      let pbf: ArrayBuffer;
+      // No data for this tile (open ocean at high zoom, …). On the terrain it still gets its ground.
+      if (response.status === 204 || response.status === 404) {
+        if (!this.elevation) return null;
+        pbf = new ArrayBuffer(0);
+      } else {
+        if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+        pbf = await response.arrayBuffer();
+      }
+      const heights = await heightsPromise;
       if (generation !== this.generation) return null;
-      return this.pool.buildTile(pbf, tile, bounds, entry.terrain, entry.city, this.treesEnabled);
+      return this.pool.buildTile(pbf, tile, bounds, entry.terrain, entry.city, this.treesEnabled, heights);
     })()
       .then((result) => {
         if (generation !== this.generation) return;
@@ -462,6 +497,7 @@ export default class WorldTileStreamer {
           if (l && l.indices.length) layer.buffer.addTile(key, l.vertices, l.indices);
         }
       }
+      if (result?.ground) this.ground?.addTile(key, result.ground.vertices, result.ground.indices);
       if (result?.roads?.length) this.roads?.addTile(key, result.roads);
       // Empty tiles are recorded too, so they aren't re-requested.
       this.loadedTerrainTiles.add(key);
