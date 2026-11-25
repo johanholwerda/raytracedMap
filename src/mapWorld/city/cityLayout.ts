@@ -1,4 +1,5 @@
 import Vector3 from 'webGPU-framework/renderer/math/Vector3';
+import { hypot2 } from 'webGPU-framework/renderer/utils/MathUtils';
 import ModelBVH from './ModelBVH';
 
 /*
@@ -189,7 +190,7 @@ export function layoutWalls(polygons: BuildingPolygon[], tileX: number, tileY: n
       let chunk: Chunk | null = null;
       for (let j = 0; j < n; j++) {
         const ia = s + j, ib = s + ((j + 1) % n);
-        const len = Math.hypot(p.coords[ib * 2] - p.coords[ia * 2], p.coords[ib * 2 + 1] - p.coords[ia * 2 + 1]);
+        const len = hypot2(p.coords[ib * 2] - p.coords[ia * 2], p.coords[ib * 2 + 1] - p.coords[ia * 2 + 1]);
         const bottom = bottoms ? bottoms[ia] : p.base;
         //a wall that isn't drawn: the next one starts a chunk of its own, it isn't next to the one before it
         if (len > 0 && Number.isNaN(bottom)) {
@@ -345,10 +346,9 @@ export function buildTraceBlock(polygons: BuildingPolygon[], trees: TraceTree[],
   const u = new Uint32Array(data);
   const f = new Float32Array(data);
 
-  //the nodes, with the children as vec4 indices of the block. The records are in the order of the boxes
-  const nodeData = new ArrayBuffer(nodeCount * ModelBVH.bytesPerNode);
-  bvh.setNodeData(nodeData);
-  u.set(new Uint32Array(nodeData), 0);
+  //the nodes (at the start of the block), with the children as vec4 indices of the block. The records are in the order
+  //of the boxes
+  bvh.setNodeData(data);
   for (let n = 0; n < nodeCount; n++) {
     for (let w = n * 16 + 3; w < n * 16 + 8; w += 4) {
       const child = u[w];

@@ -24,10 +24,11 @@ import DeferredShading from './deferred/DeferredShading';
 import WaterReflectionHalfRes from './deferred/WaterReflectionHalfRes';
 import { NOTABLE_BUILDINGS } from './map/notableBuildings';
 import { describeCity, findCity, pickRandomCity, pickStartCity } from './map/worldCities';
+import type { City } from './map/worldCities';
 import OpenFreeMapTileService from './map/OpenFreeMapTileService';
 import WorldWorkerPool from './map/WorldWorkerPool';
-import WorldTileStreamer from './map/WorldTileStreamer';
-import ElevationService from './map/ElevationService';
+import WorldTileStreamer, { PreviewCamera } from './map/WorldTileStreamer';
+import ElevationClient from './map/ElevationClient';
 import TerrainHeightField from './map/TerrainHeightField';
 import TiltShift from './tiltShift/TiltShift';
 import SkyVisibilityLightmap, { LightmapView } from './skyVisibilityLightmap/SkyVisibilityLightmap';
@@ -66,6 +67,14 @@ const CAMERA_PITCH_MIN = -1.4;
 const CAMERA_PITCH_MAX = -.2;
 const CAMERA_DISTANCE_MIN = .1;
 const CAMERA_DISTANCE_MAX = 2;
+// what it starts with: the pitch and the distance (the yaw is 0), and its lens
+const CAMERA_PITCH_START = -.7;
+const CAMERA_DISTANCE_START = 1;
+const CAMERA_FOV = 1;
+const CAMERA_NEAR = .01;
+// The frames the page draws with 1 map worker before the others join in, see MapWorld.startTiles: the first frames
+// compile the pipelines, which the GPU process does on the cores the workers would take
+const START_FRAMES = 4;
 // ms the orbit camera has to stand still before its view goes into the URL, see updateUrl
 const URL_CAMERA_DELAY_MS = 500;
 // ms after the last input (pointer, wheel, key) in which the camera moving counts as the user moving it: the zoom
@@ -131,9 +140,11 @@ export default class MapWorld {
   private orbitKeys!: OrbitKeyRotation;
   private bounds: LatLngBounds = DEFAULT_BOUNDS;
   private workerPool!: WorldWorkerPool;
+  // the frames to draw before all map workers work, see startTiles
+  private startFrames: number = START_FRAMES;
   private tileService: OpenFreeMapTileService = new OpenFreeMapTileService();
   // The heights of the ground: the tiles are built on it while the elevation param is on, see applyElevation
-  private elevation: ElevationService = new ElevationService();
+  private elevation: ElevationClient = new ElevationClient();
   private elevationParam!: ParamBool;
   // the ground of the loaded tiles, for the cars, the camera pivot and the plane (empty with the elevation off: flat 0)
   private heightField!: TerrainHeightField;
@@ -242,6 +253,10 @@ export default class MapWorld {
     // router5 strips query params on start; bootstrap.ts keeps the original.
     const urlParams = new URLSearchParams(window.location.search || (window as any).__initialSearch || '');
 
+    // The tiles of the first view, before the GPU: asking for the WebGPU device takes half a second or more of waiting,
+    // in which the tiles are fetched and built already (see startTiles). The map draws them in its first frames.
+    const tilesStarted = this.startTiles(urlParams, canvasParent);
+
     this.renderer = new Renderer();
     // ?res=2160: the canvas this many pixels high, for timings at a fixed resolution
     // const res = parseFloat(urlParams.get('res') ?? '');
@@ -253,7 +268,10 @@ export default class MapWorld {
     // SkyVisibilityLightmap. CityScene stays at its 128 MiB whatever the limit
     const requiredLimits: Record<string, GPUSize64> = isMobile() ? {} : { maxStorageBufferBindingSize: 2 ** 32 };
     await this.renderer.init(canvasParent, { sampleCount: 1, pixelRatio: -1, requiredLimits });
-    if (!this.renderer.device) return false;
+    if (!this.renderer.device) {
+      this.workerPool.destroy();
+      return false;
+    }
     // await this.renderer.init(canvasParent, { sampleCount: 1, pixelRatio: 1});
     if (urlParams.has('bench')) {
       this.bench = new MapWorldBench(this.renderer, urlParams);
@@ -263,16 +281,13 @@ export default class MapWorld {
     if (urlParams.has('video')) this.video = this.createVideo();
     this.renderer.setClearColor(0, 0, 0, 1);
 
-    // Read the current OpenFreeMap tile URL (it changes with each planet build).
-    await this.tileService.init();
-
     this.camera = new MapCamera(this.renderer, {
-      fov: 1,
-      nearPlane: 0.01,
+      fov: CAMERA_FOV,
+      nearPlane: CAMERA_NEAR,
       farPlane: 10,
-      zPosition: 1,
+      zPosition: CAMERA_DISTANCE_START,
     });
-    this.camera.rotationController.eulerXY = new Vector2(-.7, 0);
+    this.camera.rotationController.eulerXY = new Vector2(CAMERA_PITCH_START, 0);
     // always look a bit down, never from under the map
     this.camera.rotationController.rotationLimitX = new Vector2(CAMERA_PITCH_MIN, CAMERA_PITCH_MAX);
     this.camera.setDistanceLimit(CAMERA_DISTANCE_MIN, CAMERA_DISTANCE_MAX);
@@ -323,8 +338,6 @@ export default class MapWorld {
     for (const layer of this.geometry.layers) {
       if (layer.def.key === 'water' || layer.def.key === 'waterways') this.waterMaterials |= 1 << this.gBuffer.materialIndex(layer.material);
     }
-    this.workerPool = new WorldWorkerPool();
-
     // Click-to-select buildings; the address comes from Nominatim.
     this.picker = new BuildingPicker(this.renderer, canvasParent, () => this.dirty = true);
 
@@ -348,32 +361,22 @@ export default class MapWorld {
       },
     });
 
-    this.heightField = new TerrainHeightField(this.projection);
     this.traffic.setHeightField(this.heightField);
     this.airplane.ground = (x, z) => this.heightField.heightAt(x, z);
-    this.tileStreamer = new WorldTileStreamer({
+    // where the tiles startTiles asked for go: the built ones wait for the first frame
+    this.tileStreamer.attach({
       renderer: this.renderer,
       camera: this.camera,
-      projection: this.projection,
       layers: this.geometry.layers,
       meshBounds: this.geometry.meshBounds,
-      workerPool: this.workerPool,
-      tileService: this.tileService,
-      onTileError: (msg) => this.ui.showTileError(msg),
       cityScene: this.skyLightmap.cityScene,
       roads: this.traffic,
       ground: this.geometry.groundBuffer,
-      heightField: this.heightField,
     });
     // on by default, see the elevation param
-    this.tileStreamer.setElevation(this.elevation);
     this.geometry.elevation = true;
 
-    // Start on one of a few well-known cities (pickStartCity). The projection
-    // is centered on it so vertex coordinates stay small (fp32 precision).
-    // ?lat=&lng=(&dist=&pitch=&yaw=): the camera of a shared link, see updateUrl. Not in a bench or a video,
-    // they move the camera themselves.
-    const urlCamera = this.bench || this.video ? null : parseUrlCamera(urlParams);
+    const { urlCamera, city } = await tilesStarted;
     // not in a bench: its frames have to compare between runs
     const timeIndex = TIMES_OF_DAY.indexOf(urlParams.get('time') ?? '');
     if (!this.bench && timeIndex >= 0) this.urlTimeOfDay = timeIndex as TimeOfDay;
@@ -384,34 +387,97 @@ export default class MapWorld {
     window.addEventListener('pointermove', (e) => { if (e.buttons) markInput(); }, inputOptions);
     window.addEventListener('wheel', markInput, inputOptions);
     window.addEventListener('keydown', markInput, inputOptions);
-    if (urlCamera) {
-      this.bounds = this.boundsAround(urlCamera.lat, urlCamera.lng);
-      LogGL.log(`[MapWorld] centering on the URL camera (${urlCamera.lat}, ${urlCamera.lng})`);
-    } else {
-      // ?city=Paris: always the same city, for timings
-      const cityName = urlParams.get('city');
-      const city = (cityName ? await findCity(cityName) : undefined) ?? pickStartCity();
-      this.bounds = this.boundsAround(city.lat, city.lng);
-      LogGL.log(`[MapWorld] centering on ${describeCity(city)}`);
-      this.ui.showLocationTitle(city.name, city.landmark || undefined);
-    }
+    if (city) this.ui.showLocationTitle(city.name, city.landmark || undefined);
     if (!this.video && !this.bench) this.ui.showControlsHint();
 
-    await this.loadFromBounds(this.bounds);
+    // the place is set and its tiles are asked for (startTiles): the rest of loadFromBounds
+    this.resetView();
     if (urlCamera) this.applyUrlCamera(urlCamera);
     return true;
   }
 
-  /** The pitch, yaw and distance of the URL (the pivot is at its lat/lng already, loadFromBounds centered there). */
-  private applyUrlCamera(urlCamera: UrlCamera): void {
-    const euler = this.camera.rotationController.eulerXY;
-    const toRad = Math.PI / 180;
-    const pitch = Number.isFinite(urlCamera.pitch) ? clamp(urlCamera.pitch * toRad, CAMERA_PITCH_MIN, CAMERA_PITCH_MAX) : euler.x;
-    const yaw = Number.isFinite(urlCamera.yaw) ? urlCamera.yaw * toRad : euler.y;
-    this.camera.rotationController.eulerXY = new Vector2(pitch, yaw);
-    if (Number.isFinite(urlCamera.dist)) {
-      this.camera.distance = clamp(urlCamera.dist * this.projection.metersToNorm, CAMERA_DISTANCE_MIN, CAMERA_DISTANCE_MAX);
+  /**
+   * What the tiles need, none of it the GPU, and the requests for the tiles of the view the map starts with: the
+   * workers, the tile service, the place (the projection centered on it) and the streamer, which asks for the tiles
+   * of a PreviewCamera with that view (WorldTileStreamer.prefetch). Returns the camera of the URL (null without) and
+   * the city the map starts on (undefined with a URL camera).
+   */
+  private async startTiles(urlParams: URLSearchParams, canvasParent: HTMLElement): Promise<{ urlCamera: UrlCamera | null; city?: City }> {
+    // ?workers=4: the number of map workers, for timings (default: see WorldWorkerPool)
+    this.workerPool = new WorldWorkerPool(parseInt(urlParams.get('workers') ?? '') || undefined, this.elevation);
+    // 1 of them until the map has drawn its first START_FRAMES frames (update lifts it): until then the GPU process
+    // starts up and compiles the pipelines next to them. With all cores busy the WebGPU device took 2 s instead of 0.6 s
+    // (and now and then over 4 s on a machine that was busy with other things, also with 2 workers), with 1 it comes
+    // about as without. And with all workers from the device on, the first tiles were on screen after 1.5 s instead of
+    // 1 s: the first frames took longer. ?earlyWorkers=2 for timings
+    const early = parseInt(urlParams.get('earlyWorkers') ?? '');
+    this.workerPool.activeLimit = Number.isFinite(early) ? early : 1;
+    // Reads the current OpenFreeMap tile URL (it changes with each planet build).
+    const tileService = this.tileService.init();
+    this.heightField = new TerrainHeightField(this.projection);
+    this.tileStreamer = new WorldTileStreamer({
+      projection: this.projection,
+      workerPool: this.workerPool,
+      tileService: this.tileService,
+      onTileError: (msg) => this.ui?.showTileError(msg),
+      heightField: this.heightField,
+    });
+    // on by default, see the elevation param
+    this.tileStreamer.setElevation(this.elevation);
+
+    // Start on one of a few well-known cities (pickStartCity). The projection
+    // is centered on it so vertex coordinates stay small (fp32 precision).
+    // ?lat=&lng=(&dist=&pitch=&yaw=): the camera of a shared link, see updateUrl. Not in a bench or a video,
+    // they move the camera themselves.
+    const urlCamera = urlParams.has('bench') || urlParams.has('video') ? null : parseUrlCamera(urlParams);
+    let city: City | undefined;
+    if (urlCamera) {
+      this.setPlace(this.boundsAround(urlCamera.lat, urlCamera.lng));
+      LogGL.log(`[MapWorld] centering on the URL camera (${urlCamera.lat}, ${urlCamera.lng})`);
+    } else {
+      // ?city=Paris: always the same city, for timings
+      const cityName = urlParams.get('city');
+      city = (cityName ? await findCity(cityName) : undefined) ?? pickStartCity();
+      this.setPlace(this.boundsAround(city.lat, city.lng));
+      LogGL.log(`[MapWorld] centering on ${describeCity(city)}`);
     }
+    await tileService;
+
+    // The view of the first frame: the camera of start() with the camera of the URL (applyUrlCamera), the view distance
+    // of the quality init starts with (the far plane as updateFarPlane has it), the canvas as wide as its parent
+    const view = this.startView(urlCamera);
+    const viewDistance = qualitySettings[this.startQuality].viewDistanceMax;
+    const height = Math.max(view.distance * Math.sin(-view.pitch), 0);
+    const size = canvasParent.getBoundingClientRect();
+    const preview = new PreviewCamera(CAMERA_FOV, CAMERA_NEAR, Math.hypot(viewDistance, height), view.distance, view.pitch, view.yaw,
+      size.width / Math.max(size.height, 1) || 1);
+    this.tileStreamer.setViewDistanceMax(viewDistance);
+    this.tileStreamer.setTerrainStreamingEnabled(true);
+    this.tileStreamer.setCityStreamingEnabled(true);
+    this.tileStreamer.prefetch(preview);
+    return { urlCamera, city };
+  }
+
+  /** The quality the map starts with, see the quality param. */
+  private get startQuality(): Quality {
+    return isMobile() ? Quality.Medium : Quality.High;
+  }
+
+  /** The pitch, the yaw and the distance the orbit camera starts with: the ones of the URL where it has them. */
+  private startView(urlCamera: UrlCamera | null): { pitch: number; yaw: number; distance: number } {
+    const toRad = Math.PI / 180;
+    const pitch = urlCamera && Number.isFinite(urlCamera.pitch) ? clamp(urlCamera.pitch * toRad, CAMERA_PITCH_MIN, CAMERA_PITCH_MAX) : CAMERA_PITCH_START;
+    const yaw = urlCamera && Number.isFinite(urlCamera.yaw) ? urlCamera.yaw * toRad : 0;
+    const distance = urlCamera && Number.isFinite(urlCamera.dist)
+      ? clamp(urlCamera.dist * this.projection.metersToNorm, CAMERA_DISTANCE_MIN, CAMERA_DISTANCE_MAX) : CAMERA_DISTANCE_START;
+    return { pitch, yaw, distance };
+  }
+
+  /** The pitch, yaw and distance of the URL (the pivot is at its lat/lng already, setPlace centered there). */
+  private applyUrlCamera(urlCamera: UrlCamera): void {
+    const view = this.startView(urlCamera);
+    this.camera.rotationController.eulerXY = new Vector2(view.pitch, view.yaw);
+    this.camera.distance = view.distance;
   }
 
   /**
@@ -548,10 +614,22 @@ export default class MapWorld {
     this.tileStreamer.clearAllCityTiles();
     this.picker.clearSelection();
 
+    this.setPlace(bounds);
+    this.resetView();
+  }
+
+  /** The projection centered on a region, for the tiles asked for from now on. */
+  private setPlace(bounds: LatLngBounds): void {
     this.projection.setBounds(bounds);
     this.bounds = bounds;
     // the ground at the center is at y 0
     this.elevation.setOrigin(this.projection.latMid, this.projection.lngMid);
+    // the elevation of the tiles around it, while the map tiles are still to be asked for
+    if (this.elevationParam?.value !== false) this.elevation.preload(this.projection.latMid, this.projection.lngMid);
+  }
+
+  /** After setPlace: the camera on the center of the new projection, all that was of the old one gone, the tiles streaming. */
+  private resetView(): void {
     // the sun stands elsewhere at another latitude (before init, applyTimeOfDay does it)
     if (this.timeOfDay) this.applySunAngles();
     // Another projection center: everything the lightmap holds is somewhere else now.
@@ -573,7 +651,7 @@ export default class MapWorld {
   public init(): void {
     const paramGroup = new ParamGroup('controls');
     this.drawMode = paramGroup.addParamSelect('drawMode', DrawMode.Full, DRAW_MODES, { callback: () => this.applyDrawMode() });
-    this.quality = paramGroup.addParamSelect('quality', isMobile() ? Quality.Medium : Quality.High, QUALITIES, { callback: () => this.applyQuality() });
+    this.quality = paramGroup.addParamSelect('quality', this.startQuality, QUALITIES, { callback: () => this.applyQuality() });
     // the one of the URL, else a random one on every load, except in a bench: its frames have to compare between runs
     const timeOfDay = this.bench ? TimeOfDay.Afternoon : this.urlTimeOfDay ?? randomTimeOfDay();
     this.timeOfDay = paramGroup.addParamSelect('timeOfDay', timeOfDay, TIMES_OF_DAY, { callback: () => {
@@ -878,6 +956,8 @@ export default class MapWorld {
 
     this.draw(this.dirty, cameraMoving, tilesLoading, cityTilesChanged);
     this.dirty = false;
+    // all map workers from here on, see startTiles
+    if (this.startFrames > 0 && --this.startFrames === 0) this.workerPool.activeLimit = this.workerPool.size;
     if (this.screenshotRequested) {
       this.screenshotRequested = false;
       const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
@@ -1173,6 +1253,7 @@ export default class MapWorld {
     this.picker?.destruct();
     this.tileStreamer.destruct();
     this.workerPool?.destroy();
+    this.elevation.destroy();
     this.geometry?.destruct();
     this.ssao?.destruct();
     this.traffic?.destruct();

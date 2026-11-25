@@ -6,6 +6,11 @@
     <meta name="viewport" content="width=device-width"/>
 
     <title>raytracedMap</title>
+
+    <!-- the servers of the map tiles and the elevation tiles: connected to while the script loads, the first tiles
+         are asked for as soon as it runs (see MapWorld.startTiles) -->
+    <link rel="preconnect" href="https://tiles.openfreemap.org" crossorigin/>
+    <link rel="preconnect" href="https://s3.amazonaws.com" crossorigin/>
 </head>
 
 <body>

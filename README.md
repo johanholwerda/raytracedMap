@@ -140,9 +140,9 @@ The `drawMode` param has debug views of the lightmap: the sky light alone, the l
 Data
 ----
 
-Ground layers and building footprints with heights are OpenFreeMap vector tiles (OpenMapTiles schema, zoom 14), 1 request per tile, decoded and triangulated in workers. Addresses of clicked buildings are from Nominatim. © OpenFreeMap © OpenMapTiles, data © OpenStreetMap contributors.
+Ground layers and building footprints with heights are OpenFreeMap vector tiles (OpenMapTiles schema, zoom 14), 1 request per tile, fetched, decoded and triangulated in workers. Addresses of clicked buildings are from Nominatim. © OpenFreeMap © OpenMapTiles, data © OpenStreetMap contributors.
 
-The height of the ground is from the terrarium elevation tiles of the AWS terrain tiles (Mapzen), at zoom 12, decoded on the main thread (`ElevationService.ts`). Each map tile gets a grid of 65 x 65 heights, 1 cell per pixel of the elevation tiles, relative to the ground at the projection center, and the worker builds on it (`terrainGrid.ts`):
+The height of the ground is from the terrarium elevation tiles of the AWS terrain tiles (Mapzen), at zoom 12, fetched and decoded in the worker that also fetches the map tiles (`ElevationService.ts` in `tileFetchWorker.ts`), which hands each tile with its heights to a build worker. Each map tile gets a grid of 65 x 65 heights, 1 cell per pixel of the elevation tiles, relative to the ground at the projection center, and the worker builds on it (`terrainGrid.ts`):
 
 - the ground: a mesh of the grid, 2 triangles per cell, instead of the flat ground quad.
 - the normals: smooth, at the grid points from the heights around them (the grid has a ring of the neighbour tiles' heights, so both sides of a tile edge get the same ones), interpolated inside a triangle of the ground. A ground or layer vertex has its normal in the free .w of its vec4, x and z in 11 bits each, as an integer a float holds exactly (`terrainNormal.wgsl`). The water keeps the normal up, the buildings the flat one of the fragment shader.

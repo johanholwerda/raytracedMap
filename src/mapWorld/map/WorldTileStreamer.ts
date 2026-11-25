@@ -4,6 +4,8 @@ import Mesh from 'webGPU-framework/renderer/mesh/Mesh';
 import Vector3 from 'webGPU-framework/renderer/math/Vector3';
 import AABox from 'webGPU-framework/renderer/math/AABox';
 import MapCamera from 'webGPU-framework/utils/camera/MapCamera';
+import Camera from 'webGPU-framework/renderer/camera/Camera';
+import Transform from 'webGPU-framework/renderer/scene/Transform';
 import Frustum from 'webGPU-framework/utils/camera/Frustum';
 import ParamGroup from 'webGPU-framework/utils/params/ParamGroup';
 import ParamFloat from 'webGPU-framework/utils/params/ParamFloat';
@@ -18,29 +20,54 @@ import type { WorldBuildingResult, WorldTileResult } from './worldGeometryCore';
 import type { WallAtlasMeshData } from '../city/WallAtlasView';
 import OpenFreeMapTileService from './OpenFreeMapTileService';
 import WorldWorkerPool from './WorldWorkerPool';
-import type ElevationService from './ElevationService';
+import type ElevationClient from './ElevationClient';
 import type TerrainHeightField from './TerrainHeightField';
 import type CityScene from '../city/CityScene';
 import type TerrainLayerBuffer from '../osm/TerrainLayerBuffer';
 
+/** What the streamer needs to request tiles and have them built: nothing of the GPU, see WorldTileStreamer.prefetch. */
 export type WorldTileStreamerConfig = {
-  renderer: Renderer;
-  camera: MapCamera;
   projection: MapProjection;
-  layers: LayerRuntime[];
-  meshBounds: Map<Mesh, AABox>;
   workerPool: WorldWorkerPool;
   tileService: OpenFreeMapTileService;
   onTileError?: (message: string) => void;
+  /** Gets the heights of the terrain tiles, for what moves over the ground. */
+  heightField?: TerrainHeightField;
+};
+
+/** Where the built tiles go, and the camera they are streamed around: see WorldTileStreamer.attach. */
+export type WorldTileStreamerTargets = {
+  renderer: Renderer;
+  camera: MapCamera;
+  layers: LayerRuntime[];
+  meshBounds: Map<Mesh, AABox>;
   /** Gets the ray tracing data of the building tiles that come and go, see SkyVisibilityLightmap. */
   cityScene?: CityScene;
   /** Gets the road center lines of the terrain tiles that come and go, see CarTraffic. */
   roads?: RoadTileSink;
   /** Gets the ground meshes of the terrain tiles with heights (see setElevation). */
   ground?: TerrainLayerBuffer;
-  /** Gets the heights of the terrain tiles, for what moves over the ground. */
-  heightField?: TerrainHeightField;
 };
+
+/** The camera the tiles are streamed around: a MapCamera, or a PreviewCamera before there is one. */
+export type StreamCamera = Camera & { pivot: Transform; distance: number };
+
+/**
+ * A camera at a distance from a pivot it looks at, as a PivotCamera has it, without a renderer or input: the view the
+ * map will start with, for WorldTileStreamer.prefetch.
+ */
+export class PreviewCamera extends Camera {
+  public readonly pivot = new Transform();
+
+  /** pitch, yaw: the euler x and y of the pivot (radians). aspect: width / height of the view. */
+  constructor(fov: number, near: number, far: number, public readonly distance: number, pitch: number, yaw: number, aspect: number) {
+    super({ fov, nearPlane: near, farPlane: far });
+    this.parent = this.pivot;
+    this.setPositionValues(0, 0, distance);
+    this.pivot.euler = new Vector3(pitch, yaw, 0);
+    this.projection.aspectRatio = aspect;
+  }
+}
 
 /** Takes the road center lines of the terrain tiles (WorldTileResult.roads), by tile key. */
 export interface RoadTileSink {
@@ -60,6 +87,10 @@ type QueuedTile = { tile: TileCoord; key: string; terrain: boolean; city: boolea
  * buildings become one Mesh per tile with a recycled picking slot, exactly like
  * the 3DBAG tiles in mapOSM/TileStreamer, so picking/highlight/shadows/SSAO in
  * the host work unchanged.
+ *
+ * Requesting the tiles and building them (the fetches and the workers) needs no GPU: {@link prefetch} starts on the
+ * tiles of the first view while the page still waits for its WebGPU device (half a second or more), {@link attach} then
+ * gives the streamer where the built tiles go, and {@link update} runs it per frame from there on.
  */
 export default class WorldTileStreamer {
   public static readonly FEATURE_STRIDE = 65536;
@@ -69,22 +100,24 @@ export default class WorldTileStreamer {
   // The budget of applyTileResults per frame: the bytes of the ground uploaded, and the main thread time
   private static readonly RESULT_BYTES_PER_FRAME = 4 * 1048576;
   private static readonly RESULT_MS_PER_FRAME = 3;
-  // Concurrent tile requests (the fetch, then the worker), per worker of the pool: about half of a request is the fetch,
-  // with 1 per worker they were idle half the time. Queued tiles beyond this can still be cancelled when the camera moves
-  // away.
-  private static readonly FETCHES_PER_WORKER = 2;
-  private static readonly MIN_CONCURRENT_FETCHES = 8;
+  // The budgets times this while the map of a place first loads (see filling): the screen is empty, tiles on it sooner
+  // are worth more than short frames. With the tiles of prefetch waiting for the first frame, 1 building tile per frame
+  // took longer than building them did
+  private static readonly FILL_BUDGET_SCALE = 4;
+  // the load distance param before init made it (see prefetch), and its default
+  private static readonly LOAD_DISTANCE = isMobile() ? 1.5 : 2;
   // Tallest buildings we expect, used for the tile-vs-frustum test.
   private static readonly MAX_BUILDING_HEIGHT_M = 400;
   // The range of the ground (m, relative to the projection center's) of the tile-vs-frustum test while its elevation tile
   // isn't loaded
   private static readonly UNKNOWN_GROUND_M: [number, number] = [-1000, 1000];
 
-  private renderer: Renderer;
-  private camera: MapCamera;
+  // from attach on
+  private renderer!: Renderer;
+  private camera!: MapCamera;
+  private layers: LayerRuntime[] = [];
+  private meshBounds: Map<Mesh, AABox> = new Map();
   private projection: MapProjection;
-  private layers: LayerRuntime[];
-  private meshBounds: Map<Mesh, AABox>;
   private pool: WorldWorkerPool;
   private tiles: OpenFreeMapTileService;
   private onTileError?: (message: string) => void;
@@ -93,12 +126,13 @@ export default class WorldTileStreamer {
   private ground?: TerrainLayerBuffer;
   private heightField?: TerrainHeightField;
   // the heights of the ground, null: the flat ground at 0. See setElevation
-  private elevation: ElevationService | null = null;
+  private elevation: ElevationClient | null = null;
 
   // --- tile state ---
   private loadedTerrainTiles: Set<string> = new Set();
   private loadedCityTiles: Map<string, { mesh: Mesh | null; slot: number; wallTile: [number, number]; quantization: number[] }> = new Map();
-  private inFlight: Map<string, { terrain: boolean; city: boolean }> = new Map();
+  // the tiles the workers are at, with the job of the pool (see loadTile)
+  private inFlight: Map<string, { terrain: boolean; city: boolean; job: number }> = new Map();
   private fetchQueue: QueuedTile[] = [];
   private failedTiles: Map<string, number> = new Map();
   private cityReadyQueue: { key: string; result: WorldBuildingResult }[] = [];
@@ -110,6 +144,9 @@ export default class WorldTileStreamer {
   private terrainDesired: Set<string> = new Set();
   private cityDesired: Set<string> = new Set();
   private needsRestream = false;
+  // The map of a place is loading from nothing (from a clear until the streamer is idle): the results are applied with
+  // FILL_BUDGET_SCALE times the budget per frame
+  private filling = true;
 
   // --- picking slots (see mapOSM/TileStreamer) ---
   private slotBuildings: (BuildingInfo[] | null)[] = [];
@@ -156,18 +193,36 @@ export default class WorldTileStreamer {
   private viewDistanceMax = 8;
 
   constructor(config: WorldTileStreamerConfig) {
-    this.renderer = config.renderer;
-    this.camera = config.camera;
     this.projection = config.projection;
-    this.layers = config.layers;
-    this.meshBounds = config.meshBounds;
     this.pool = config.workerPool;
     this.tiles = config.tileService;
     this.onTileError = config.onTileError;
-    this.cityScene = config.cityScene;
-    this.roads = config.roads;
-    this.ground = config.ground;
     this.heightField = config.heightField;
+  }
+
+  /**
+   * Where the built tiles go and the camera they are streamed around, before the first update. The tiles prefetch
+   * asked for are kept: the ones that are built wait for the first update.
+   */
+  public attach(targets: WorldTileStreamerTargets): void {
+    this.renderer = targets.renderer;
+    this.camera = targets.camera;
+    this.layers = targets.layers;
+    this.meshBounds = targets.meshBounds;
+    this.cityScene = targets.cityScene;
+    this.roads = targets.roads;
+    this.ground = targets.ground;
+  }
+
+  /**
+   * Requests the tiles of the view of camera (a PreviewCamera of the view the map starts with) and has them built,
+   * before attach: the first update then finds them built or under way. With the streaming enabled, the projection and
+   * the tile service set up, and the view distance of the quality the map starts with (setViewDistanceMax). A tile the
+   * real camera doesn't want after all is dropped when it comes in.
+   */
+  public prefetch(camera: StreamCamera): void {
+    this.streamTiles(camera);
+    this.pumpFetchQueue();
   }
 
   public init(paramGroup: ParamGroup): void {
@@ -175,7 +230,7 @@ export default class WorldTileStreamer {
     const params = { callback: () => this.resetStreamingPosition() };
     // the buildings (and trees): times the view footprint of the camera height, see streamRadiusTiles. The ground loads
     // as far as viewDistanceMax, see setViewDistanceMax
-    this.radiusScaleParam = pg.addParamFloat('load distance', isMobile() ? 1.5 : 2, 0.1, 8, params);
+    this.radiusScaleParam = pg.addParamFloat('load distance', WorldTileStreamer.LOAD_DISTANCE, 0.1, 8, params);
     this.loadOnlyInFrustum = pg.addParamBool('loadOnlyInFrustum', true, params);
   }
 
@@ -193,7 +248,7 @@ export default class WorldTileStreamer {
    * The heights of the ground the tiles are built on (null: flat at 0). Takes effect for the tiles requested from now
    * on: the host clears the loaded ones.
    */
-  public setElevation(elevation: ElevationService | null): void {
+  public setElevation(elevation: ElevationClient | null): void {
     this.elevation = elevation;
   }
 
@@ -281,12 +336,15 @@ export default class WorldTileStreamer {
   /** Forget queued / in-flight requests; their results will be ignored. */
   private dropStale(): void {
     this.generation++;
+    // the workers don't build them: the tiles of the next place are waiting
+    for (const request of this.inFlight.values()) this.pool.cancel(request.job);
     this.inFlight.clear();
     this.resultQueue.clear();
     this.fetchQueue = [];
     this.failedTiles.clear();
     // Requests for still-wanted tiles may have been dropped; re-evaluate.
     this.needsRestream = true;
+    this.filling = true;
   }
 
   /**
@@ -330,6 +388,7 @@ export default class WorldTileStreamer {
     this.pumpFetchQueue();
     this.applyTileResults();
     this.finalizeCityMeshes();
+    if (this.isIdle()) this.filling = false;
   }
 
   /**
@@ -339,9 +398,11 @@ export default class WorldTileStreamer {
    */
   private applyTileResults(): void {
     const start = performance.now();
+    const scale = this.filling ? WorldTileStreamer.FILL_BUDGET_SCALE : 1;
+    const bytesMax = WorldTileStreamer.RESULT_BYTES_PER_FRAME * scale, msMax = WorldTileStreamer.RESULT_MS_PER_FRAME * scale;
     let bytes = 0;
     for (const [key, { entry, result, heights }] of this.resultQueue) {
-      if (bytes > 0 && (bytes >= WorldTileStreamer.RESULT_BYTES_PER_FRAME || performance.now() - start >= WorldTileStreamer.RESULT_MS_PER_FRAME)) break;
+      if (bytes > 0 && (bytes >= bytesMax || performance.now() - start >= msMax)) break;
       this.resultQueue.delete(key);
       bytes += this.onTileResult(key, entry, result, heights) || 1;
       this.maybeLogBatch();
@@ -350,13 +411,14 @@ export default class WorldTileStreamer {
 
   // --- streaming ---------------------------------------------------------------
 
-  private streamRadiusTiles(elevationWorld: number, zoom: number): number {
-    const fov = this.camera.projection.FOV;
-    const aspect = this.camera.projection.aspectRatio;
+  private streamRadiusTiles(camera: StreamCamera, zoom: number): number {
+    const elevationWorld = camera.distance;
+    const fov = camera.projection.FOV;
+    const aspect = camera.projection.aspectRatio;
     const halfW = elevationWorld * Math.tan(fov * 0.5) * aspect;
     const halfH = elevationWorld * Math.tan(fov * 0.5);
     const maxDimMeters = Math.max(halfW, halfH) * this.projection.metersPerUnit;
-    const scale = this.radiusScaleParam ? this.radiusScaleParam.value : 1;
+    const scale = this.radiusScaleParam ? this.radiusScaleParam.value : WorldTileStreamer.LOAD_DISTANCE;
     return Math.ceil((scale * maxDimMeters) / this.projection.tileSizeMeters(zoom)) + 1;
   }
 
@@ -393,20 +455,20 @@ export default class WorldTileStreamer {
     return this.frustum.boxInFrustum(min, max);
   }
 
-  /** Recompute the wanted tile rings, evict what fell out, queue what's missing. */
-  private streamTiles(): void {
+  /** Recompute the wanted tile rings around the camera, evict what fell out, queue what's missing. */
+  private streamTiles(camera: StreamCamera = this.camera): void {
     const terrainOn = this.terrainStreamingEnabled;
     const cityOn = this.cityStreamingEnabled;
     if (!terrainOn && !cityOn) return;
 
-    this.frustum.setFromCamera(this.camera);
-    const pivot = this.camera.pivot.position;
+    this.frustum.setFromCamera(camera);
+    const pivot = camera.pivot.position;
     const { lat, lng } = this.projection.worldToLatLng(pivot.x, pivot.z);
     const zoom = this.tiles.maxZoom;
-    const cityRadius = this.streamRadiusTiles(this.camera.distance, zoom);
+    const cityRadius = this.streamRadiusTiles(camera, zoom);
     // The ground: the tiles that reach into viewDistanceMax around the camera (xz), the rings around the pivot that
     // hold that circle. The pivot is anywhere in the center tile: 1 ring more
-    const eye = this.camera.worldPosition;
+    const eye = camera.worldPosition;
     const tileSize = this.projection.tileSizeMeters(zoom) / this.projection.metersPerUnit;
     const viewDistance = this.viewDistanceMax;
     const eyeOffset = Math.hypot(eye.x - pivot.x, eye.z - pivot.z);
@@ -466,6 +528,14 @@ export default class WorldTileStreamer {
       if (!this.cityDesired.has(key)) this.removeCityTile(key);
     }
     this.cityReadyQueue = this.cityReadyQueue.filter((e) => this.cityDesired.has(e.key));
+    // The tiles the workers are at that fell out too (the camera moved on before they came): cancelled, so a worker
+    // that hasn't started on one builds a tile of the view instead. In a fast drag most of the tiles asked for at its
+    // start are behind the camera when their turn comes
+    for (const [key, request] of this.inFlight) {
+      if ((request.terrain && this.terrainDesired.has(key)) || (request.city && this.cityDesired.has(key))) continue;
+      this.pool.cancel(request.job);
+      this.inFlight.delete(key);
+    }
 
     // Visible first, then nearest first. Replaces the old queue so tiles the
     // camera moved away from are never fetched.
@@ -480,7 +550,9 @@ export default class WorldTileStreamer {
   }
 
   private pumpFetchQueue(): void {
-    const max = Math.max(WorldTileStreamer.MIN_CONCURRENT_FETCHES, this.pool.size * WorldTileStreamer.FETCHES_PER_WORKER);
+    // As many as the workers take (see WorldWorkerPool.capacity): the ones beyond that wait here, where the next
+    // streamTiles can still replace them when the camera moves away
+    const max = this.pool.capacity;
     while (this.fetchQueue.length > 0 && this.inFlight.size < max) {
       const entry = this.fetchQueue.shift()!;
       if (this.inFlight.has(entry.key) || this.resultQueue.has(entry.key)) continue;
@@ -488,45 +560,32 @@ export default class WorldTileStreamer {
     }
   }
 
+  /** Has a worker make the tile: it fetches the vector tile, gets the heights of the ground and builds (see worldMapWorker.ts). */
   private loadTile(entry: QueuedTile): void {
     const { tile, key } = entry;
     const generation = this.generation;
-    const bounds = this.projection.bounds;
-    this.inFlight.set(key, { terrain: entry.terrain, city: entry.city });
     const url = this.tiles.tileUrl(tile);
-    // the heights of the ground, in parallel with the vector tile
-    const heightsPromise = this.elevation ? this.elevation.getTileGrid(tile) : Promise.resolve(null);
-    // rejections are handled where it is awaited, not when the vector tile fails first
-    heightsPromise.catch(() => {});
+    const job = this.pool.start({
+      url, tile, bounds: this.projection.bounds, wantTerrain: entry.terrain, wantBuildings: entry.city, wantTrees: this.treesEnabled,
+      elevation: this.elevation !== null,
+    });
+    this.inFlight.set(key, { terrain: entry.terrain, city: entry.city, job: job.id });
+    // not after a clear, and not when the job was cancelled (the tile may be asked for again by then, as another job)
+    const current = () => generation === this.generation && this.inFlight.get(key)?.job === job.id;
 
-    // the heights the tile is built on, kept for the height field (the worker gets a copy)
-    let tileHeights: Float32Array | null = null;
-    void (async (): Promise<WorldTileResult | null> => {
-      const response = await fetch(url);
-      let pbf: ArrayBuffer;
-      // No data for this tile (open ocean at high zoom, …). On the terrain it still gets its ground.
-      if (response.status === 204 || response.status === 404) {
-        if (!this.elevation) return null;
-        pbf = new ArrayBuffer(0);
-      } else {
-        if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-        pbf = await response.arrayBuffer();
-      }
-      tileHeights = await heightsPromise;
-      if (generation !== this.generation) return null;
-      return this.pool.buildTile(pbf, tile, bounds, entry.terrain, entry.city, this.treesEnabled, tileHeights?.slice() ?? null);
-    })()
-      .then((result) => {
-        if (generation !== this.generation) return;
+    job.done
+      .then(({ result, heights }) => {
+        if (!current()) return;
         this.inFlight.delete(key);
         this.failedTiles.delete(key);
         this.batchTiles++;
-        this.resultQueue.set(key, { entry, result, heights: tileHeights });
+        // heights: the ones the tile is built on, for the height field
+        this.resultQueue.set(key, { entry, result, heights });
         // the next request right away, not at the next frame (which a busy GPU can hold up)
         this.pumpFetchQueue();
       })
       .catch((e) => {
-        if (generation !== this.generation) return;
+        if (!current()) return;
         this.inFlight.delete(key);
         this.failedTiles.set(key, performance.now());
         LogGL.warn(`[MapWorld] failed tile ${key}:`, e);
@@ -607,7 +666,7 @@ export default class WorldTileStreamer {
 
   /** Upload at most a few finished building tiles per frame. */
   private finalizeCityMeshes(): void {
-    let budget = WorldTileStreamer.MAX_CITY_FINALIZE_PER_FRAME;
+    let budget = WorldTileStreamer.MAX_CITY_FINALIZE_PER_FRAME * (this.filling ? WorldTileStreamer.FILL_BUDGET_SCALE : 1);
     while (budget-- > 0 && this.cityReadyQueue.length > 0) {
       const { key, result } = this.cityReadyQueue.shift()!;
       if (this.loadedCityTiles.has(key)) continue;

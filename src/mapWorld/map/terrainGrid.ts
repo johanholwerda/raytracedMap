@@ -12,15 +12,67 @@ ground interpolated between its 3 corners. A vertex of the ground mesh or of a d
 
 Pure (no renderer imports): runs in the map worker.
  */
-
-/**
- * A mesh in engine space: x, height, -north and the normal (encodeTerrainNormal, or NO_NORMAL) per vertex, 3 indices
- * per triangle.
- */
-export type GridMesh = { vertices: number[]; indices: number[] };
+import { hypot3 } from 'webGPU-framework/renderer/utils/MathUtils';
 
 /** Floats per vertex of a GridMesh and of buildMesh. */
 export const GRID_VERTEX_FLOATS = 4;
+
+/**
+ * A mesh in engine space that drapeTriangles appends to: x, height, -north and the normal (encodeTerrainNormal, or
+ * NO_NORMAL) per vertex, 3 indices per triangle. In typed arrays that grow by doubling: as number[] the pushes and the
+ * copy into a Float32Array at the end were a tenth of the time of a tile, and garbage of 8 bytes per float. Made once
+ * and used for mesh after mesh (reset): a new large array is memory the OS has to hand out and clear, which takes
+ * much longer than writing to it, and longer still with all the map workers asking at once.
+ */
+export class GridMesh {
+  // public for TerrainGrid, which writes the vertices in place (see allocVertex)
+  public vertexData = new Float32Array(16384 * GRID_VERTEX_FLOATS);
+  private indexData = new Uint32Array(16384 * 6);
+  public vertexCount = 0;
+  public indexCount = 0;
+
+  /** Empty again, the arrays stay. */
+  public reset(): void {
+    this.vertexCount = 0;
+    this.indexCount = 0;
+  }
+
+  /**
+   * A new vertex: returns where its GRID_VERTEX_FLOATS go in vertexData (read vertexData after the call, it may have
+   * grown), its index is that / GRID_VERTEX_FLOATS. Not a push of its 4 floats: numbers passed to a function that isn't
+   * inlined each become an object on the heap.
+   */
+  public allocVertex(): number {
+    const o = this.vertexCount * GRID_VERTEX_FLOATS;
+    if (o + GRID_VERTEX_FLOATS > this.vertexData.length) {
+      const grown = new Float32Array(this.vertexData.length * 2);
+      grown.set(this.vertexData);
+      this.vertexData = grown;
+    }
+    this.vertexCount++;
+    return o;
+  }
+
+  public pushTriangle(a: number, b: number, c: number): void {
+    const o = this.indexCount;
+    if (o + 3 > this.indexData.length) {
+      const grown = new Uint32Array(this.indexData.length * 2);
+      grown.set(this.indexData);
+      this.indexData = grown;
+    }
+    const d = this.indexData;
+    d[o] = a; d[o + 1] = b; d[o + 2] = c;
+    this.indexCount = o + 3;
+  }
+
+  /** The vertices and the indices in arrays of their own, of their size. */
+  public finish(): { vertices: Float32Array; indices: Uint32Array } {
+    return {
+      vertices: this.vertexData.slice(0, this.vertexCount * GRID_VERTEX_FLOATS),
+      indices: this.indexData.slice(0, this.indexCount),
+    };
+  }
+}
 
 // the steps of each of the 2 encoded components of a normal: 11 bits
 const NORMAL_STEPS = 2047;
@@ -69,7 +121,7 @@ export default class TerrainGrid {
         // the surface y = h(x, north) at z = -north: the normal is (-dh/dx, 1, dh/dnorth), normalized
         const gx = (b(i + 1, j) - b(i - 1, j)) / (2 * this.dx);
         const gn = (b(i, j + 1) - b(i, j - 1)) / (2 * this.dy);
-        const l = Math.hypot(gx, 1, gn);
+        const l = hypot3(gx, 1, gn);
         const o = (j * side + i) * 3;
         this.normals[o] = -gx / l;
         this.normals[o + 1] = 1 / l;
@@ -131,7 +183,7 @@ export default class TerrainGrid {
     const nx = m[sw * 3] * wsw + m[a * 3] * wa + m[b * 3] * wb;
     const ny = m[sw * 3 + 1] * wsw + m[a * 3 + 1] * wa + m[b * 3 + 1] * wb;
     const nz = m[sw * 3 + 2] * wsw + m[a * 3 + 2] * wa + m[b * 3 + 2] * wb;
-    const l = Math.hypot(nx, ny, nz) || 1;
+    const l = hypot3(nx, ny, nz) || 1;
     return encodeTerrainNormal(nx / l, nz / l);
   }
 
@@ -202,7 +254,10 @@ export default class TerrainGrid {
   public drapeTriangles(
     coords: ArrayLike<number>, tris: ArrayLike<number>, lift: number, tolerance: number, normals: boolean, out: GridMesh,
   ): void {
-    const drape: Drape = { out, lift, tolerance, normals, points: new Int32Array(coords.length / 2).fill(-1), cut: new PointMap() };
+    const scratch = drapeScratch ??= new DrapeScratch();
+    scratch.cut.clear();
+    const drape: Drape = { out, lift, tolerance, normals, points: scratch.pointsFor(coords.length / 2), cut: scratch.cut, scratch };
+    const triangle = scratch.pieceAt(0);
     for (let t = 0; t + 2 < tris.length; t += 3) {
       const ia = tris[t], ib = tris[t + 1], ic = tris[t + 2];
       const ax = coords[ia * 2], ay = coords[ia * 2 + 1], bx = coords[ib * 2], by = coords[ib * 2 + 1];
@@ -211,25 +266,70 @@ export default class TerrainGrid {
       const i0 = this.cellX(Math.min(ax, bx, cx)), i1 = this.cellX(Math.max(ax, bx, cx));
       const j0 = this.cellY(Math.min(ay, by, cy)), j1 = this.cellY(Math.max(ay, by, cy));
       if (this.planarUnder(i0, i1, j0, j1, tolerance)) {
-        out.indices.push(this.pointVertex(drape, ia, ax, ay), this.pointVertex(drape, ib, bx, by), this.pointVertex(drape, ic, cx, cy));
+        // in this order: the vertices are made on first use
+        const va = this.pointVertex(drape, coords, ia), vb = this.pointVertex(drape, coords, ib);
+        out.pushTriangle(va, vb, this.pointVertex(drape, coords, ic));
         continue;
       }
-      this.drapePolygon(drape, [ax, ay, bx, by, cx, cy], i0, i1, j0, j1);
+      triangle[0] = ax; triangle[1] = ay; triangle[2] = bx; triangle[3] = by; triangle[4] = cx; triangle[5] = cy;
+      this.drapePolygon(drape, triangle, 3, i0, i1, j0, j1, 1);
     }
   }
 
-  /** The vertex of source point k, made on first use. */
-  private pointVertex(drape: Drape, k: number, x: number, y: number): number {
-    if (drape.points[k] < 0) drape.points[k] = this.pushVertex(drape, x, y);
+  /** The vertex of source point k of coords, made on first use. */
+  private pointVertex(drape: Drape, coords: ArrayLike<number>, k: number): number {
+    if (drape.points[k] < 0) drape.points[k] = this.pushVertex(drape, coords, k);
     return drape.points[k];
   }
 
-  /** A vertex of out on the ground at (x, north) plus the lift, with the normal there. Returns its index. */
-  private pushVertex(drape: Drape, x: number, y: number): number {
+  /**
+   * A vertex of out on the ground at point k of coords (x, north per point) plus the lift, with the normal there.
+   * Returns its index. heightAt, normalAt and encodeTerrainNormal written out (the same sums): the point is read here
+   * and nothing is passed on, see GridMesh.allocVertex. This runs per vertex of every ground layer.
+   */
+  private pushVertex(drape: Drape, coords: ArrayLike<number>, k: number): number {
+    const x = coords[k * 2], y = coords[k * 2 + 1];
+    const cells = this.cells;
+    const i = Math.min(Math.max(Math.floor((x - this.x0) / this.dx), 0), cells - 1);
+    const j = Math.min(Math.max(Math.floor((y - this.y0) / this.dy), 0), cells - 1);
+    const u = (x - (i >= cells ? this.x1 : this.x0 + (this.x1 - this.x0) * i / cells)) / this.dx;
+    const v = (y - (j >= cells ? this.y1 : this.y0 + (this.y1 - this.y0) * j / cells)) / this.dy;
+    const side = cells + 1, h = this.heights;
+    const sw = j * side + i, se = sw + 1, nw = sw + side, ne = nw + 1;
+    // the height on the triangle (sw, se, ne) or (sw, ne, nw), see heightAt
+    const hsw = h[sw], hne = h[ne];
+    let height: number;
+    if (u >= v) {
+      const hse = h[se];
+      height = hsw + u * (hse - hsw) + v * (hne - hse);
+    } else {
+      const hnw = h[nw];
+      height = hsw + v * (hnw - hsw) + u * (hne - hnw);
+    }
+    let normal = NO_NORMAL;
+    if (drape.normals) {
+      // see normalAt
+      let a: number, wa: number, b: number, wb: number;
+      const wsw = u >= v ? 1 - u : 1 - v;
+      if (u >= v) { a = se; wa = u - v; b = ne; wb = v; } else { a = nw; wa = v - u; b = ne; wb = u; }
+      const m = this.normals;
+      const nx = m[sw * 3] * wsw + m[a * 3] * wa + m[b * 3] * wb;
+      const ny = m[sw * 3 + 1] * wsw + m[a * 3 + 1] * wa + m[b * 3 + 1] * wb;
+      const nz = m[sw * 3 + 2] * wsw + m[a * 3 + 2] * wa + m[b * 3 + 2] * wb;
+      const l = hypot3(nx, ny, nz) || 1;
+      // see encodeTerrainNormal
+      const qx = Math.round((Math.min(Math.max(nx / l, -1), 1) * .5 + .5) * NORMAL_STEPS);
+      const qz = Math.round((Math.min(Math.max(nz / l, -1), 1) * .5 + .5) * NORMAL_STEPS);
+      normal = qx * 2048 + qz;
+    }
     const out = drape.out;
-    const index = out.vertices.length / GRID_VERTEX_FLOATS;
-    out.vertices.push(x, this.heightAt(x, y) + drape.lift, -y, drape.normals ? this.normalAt(x, y) : NO_NORMAL);
-    return index;
+    const o = out.allocVertex();
+    const d = out.vertexData;
+    d[o] = x;
+    d[o + 1] = height + drape.lift;
+    d[o + 2] = -y;
+    d[o + 3] = normal;
+    return o / GRID_VERTEX_FLOATS;
   }
 
   /**
@@ -251,13 +351,16 @@ export default class TerrainGrid {
   }
 
   /**
-   * A convex piece within cells [i0, i1] x [j0, j1] (the cells of the split that made it, narrowed to its box): whole
-   * where the ground under it is planar, else cut along the diagonal in 1 cell, else halved along a grid line.
+   * A convex piece (n points in poly, x, y each) within cells [i0, i1] x [j0, j1] (the cells of the split that made it,
+   * narrowed to its box): whole where the ground under it is planar, else cut along the diagonal in 1 cell, else halved
+   * along a grid line. depth: of the halving. Its 2 halves are cut into pieceAt(depth) one after the other (the first
+   * is done when the second is cut), so no piece is allocated: as arrays of their own the pieces were a fifth of the
+   * time of a tile.
    */
-  private drapePolygon(drape: Drape, poly: number[], i0: number, i1: number, j0: number, j1: number): void {
-    if (poly.length < 6) return;
+  private drapePolygon(drape: Drape, poly: Float64Array, n: number, i0: number, i1: number, j0: number, j1: number, depth: number): void {
+    if (n < 3) return;
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-    for (let k = 0; k < poly.length; k += 2) {
+    for (let k = 0; k < n * 2; k += 2) {
       minX = Math.min(minX, poly[k]); maxX = Math.max(maxX, poly[k]);
       minY = Math.min(minY, poly[k + 1]); maxY = Math.max(maxY, poly[k + 1]);
     }
@@ -265,53 +368,71 @@ export default class TerrainGrid {
     i0 = Math.min(Math.max(this.cellX(minX), i0), i1); i1 = Math.max(Math.min(this.cellX(maxX), i1), i0);
     j0 = Math.min(Math.max(this.cellY(minY), j0), j1); j1 = Math.max(Math.min(this.cellY(maxY), j1), j0);
     if (this.planarUnder(i0, i1, j0, j1, drape.tolerance)) {
-      this.emitPolygon(drape, poly);
+      this.emitPolygon(drape, poly, n);
       return;
     }
+    const half = drape.scratch.pieceAt(depth);
     if (i0 === i1 && j0 === j1) {
       // in 1 cell, its 2 triangles not coplanar: cut along the diagonal. u - v >= 0 is the south east half, the other
       // half the negated function, so both get the same cut vertices
       const sx = 1 / this.dx, sy = 1 / this.dy;
       const ox = this.gridX(i0), oy = this.gridY(j0);
       const a = sx, b = -sy, c = -ox * sx + oy * sy;
-      this.emitPolygon(drape, clipHalf(poly, a, b, c, []));
-      this.emitPolygon(drape, clipHalf(poly, -a, -b, -c, []));
+      clipPlane[0] = a; clipPlane[1] = b; clipPlane[2] = c;
+      let m = clipHalf(poly, n, half);
+      if (m === CLIP_ALL) this.emitPolygon(drape, poly, n);
+      else this.emitPolygon(drape, half, m);
+      clipPlane[0] = -a; clipPlane[1] = -b; clipPlane[2] = -c;
+      m = clipHalf(poly, n, half);
+      if (m === CLIP_ALL) this.emitPolygon(drape, poly, n);
+      else this.emitPolygon(drape, half, m);
       return;
     }
     // halve the cells along the longer side, on a grid line. Both sides of the cut get the same new vertices (clipHalf)
     if (i1 - i0 >= j1 - j0) {
-      const m = (i0 + i1 + 1) >> 1, x = this.gridX(m);
-      this.drapePolygon(drape, clipHalf(poly, -1, 0, x, []), i0, m - 1, j0, j1);
-      this.drapePolygon(drape, clipHalf(poly, 1, 0, -x, []), m, i1, j0, j1);
+      const mid = (i0 + i1 + 1) >> 1, x = this.gridX(mid);
+      clipPlane[0] = -1; clipPlane[1] = 0; clipPlane[2] = x;
+      let m = clipHalf(poly, n, half);
+      if (m === CLIP_ALL) this.drapePolygon(drape, poly, n, i0, mid - 1, j0, j1, depth + 1);
+      else this.drapePolygon(drape, half, m, i0, mid - 1, j0, j1, depth + 1);
+      // set again: the pieces of the first half cut too
+      clipPlane[0] = 1; clipPlane[1] = 0; clipPlane[2] = -x;
+      m = clipHalf(poly, n, half);
+      if (m === CLIP_ALL) this.drapePolygon(drape, poly, n, mid, i1, j0, j1, depth + 1);
+      else this.drapePolygon(drape, half, m, mid, i1, j0, j1, depth + 1);
     } else {
-      const m = (j0 + j1 + 1) >> 1, y = this.gridY(m);
-      this.drapePolygon(drape, clipHalf(poly, 0, -1, y, []), i0, i1, j0, m - 1);
-      this.drapePolygon(drape, clipHalf(poly, 0, 1, -y, []), i0, i1, m, j1);
+      const mid = (j0 + j1 + 1) >> 1, y = this.gridY(mid);
+      clipPlane[0] = 0; clipPlane[1] = -1; clipPlane[2] = y;
+      let m = clipHalf(poly, n, half);
+      if (m === CLIP_ALL) this.drapePolygon(drape, poly, n, i0, i1, j0, mid - 1, depth + 1);
+      else this.drapePolygon(drape, half, m, i0, i1, j0, mid - 1, depth + 1);
+      clipPlane[0] = 0; clipPlane[1] = 1; clipPlane[2] = -y;
+      m = clipHalf(poly, n, half);
+      if (m === CLIP_ALL) this.drapePolygon(drape, poly, n, i0, i1, mid, j1, depth + 1);
+      else this.drapePolygon(drape, half, m, i0, i1, mid, j1, depth + 1);
     }
   }
 
-  /** A convex piece as a fan, its points lifted to the ground plus lift. Slivers without area are dropped. */
-  private emitPolygon(drape: Drape, poly: number[]): void {
-    const n = poly.length / 2;
+  /** A convex piece (n points) as a fan, its points lifted to the ground plus lift. Slivers without area are dropped. */
+  private emitPolygon(drape: Drape, poly: Float64Array, n: number): void {
     if (n < 3) return;
     let area = 0;
     for (let k = 0; k < n; k++) {
-      const q = (k + 1) % n;
+      const q = k + 1 === n ? 0 : k + 1;
       area += poly[k * 2] * poly[q * 2 + 1] - poly[q * 2] * poly[k * 2 + 1];
     }
     if (Math.abs(area) < 1e-18) return;
     const { out, cut } = drape;
-    const index = new Array<number>(n);
+    const index = drape.scratch.fan;
     for (let k = 0; k < n; k++) {
-      const x = poly[k * 2], y = poly[k * 2 + 1];
-      let v = cut.get(x, y);
+      let v = cut.get(poly, k);
       if (v < 0) {
-        v = this.pushVertex(drape, x, y);
-        cut.set(x, y, v);
+        v = this.pushVertex(drape, poly, k);
+        cut.set(poly, k, v);
       }
       index[k] = v;
     }
-    for (let k = 1; k + 1 < n; k++) out.indices.push(index[0], index[k], index[k + 1]);
+    for (let k = 1; k + 1 < n; k++) out.pushTriangle(index[0], index[k], index[k + 1]);
   }
 }
 
@@ -329,80 +450,143 @@ export function insideRing(c: ArrayLike<number>, s: number, e: number, x: number
  * One drapeTriangles call: the output, the lift, the tolerance and whether the vertices get normals, the vertices of the source points (-1: none yet) and
  * the vertices of the pieces by position.
  */
-type Drape = { out: GridMesh; lift: number; tolerance: number; normals: boolean; points: Int32Array; cut: PointMap };
+type Drape = { out: GridMesh; lift: number; tolerance: number; normals: boolean; points: Int32Array; cut: PointMap; scratch: DrapeScratch };
+
+/**
+ * What drapeTriangles works in, made on its first call and kept for all the tiles after (a TerrainGrid is made per
+ * tile, on the main thread too, where nothing is draped): the vertices of the cuts by position, the pieces of the
+ * halving (1 per depth of drapePolygon), the vertices of the piece that is emitted and the vertices of the source points.
+ */
+class DrapeScratch {
+  public readonly cut = new PointMap();
+  public readonly fan = new Int32Array(PIECE_POINTS_MAX);
+  private readonly pieces: Float64Array[] = [];
+  private points = new Int32Array(8192);
+
+  /** The buffer of the pieces that drapePolygon cuts at depth (the triangle itself at 0): x, y per point. */
+  public pieceAt(depth: number): Float64Array {
+    return this.pieces[depth] ??= new Float64Array(PIECE_POINTS_MAX * 2);
+  }
+
+  /** An array of at least count, its first count -1. */
+  public pointsFor(count: number): Int32Array {
+    if (this.points.length < count) this.points = new Int32Array(Math.max(count, this.points.length * 2));
+    return this.points.fill(-1, 0, count);
+  }
+}
+
+let drapeScratch: DrapeScratch | null = null;
 
 /**
  * A map from a point (x, y, exactly) to a number, for the vertices of the cuts: by a hash of the bits of the 2 floats,
- * with chains of the points of the same hash. A string key (x + ',' + y) made the floats strings: most of the time of
- * the draping went to that.
+ * in a table with open addressing (the next slot when one is taken), all in typed arrays that are kept between the
+ * layers of a tile. A string key (x + ',' + y) made the floats strings, a Map from the hash to chains in number[] was a
+ * sixth of the time of a tile: most of the time of the draping went to them.
  */
 class PointMap {
   private static readonly bits = new Float64Array(2);
   private static readonly words = new Uint32Array(PointMap.bits.buffer);
-  // per hash the first entry, then per entry the next one of the same hash (-1: none)
-  private readonly first = new Map<number, number>();
-  private readonly next: number[] = [];
-  private readonly xs: number[] = [];
-  private readonly ys: number[] = [];
-  private readonly values: number[] = [];
+  // per slot the entry in it, -1 for none: a power of 2 slots, at most half of them taken
+  private slots = new Int32Array(1 << 13).fill(-1);
+  // per entry its point (x, y) and its value
+  private keys = new Float64Array(2 << 12);
+  private values = new Int32Array(1 << 12);
+  private count = 0;
 
-  private static hash(x: number, y: number): number {
+  /** The hash of point k of points (x, y each). The point by its index: see GridMesh.allocVertex. */
+  private static hash(points: Float64Array, k: number): number {
     // + 0: -0 is 0, as x === y has it
-    PointMap.bits[0] = x + 0;
-    PointMap.bits[1] = y + 0;
+    PointMap.bits[0] = points[k * 2] + 0;
+    PointMap.bits[1] = points[k * 2 + 1] + 0;
     const w = PointMap.words;
     let h = Math.imul(w[0] ^ Math.imul(w[1], 0x9e3779b1), 0x85ebca6b);
     h = Math.imul(h ^ w[2] ^ Math.imul(w[3], 0xc2b2ae35), 0x27d4eb2f);
-    // a small integer (a Smi): the fast keys of a Map
-    return (h ^ (h >>> 15)) & 0x3fffffff;
+    return (h ^ (h >>> 15)) >>> 0;
   }
 
-  /** The value of the point, -1 when it has none. */
-  public get(x: number, y: number): number {
-    for (let e = this.first.get(PointMap.hash(x, y)) ?? -1; e >= 0; e = this.next[e]) {
-      if (this.xs[e] === x && this.ys[e] === y) return this.values[e];
+  /** Empty again, the arrays stay. */
+  public clear(): void {
+    if (this.count > 0) this.slots.fill(-1);
+    this.count = 0;
+  }
+
+  /** The value of point k of points (x, y each), -1 when it has none. */
+  public get(points: Float64Array, k: number): number {
+    const x = points[k * 2], y = points[k * 2 + 1];
+    const slots = this.slots, mask = slots.length - 1, keys = this.keys;
+    for (let s = PointMap.hash(points, k) & mask; ; s = (s + 1) & mask) {
+      const e = slots[s];
+      if (e < 0) return -1;
+      if (keys[e * 2] === x && keys[e * 2 + 1] === y) return this.values[e];
     }
-    return -1;
   }
 
-  /** For a point that has no value yet. */
-  public set(x: number, y: number, value: number): void {
-    const h = PointMap.hash(x, y);
-    const e = this.values.length;
-    this.xs.push(x);
-    this.ys.push(y);
-    this.values.push(value);
-    this.next.push(this.first.get(h) ?? -1);
-    this.first.set(h, e);
+  /** For a point (k of points) that has no value yet. */
+  public set(points: Float64Array, k: number, value: number): void {
+    if (this.count === this.values.length) this.grow();
+    const e = this.count++;
+    this.keys[e * 2] = points[k * 2];
+    this.keys[e * 2 + 1] = points[k * 2 + 1];
+    this.values[e] = value;
+    this.insert(e);
+  }
+
+  private insert(e: number): void {
+    const slots = this.slots, mask = slots.length - 1;
+    let s = PointMap.hash(this.keys, e) & mask;
+    while (slots[s] >= 0) s = (s + 1) & mask;
+    slots[s] = e;
+  }
+
+  /** Twice the entries, in twice the slots. */
+  private grow(): void {
+    const size = this.values.length * 2;
+    const keys = new Float64Array(size * 2), values = new Int32Array(size);
+    keys.set(this.keys); values.set(this.values);
+    this.keys = keys; this.values = values;
+    this.slots = new Int32Array(size * 2).fill(-1);
+    for (let e = 0; e < this.count; e++) this.insert(e);
   }
 }
 
+// The most points of a piece of drapePolygon: a triangle, and 1 more per cut. The cuts halve the cells of the tile along
+// x and along y (8 times each for the 256 cells of an elevation tile, see terrainGridCells) and end with the diagonal
+const PIECE_POINTS_MAX = 32;
+// clipHalf: all of the polygon is in the half, nothing was written
+const CLIP_ALL = -1;
+// The half plane clipHalf cuts by: a, b and c of a * x + b * y + c >= 0. Set before each call instead of passed: see
+// GridMesh.allocVertex, as arguments they were 4.5 MB of garbage per tile
+const clipPlane = new Float64Array(3);
+
 /**
- * The part of the convex polygon poly (x, y pairs) where a * x + b * y + c >= 0 (Sutherland-Hodgman), into out (which
- * is returned). A cut edge gets the same new vertex in the part of the negated function: the factor t is the same
- * (negating a float is exact), so the 2 sides of a cut meet without a crack. A cut along a grid line (a or b 0, the
- * other +-1) puts the new vertex on the line exactly.
+ * The part of the convex polygon poly (n points, x, y each) where a * x + b * y + c >= 0 (Sutherland-Hodgman, a, b and c
+ * from clipPlane), into out: returns its number of points, or CLIP_ALL when that is all of poly (out is not written then). A cut edge gets the same
+ * new vertex in the part of the negated function: the factor t is the same (negating a float is exact), so the 2 sides
+ * of a cut meet without a crack. A cut along a grid line (a or b 0, the other +-1) puts the new vertex on the line
+ * exactly.
  */
-function clipHalf(poly: number[], a: number, b: number, c: number, out: number[]): number[] {
-  out.length = 0;
-  const n = poly.length / 2;
+function clipHalf(poly: Float64Array, n: number, out: Float64Array): number {
+  const a = clipPlane[0], b = clipPlane[1], c = clipPlane[2];
   let inside = 0;
   for (let k = 0; k < n; k++) if (a * poly[k * 2] + b * poly[k * 2 + 1] + c >= 0) inside++;
-  if (inside === n) {
-    for (let k = 0; k < poly.length; k++) out.push(poly[k]);
-    return out;
-  }
-  if (inside === 0) return out;
+  if (inside === n) return CLIP_ALL;
+  if (inside === 0) return 0;
+  let m = 0;
   for (let k = 0; k < n; k++) {
     const px = poly[k * 2], py = poly[k * 2 + 1];
-    const q = (k + 1) % n;
+    const q = k + 1 === n ? 0 : k + 1;
     const qx = poly[q * 2], qy = poly[q * 2 + 1];
     const fp = a * px + b * py + c, fq = a * qx + b * qy + c;
-    if (fp >= 0) out.push(px, py);
+    if (fp >= 0) {
+      out[m] = px; out[m + 1] = py;
+      m += 2;
+    }
     if ((fp >= 0) !== (fq >= 0)) {
       const t = fp / (fp - fq);
-      out.push(b === 0 ? -c / a : px + t * (qx - px), a === 0 ? -c / b : py + t * (qy - py));
+      out[m] = b === 0 ? -c / a : px + t * (qx - px);
+      out[m + 1] = a === 0 ? -c / b : py + t * (qy - py);
+      m += 2;
     }
   }
-  return out;
+  return m / 2;
 }

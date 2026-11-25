@@ -1,3 +1,4 @@
+import { hypot2 } from 'webGPU-framework/renderer/utils/MathUtils';
 import type { BuildingPolygon } from './cityLayout';
 
 /**
@@ -49,8 +50,6 @@ export function findWallBottoms(polygons: BuildingPolygon[], count: number, eps:
   const stamp = new Int32Array(count).fill(-1);
   let wallIndex = 0;
   // the covered pieces of the wall: t0, t1 along it (0 to 1), h0, h1
-  const rects: number[] = [];
-  const ts: number[] = [];
   // Of 2 coplanar walls (of parts p and q) only the bottom of one can go up (a wall is drawn from its bottom to its top):
   // the one with the higher base, of equal bases the later one (the parts are sorted tallest first). In Midtown the
   // parts of a tower often all start at the ground and share facades: the walls of the shorter ones are dropped there.
@@ -68,7 +67,7 @@ export function findWallBottoms(polygons: BuildingPolygon[], count: number, eps:
       for (let j = 0; j < n; j++) {
         const ia = s + j, ib = s + ((j + 1) % n);
         const dx = c[ib * 2] - c[ia * 2], dy = c[ib * 2 + 1] - c[ia * 2 + 1];
-        const len = Math.hypot(dx, dy);
+        const len = hypot2(dx, dy);
         if (len === 0) continue;
         // outward: the outer ring is CCW and the holes CW, the solid is on the left of every edge
         const ox = dy / len * eps, oy = -dx / len * eps;
@@ -87,33 +86,52 @@ export function findWallBottoms(polygons: BuildingPolygon[], count: number, eps:
         const midCell = cellOf(my, minY, cellY) * grid + cellOf(mx, minX, cellX);
         const innerCell = cellOf(imy, minY, cellY) * grid + cellOf(imx, minX, cellX);
         let midCovered = false;
-        for (const cell of innerCell === midCell ? [midCell] : [midCell, innerCell]) {
-          for (const qi of cells[cell]) {
+        // the cell of the middle, then the one of the inner middle when it is another
+        for (let side = 0; side < 2 && !midCovered; side++) {
+          if (side === 1 && innerCell === midCell) break;
+          const list = cells[side === 0 ? midCell : innerCell];
+          for (let k = 0; k < list.length; k++) {
+            const qi = list[k];
             const q = polygons[qi];
             if (qi === pi || q.base > p.base + eps || q.top <= p.base) continue;
-            if (pointInBounds(bounds, qi, mx, my) && pointInPolygon(q, mx, my)) { midCovered = true; break; }
-            if (coplanarCovers(pi, qi) && pointInBounds(bounds, qi, imx, imy) && pointInPolygon(q, imx, imy)) { midCovered = true; break; }
+            if (pointInBounds(bounds, qi, mx, my)) {
+              point[0] = mx; point[1] = my;
+              if (pointInPolygon(q)) { midCovered = true; break; }
+            }
+            if (coplanarCovers(pi, qi) && pointInBounds(bounds, qi, imx, imy)) {
+              point[0] = imx; point[1] = imy;
+              if (pointInPolygon(q)) { midCovered = true; break; }
+            }
           }
-          if (midCovered) break;
         }
         if (!midCovered) continue;
-        rects.length = 0;
+        rectFloats = 0;
         wallIndex++;
         const cx0 = cellOf(sx0, minX, cellX), cx1 = cellOf(sx1, minX, cellX);
         const cy0 = cellOf(sy0, minY, cellY), cy1 = cellOf(sy1, minY, cellY);
         for (let gy = cy0; gy <= cy1; gy++) for (let gx = cx0; gx <= cx1; gx++) {
-          for (const qi of cells[gy * grid + gx]) {
+          const list = cells[gy * grid + gx];
+          for (let k = 0; k < list.length; k++) {
+            const qi = list[k];
             if (qi === pi || stamp[qi] === wallIndex) continue;
             stamp[qi] = wallIndex;
             const q = polygons[qi];
             if (q.top <= p.base || q.base >= p.top) continue;
             if (bounds[qi * 4] > sx1 || bounds[qi * 4 + 2] < sx0 || bounds[qi * 4 + 1] > sy1 || bounds[qi * 4 + 3] < sy0) continue;
-            const h0 = Math.max(q.base, p.base), h1 = Math.min(q.top, p.top);
-            insideIntervals(q, ax, ay, dx, dy, ts, (t0, t1) => rects.push(t0, t1, h0, h1));
-            if (coplanarCovers(pi, qi)) insideIntervals(q, ix, iy, dx, dy, ts, (t0, t1) => rects.push(t0, t1, h0, h1));
+            segment[0] = ax; segment[1] = ay; segment[2] = dx; segment[3] = dy;
+            segment[4] = Math.max(q.base, p.base); segment[5] = Math.min(q.top, p.top);
+            insideIntervals(q);
+            if (coplanarCovers(pi, qi)) {
+              segment[0] = ix; segment[1] = iy;
+              insideIntervals(q);
+            }
           }
         }
-        out[pi][ia] = rects.length ? coveredBottom(rects, p.base, p.top, eps / len, eps) : p.base;
+        if (rectFloats > 0) {
+          cover[0] = p.base; cover[1] = p.top; cover[2] = eps / len; cover[3] = eps;
+          coveredBottom();
+          out[pi][ia] = cover[4];
+        } else out[pi][ia] = p.base;
       }
     }
   }
@@ -135,12 +153,57 @@ function fillZeroEdges(polygons: BuildingPolygon[], out: Float32Array[], count: 
   }
 }
 
-/** The intervals of t (0 to 1) of the segment a + t d that are inside polygon q (even-odd over its rings) */
-function insideIntervals(q: BuildingPolygon, ax: number, ay: number, dx: number, dy: number, ts: number[],
-  add: (t0: number, t1: number) => void): void {
+/*
+The numbers the functions below take and give, set before a call and read after it instead of passed and returned: a
+number passed to (or returned by) a function that isn't inlined becomes an object on the heap, and these run per wall
+per part near it (5 MB of garbage per tile).
+-point: x, y of pointInPolygon
+-segment: a.x, a.y, d.x, d.y, h0, h1 of insideIntervals
+-cover: base, top, gap, hGap of coveredBottom, and its result
+ */
+const point = new Float64Array(2);
+const segment = new Float64Array(6);
+const cover = new Float64Array(5);
+
+/*
+What they work in, kept from wall to wall and from tile to tile, in typed arrays with a count next to them: an array
+that is set to length 0 lets go of its storage, the next push allocates it again (3 MB per tile for the few numbers
+here).
+-rects: the covered pieces of the wall of findWallBottoms, t0, t1 along it (0 to 1), h0, h1 each; rectFloats of them
+-crossings: where a wall crosses the edges of a part, as t along the wall (insideIntervals)
+-coveredOrder: the rects at a height of coveredBottom
+ */
+let rects = new Float64Array(256);
+let rectFloats = 0;
+let crossings = new Float64Array(64);
+let coveredOrder = new Int32Array(64);
+
+/** A rect after the others. */
+function addRect(t0: number, t1: number): void {
+  if (rectFloats + 4 > rects.length) {
+    const grown = new Float64Array(rects.length * 2);
+    grown.set(rects);
+    rects = grown;
+  }
+  rects[rectFloats] = t0;
+  rects[rectFloats + 1] = t1;
+  rects[rectFloats + 2] = segment[4];
+  rects[rectFloats + 3] = segment[5];
+  rectFloats += 4;
+}
+
+/**
+ * The intervals of t (0 to 1) of the segment a + t d that are inside polygon q (even-odd over its rings), added to rects
+ * as (t0, t1, h0, h1): a, d, h0 and h1 from segment. Without a callback per interval and without Array.sort (which
+ * allocates on every call, also for the 2 to 4 numbers here): this runs per wall per part near it.
+ */
+function insideIntervals(q: BuildingPolygon): void {
+  const ax = segment[0], ay = segment[1], dx = segment[2], dy = segment[3];
   const c = q.coords;
-  ts.length = 0;
-  ts.push(0, 1);
+  let ts = crossings;
+  ts[0] = 0;
+  ts[1] = 1;
+  let count = 2;
   for (let r = 0; r < q.ringStarts.length; r++) {
     const s = q.ringStarts[r], n = q.ringEnds[r] - s;
     for (let j = 0; j < n; j++) {
@@ -151,26 +214,42 @@ function insideIntervals(q: BuildingPolygon, ax: number, ay: number, dx: number,
       if (den === 0) continue;
       const fx = cx - ax, fy = cy - ay;
       const t = (fx * ey - fy * ex) / den, u = (fx * dy - fy * dx) / den;
-      if (t > 0 && t < 1 && u >= 0 && u <= 1) ts.push(t);
+      if (t > 0 && t < 1 && u >= 0 && u <= 1) {
+        if (count === ts.length) {
+          ts = new Float64Array(count * 2);
+          ts.set(crossings);
+          crossings = ts;
+        }
+        ts[count++] = t;
+      }
     }
   }
-  ts.sort((x, y) => x - y);
+  // ascending, by insertion: a few numbers
+  for (let k = 1; k < count; k++) {
+    const t = ts[k];
+    let j = k - 1;
+    for (; j >= 0 && ts[j] > t; j--) ts[j + 1] = ts[j];
+    ts[j + 1] = t;
+  }
   let open = -1;
-  for (let k = 0; k + 1 < ts.length; k++) {
+  for (let k = 0; k + 1 < count; k++) {
     if (ts[k + 1] <= ts[k]) continue;
     const m = (ts[k] + ts[k + 1]) * .5;
-    const inside = pointInPolygon(q, ax + dx * m, ay + dy * m);
+    point[0] = ax + dx * m; point[1] = ay + dy * m;
+    const inside = pointInPolygon(q);
     if (inside && open < 0) open = ts[k];
-    if (!inside && open >= 0) { add(open, ts[k]); open = -1; }
+    if (!inside && open >= 0) { addRect(open, ts[k]); open = -1; }
   }
-  if (open >= 0) add(open, 1);
+  if (open >= 0) addRect(open, 1);
 }
 
 function pointInBounds(bounds: Float64Array, i: number, x: number, y: number): boolean {
   return bounds[i * 4] <= x && bounds[i * 4 + 2] >= x && bounds[i * 4 + 1] <= y && bounds[i * 4 + 3] >= y;
 }
 
-function pointInPolygon(q: BuildingPolygon, x: number, y: number): boolean {
+/** Whether point (x, y) is inside q, even-odd over its rings. */
+function pointInPolygon(q: BuildingPolygon): boolean {
+  const x = point[0], y = point[1];
   const c = q.coords;
   let inside = false;
   for (let r = 0; r < q.ringStarts.length; r++) {
@@ -185,30 +264,49 @@ function pointInPolygon(q: BuildingPolygon, x: number, y: number): boolean {
 
 /**
  * The lowest height h from base on such that [0, 1] x [base, h] is covered by the rects (t0, t1, h0, h1), gaps along t
- * up to gap and steps in height up to hGap ignored: going up from base, at every height the rects there cover all of t until the lowest top of them
+ * up to gap and steps in height up to hGap ignored: going up from base, at every height the rects there cover all of t until the lowest top of them.
+ * base, top, gap and hGap from cover, the result into cover[4]
  */
-function coveredBottom(rects: number[], base: number, top: number, gap: number, hGap: number): number {
-  const n = rects.length / 4;
-  const order: number[] = [];
+function coveredBottom(): void {
+  const base = cover[0], top = cover[1], gap = cover[2], hGap = cover[3];
+  const n = rectFloats / 4;
+  if (coveredOrder.length < n) coveredOrder = new Int32Array(n * 2);
+  const order = coveredOrder;
   let h = base;
   for (;;) {
-    order.length = 0;
+    let count = 0;
     let next = Infinity;
     for (let i = 0; i < n; i++) {
       if (rects[i * 4 + 2] <= h + hGap && rects[i * 4 + 3] > h) {
-        order.push(i);
+        order[count++] = i;
         next = Math.min(next, rects[i * 4 + 3]);
       }
     }
-    if (!order.length) return h;
-    order.sort((a, b) => rects[a * 4] - rects[b * 4]);
+    if (count === 0) {
+      cover[4] = h;
+      return;
+    }
+    // by their start, equal ones in their order (as a stable sort has them), by insertion: a few rects
+    for (let k = 1; k < count; k++) {
+      const i = order[k], t = rects[i * 4];
+      let j = k - 1;
+      for (; j >= 0 && rects[order[j] * 4] > t; j--) order[j + 1] = order[j];
+      order[j + 1] = i;
+    }
     let reach = 0;
-    for (const i of order) {
+    for (let k = 0; k < count; k++) {
+      const i = order[k];
       if (rects[i * 4] > reach + gap) break;
       reach = Math.max(reach, rects[i * 4 + 1]);
     }
-    if (reach < 1 - gap) return h;
+    if (reach < 1 - gap) {
+      cover[4] = h;
+      return;
+    }
     h = next;
-    if (h >= top) return top;
+    if (h >= top) {
+      cover[4] = top;
+      return;
+    }
   }
 }

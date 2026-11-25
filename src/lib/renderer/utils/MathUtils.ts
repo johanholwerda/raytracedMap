@@ -122,3 +122,32 @@ export function haltonSequence(index: number, base: number): number {
   }
   return result;
 }
+
+/*
+Math.hypot of 2 and of 3 numbers, with the same bits as V8 gives (the values divided by the largest, summed with the
+Kahan compensation, see MathHypot in builtins/math.tq): Math.hypot is not inlined, allocates an array for its arguments
+and returns a number on the heap. In the loops of the map workers (a call per wall, per vertex) that was a few % of the
+time and MBs of garbage per tile. For finite numbers.
+ */
+export function hypot2(x: number, y: number): number {
+  x = Math.abs(x);
+  y = Math.abs(y);
+  const max = x > y ? x : y;
+  if (max === 0) return 0;
+  const a = x / max, b = y / max;
+  // the compensation of the first term is 0
+  return Math.sqrt(a * a + b * b) * max;
+}
+
+export function hypot3(x: number, y: number, z: number): number {
+  x = Math.abs(x);
+  y = Math.abs(y);
+  z = Math.abs(z);
+  let max = x > y ? x : y;
+  if (z > max) max = z;
+  if (max === 0) return 0;
+  const a = x / max, b = y / max, c = z / max;
+  const sum = a * a + b * b;
+  const compensation = (sum - a * a) - b * b;
+  return Math.sqrt(sum + (c * c - compensation)) * max;
+}

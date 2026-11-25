@@ -10,7 +10,8 @@ differ per region (https://github.com/tilezen/joerd/blob/master/docs/data-source
 to 10 m), elsewhere mostly SRTM (30 to 90 m) and the like, which are surface models: buildings and forests are in it
 as bumps, smoothed at the resolution used here.
 
-The tiles are fetched and decoded on the main thread, once per ELEVATION_ZOOM tile (a z12 tile covers 4 x 4 of the z14
+The tiles are fetched and decoded in the tile fetch worker (tileFetchWorker.ts, the main thread talks to it through
+ElevationClient), once per ELEVATION_ZOOM tile (a z12 tile covers 4 x 4 of the z14
 map tiles). For each map tile getTileGrid samples a grid of terrainGridCells + 1 heights over it, uniform in lat and
 lng (the projection is equirectangular, so uniform in world x and z too), which the worker builds the ground mesh from
 and drapes the ground layers, buildings and trees on (see terrainGrid.ts). The grids of 2 neighbours sample their
@@ -50,6 +51,16 @@ export default class ElevationService {
   private decoded = new Map<string, DemTile | null>();
   private origin: Promise<number> = Promise.resolve(0);
   private originM = 0;
+  /**
+   * Called when an elevation tile (x, y at ELEVATION_ZOOM) is loaded, with the lowest and highest height in it (m above
+   * sea level, both 0 where there is no tile): for ElevationClient.tileRange on the main thread.
+   */
+  public onTile: ((x: number, y: number, min: number, max: number) => void) | null = null;
+
+  /** The origin of the last setOrigin (m above sea level), when it is loaded. */
+  public get originLoaded(): Promise<number> {
+    return this.origin;
+  }
 
   /** The ground height (m) the heights are relative to: the one at lat/lng, the projection center. */
   public setOrigin(lat: number, lng: number): void {
@@ -63,6 +74,26 @@ export default class ElevationService {
     void origin.then((h) => {
       if (this.origin === origin) this.originM = h;
     });
+  }
+
+  /**
+   * Starts loading the elevation tiles around lat/lng: the one it is in and rings of them around it. For a place whose
+   * map tiles are asked for soon (see MapWorld.setPlace): getTileGrid then finds them loading or loaded. On the first
+   * load of the page the elevation tiles are what a map tile waits for longest (about 0.4 s each), and they can be
+   * asked for before the URL of the map tiles is known (OpenFreeMapTileService.init, another 0.35 s).
+   */
+  public preload(lat: number, lng: number, rings = 1): void {
+    const n = 1 << ELEVATION_ZOOM;
+    const latRad = Math.max(Math.min(lat, 85.05), -85.05) * Math.PI / 180;
+    const x = Math.floor((lng + 180) / 360 * n);
+    const y = Math.floor((1 - Math.asinh(Math.tan(latRad)) / Math.PI) / 2 * n);
+    for (let dy = -rings; dy <= rings; dy++) {
+      for (let dx = -rings; dx <= rings; dx++) {
+        if (y + dy < 0 || y + dy >= n) continue;
+        // a tile that fails is asked for again by the map tile that needs it
+        this.load(this.wrap(x + dx, n), y + dy).catch(() => {});
+      }
+    }
   }
 
   /**
@@ -195,7 +226,10 @@ export default class ElevationService {
     })();
     this.tiles.set(key, promise);
     promise.then(
-      (dem) => { if (this.tiles.get(key) === promise) this.decoded.set(key, dem); },
+      (dem) => {
+        if (this.tiles.get(key) === promise) this.decoded.set(key, dem);
+        this.onTile?.(x, y, dem ? dem.min : MIN_HEIGHT_M, dem ? dem.max : MIN_HEIGHT_M);
+      },
       () => { if (this.tiles.get(key) === promise) this.tiles.delete(key); },
     );
     while (this.tiles.size > CACHE_MAX) {

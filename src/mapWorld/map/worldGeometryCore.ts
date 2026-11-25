@@ -1,6 +1,7 @@
 import earcut from 'earcut';
 import { VectorTile } from '@mapbox/vector-tile';
 import { PbfReader } from 'pbf';
+import { hypot2 } from 'webGPU-framework/renderer/utils/MathUtils';
 import MapProjection from '../osm/MapProjection';
 import {
   classifyRings,
@@ -17,7 +18,7 @@ import type { TraceTree } from '../city/cityLayout';
 import type { BuildingPolygon, CityTraceBlock } from '../city/cityLayout';
 import { buildTrees, TREE_MATERIAL_BASE_ID } from './worldTrees';
 import { findWallBottoms } from '../city/hiddenWalls';
-import TerrainGrid, { GRID_VERTEX_FLOATS, insideRing } from './terrainGrid';
+import TerrainGrid, { GRID_VERTEX_FLOATS, GridMesh, insideRing } from './terrainGrid';
 
 /**
  * Pure (renderer-free) geometry core for the world map. Decodes one
@@ -258,17 +259,39 @@ export function buildWorldTile(
   wantTrees = false,
   heights: Float32Array | null = null,
 ): WorldTileResult {
+  const scratch = tileScratch ??= new TileScratch();
   const vt = new VectorTile(new PbfReader(bytes));
   const proj = new MapProjection();
   proj.setBounds(bounds);
   const metersToNorm = proj.metersToNorm;
   const terrain = heights ? createTerrainGrid(tile, proj, heights) : null;
 
-  // Tile-local MVT point -> projected map (x, north) coords.
+  // Tile-local MVT point -> projected map (x, north) coords: tileToLatLon and MapProjection.project (the same sums, in
+  // the same order), without the object and the array they return per point. Most points are on the whole numbers of
+  // the tile's extent: the north of each is worked out once (an atan and a sinh).
+  const tileCount = Math.pow(2, tile.z);
+  const { lngMid, latMid, cosLat, scale } = proj;
+  let cacheExtent = 0;
+  let northCache = new Float64Array(0);
   const toMap = (pt: TilePoint, extent: number, out: number[]): void => {
-    const { lat, lon } = tileToLatLon(pt.x, pt.y, extent, tile);
-    const [x, y] = proj.project(lon, lat);
-    out.push(x, y);
+    const lon = ((tile.x + pt.x / extent) / tileCount) * 360 - 180;
+    const py = pt.y;
+    let north: number;
+    if (Number.isInteger(py) && py >= 0 && py <= extent) {
+      if (extent !== cacheExtent) {
+        cacheExtent = extent;
+        northCache = new Float64Array(extent + 1).fill(NaN);
+      }
+      north = northCache[py];
+      if (north !== north) {
+        const latRad = Math.atan(Math.sinh(Math.PI * (1 - (2 * (tile.y + py / extent)) / tileCount)));
+        north = northCache[py] = ((latRad * 180) / Math.PI - latMid) * scale;
+      }
+    } else {
+      const latRad = Math.atan(Math.sinh(Math.PI * (1 - (2 * (tile.y + py / extent)) / tileCount)));
+      north = ((latRad * 180) / Math.PI - latMid) * scale;
+    }
+    out.push((lon - lngMid) * cosLat * scale, north);
   };
 
   const result: WorldTileResult = {};
@@ -277,8 +300,8 @@ export function buildWorldTile(
     // Indexed like the buildings: earcut already returns indices, so a polygon point is one vertex instead of one per
     // triangle corner (about 3x fewer vertices), and a ribbon segment is 4 vertices instead of 6. Flat (x, north) first:
     // on the terrain the triangles are cut by the ground grid at the end (see TerrainGrid.drapeTriangles)
-    const acc: Record<string, FlatMesh> = {};
-    for (const key of WORLD_LAYER_KEYS) acc[key] = { coords: [], indices: [] };
+    const acc = scratch.flat;
+    for (const key of WORLD_LAYER_KEYS) (acc[key] ??= new FlatMesh()).reset();
 
     for (const layerName of FILL_LAYERS) {
       const layer = vt.layers[layerName];
@@ -295,10 +318,10 @@ export function buildWorldTile(
           const tris = earcut(flat.coords, flat.holes.length ? flat.holes : undefined, 2);
           if (tris.length === 0) continue;
           const out = acc[c.key];
-          const first = out.coords.length / 2;
+          const first = out.pointCount;
           const coords = flat.coords;
-          for (let k = 0; k < coords.length; k++) out.coords.push(coords[k]);
-          for (let t = 0; t < tris.length; t++) out.indices.push(first + tris[t]);
+          for (let k = 0; k < coords.length; k += 2) out.pushPoint(coords[k], coords[k + 1]);
+          for (let t = 0; t < tris.length; t++) out.pushIndex(first + tris[t]);
         }
       }
     }
@@ -324,7 +347,7 @@ export function buildWorldTile(
           for (const seg of clipLineToTile(ring, extent)) {
             line.length = 0;
             for (const pt of seg) toMap(pt, extent, line);
-            addRibbon(acc[c.key], line, halfW);
+            addRibbon(acc[c.key], line, halfW, scratch.ribbon);
             if (speed !== undefined) packRoad(roads, line, c.width, speed, oneway);
           }
         }
@@ -333,18 +356,19 @@ export function buildWorldTile(
 
     const layers: Record<string, WorldTerrainLayer> = {};
     for (const key of WORLD_LAYER_KEYS) {
-      const { coords, indices } = acc[key];
+      const coords = acc[key].coordsView, indices = acc[key].indicesView;
       const y = LAYER_Y[key];
       if (terrain) {
-        const out = { vertices: [] as number[], indices: [] as number[] };
+        const out = scratch.draped;
+        out.reset();
         terrain.drapeTriangles(coords, indices, y, DRAPE_TOLERANCE, !FLAT_NORMAL_LAYERS.has(key), out);
-        layers[key] = { vertices: new Float32Array(out.vertices), indices: new Uint32Array(out.indices), floats: GRID_VERTEX_FLOATS };
+        layers[key] = { ...out.finish(), floats: GRID_VERTEX_FLOATS };
       } else {
         const vertices = new Float32Array(coords.length / 2 * 3);
         for (let k = 0, o = 0; k < coords.length; k += 2, o += 3) {
           vertices[o] = coords[k]; vertices[o + 1] = y; vertices[o + 2] = -coords[k + 1];
         }
-        layers[key] = { vertices, indices: new Uint32Array(indices), floats: 3 };
+        layers[key] = { vertices, indices: indices.slice(), floats: 3 };
       }
     }
     result.terrain = layers;
@@ -359,8 +383,75 @@ export function buildWorldTile(
   return result;
 }
 
-/** A ground layer before the terrain: the points (x, north) and the triangles, 3 point indices each. */
-type FlatMesh = { coords: number[]; indices: number[] };
+/**
+ * A ground layer before the terrain: the points (x, north) and the triangles, 3 point indices each. In typed arrays that
+ * grow by doubling and are kept for the next tile (see GridMesh for why): as number[] that grew by push they were new
+ * memory for every tile.
+ */
+class FlatMesh {
+  private coords = new Float64Array(8192);
+  private indices = new Uint32Array(8192);
+  private coordCount = 0;
+  private indexCount = 0;
+
+  /** Empty again, the arrays stay. */
+  public reset(): void {
+    this.coordCount = 0;
+    this.indexCount = 0;
+  }
+
+  public get pointCount(): number {
+    return this.coordCount / 2;
+  }
+
+  /** x, north per point. */
+  public get coordsView(): Float64Array {
+    return this.coords.subarray(0, this.coordCount);
+  }
+
+  public get indicesView(): Uint32Array {
+    return this.indices.subarray(0, this.indexCount);
+  }
+
+  /** Returns the index of the point. */
+  public pushPoint(x: number, y: number): number {
+    const o = this.coordCount;
+    if (o + 2 > this.coords.length) {
+      const grown = new Float64Array(this.coords.length * 2);
+      grown.set(this.coords);
+      this.coords = grown;
+    }
+    this.coords[o] = x;
+    this.coords[o + 1] = y;
+    this.coordCount = o + 2;
+    return o / 2;
+  }
+
+  public pushIndex(index: number): void {
+    if (this.indexCount === this.indices.length) {
+      const grown = new Uint32Array(this.indices.length * 2);
+      grown.set(this.indices);
+      this.indices = grown;
+    }
+    this.indices[this.indexCount++] = index;
+  }
+}
+
+/**
+ * What buildWorldTile works in, kept from tile to tile: a worker builds one tile at a time. Made on the first tile, so
+ * the main thread (which imports this file for its types and createTerrainGrid) has none.
+ */
+class TileScratch {
+  // the flat layers by key
+  public readonly flat: Record<string, FlatMesh> = {};
+  // a layer on the terrain, copied out at its size when it is done
+  public readonly draped = new GridMesh();
+  public readonly vertices = new BuildingVertices();
+  public readonly indices = new IndexList();
+  public readonly ribbon = new RibbonScratch();
+}
+
+let tileScratch: TileScratch | null = null;
 
 /** The ground grid of the tile, from its heights in m with their ring (ElevationService.getTileGrid). Also TerrainHeightField. */
 export function createTerrainGrid(tile: TileCoord, proj: MapProjection, heightsM: Float32Array): TerrainGrid {
@@ -434,41 +525,32 @@ const MITER_LIMIT = 2;
  * by the segments on both sides of it, offset along the miter so the ribbon keeps its width around the bend. A closed
  * line (first point = last) is mitered where it closes too.
  */
-function addRibbon(out: FlatMesh, line: number[], halfW: number): void {
+function addRibbon(out: FlatMesh, line: number[], halfW: number, scratch: RibbonScratch): void {
+  scratch.reserve(line.length / 2);
+  const { xs, ys, dxs, dys, ends, starts } = scratch;
   // the points without repeats (a zero length segment has no direction)
-  const xs: number[] = [], ys: number[] = [];
+  let n = 0;
   for (let i = 0; i < line.length; i += 2) {
     const x = line[i], y = line[i + 1];
-    const k = xs.length - 1;
-    if (k >= 0 && xs[k] === x && ys[k] === y) continue;
-    xs.push(x); ys.push(y);
+    if (n > 0 && xs[n - 1] === x && ys[n - 1] === y) continue;
+    xs[n] = x; ys[n] = y;
+    n++;
   }
-  let n = xs.length;
   if (n < 2) return;
   const closed = n > 3 && xs[0] === xs[n - 1] && ys[0] === ys[n - 1];
   if (closed) n--; // the last point is the first
   const segs = closed ? n : n - 1;
 
   // the unit direction of segment i, from point i to point i + 1
-  const dxs = new Float64Array(segs), dys = new Float64Array(segs);
   for (let i = 0; i < segs; i++) {
     const j = (i + 1) % n;
     const dx = xs[j] - xs[i], dy = ys[j] - ys[i];
-    const len = Math.hypot(dx, dy);
+    const len = hypot2(dx, dy);
     dxs[i] = dx / len; dys[i] = dy / len;
   }
 
-  const points = out.coords;
-  // the points p + o (left) and p - o (right), returns the index of the left one
-  const pair = (x: number, y: number, ox: number, oy: number): number => {
-    const v = points.length / 2;
-    points.push(x + ox, y + oy, x - ox, y - oy);
-    return v;
-  };
-
   // per point the pair the segment before it ends on and the pair the segment after it starts on: the same pair when
-  // mitered
-  const ends = new Int32Array(n), starts = new Int32Array(n);
+  // mitered. A pair: the points p + o (left) and p - o (right), by the index of the left one
   for (let i = 0; i < n; i++) {
     const x = xs[i], y = ys[i];
     const prev = closed ? (i + segs - 1) % segs : i - 1;
@@ -476,30 +558,65 @@ function addRibbon(out: FlatMesh, line: number[], halfW: number): void {
     if (prev < 0 || next < 0) {
       // an end of an open line: square to its segment
       const s = prev < 0 ? next : prev;
-      ends[i] = starts[i] = pair(x, y, -dys[s] * halfW, dxs[s] * halfW);
+      const ox = -dys[s] * halfW, oy = dxs[s] * halfW;
+      ends[i] = starts[i] = out.pushPoint(x + ox, y + oy);
+      out.pushPoint(x - ox, y - oy);
       continue;
     }
     // the left normals of both segments, the miter halfway between them
     const n0x = -dys[prev], n0y = dxs[prev];
     const n1x = -dys[next], n1y = dxs[next];
     let mx = n0x + n1x, my = n0y + n1y;
-    const ml = Math.hypot(mx, my);
+    const ml = hypot2(mx, my);
     // cos of the angle between the miter and the normals: the miter is halfW / cos long
     const cos = ml > 1e-9 ? (mx * n1x + my * n1y) / ml : 0;
     if (cos >= 1 / MITER_LIMIT) {
       const s = halfW / (cos * ml);
       mx *= s; my *= s;
-      ends[i] = starts[i] = pair(x, y, mx, my);
+      ends[i] = starts[i] = out.pushPoint(x + mx, y + my);
+      out.pushPoint(x - mx, y - my);
     } else {
-      ends[i] = pair(x, y, n0x * halfW, n0y * halfW);
-      starts[i] = pair(x, y, n1x * halfW, n1y * halfW);
+      const ax = n0x * halfW, ay = n0y * halfW;
+      ends[i] = out.pushPoint(x + ax, y + ay);
+      out.pushPoint(x - ax, y - ay);
+      const bx = n1x * halfW, by = n1y * halfW;
+      starts[i] = out.pushPoint(x + bx, y + by);
+      out.pushPoint(x - bx, y - by);
     }
   }
 
   for (let i = 0; i < segs; i++) {
     const a = starts[i], b = ends[(i + 1) % n];
     // (a left, b right, b left), (a left, a right, b right)
-    out.indices.push(a, b + 1, b, a, a + 1, b + 1);
+    out.pushIndex(a);
+    out.pushIndex(b + 1);
+    out.pushIndex(b);
+    out.pushIndex(a);
+    out.pushIndex(a + 1);
+    out.pushIndex(b + 1);
+  }
+}
+
+/** The arrays addRibbon works in, per point of the line: kept between the lines (a tile has thousands). */
+class RibbonScratch {
+  public xs = new Float64Array(0);
+  public ys = new Float64Array(0);
+  // the unit direction of each segment
+  public dxs = new Float64Array(0);
+  public dys = new Float64Array(0);
+  public ends = new Int32Array(0);
+  public starts = new Int32Array(0);
+
+  /** Room for a line of points. */
+  public reserve(points: number): void {
+    if (this.xs.length >= points) return;
+    const size = Math.max(points, this.xs.length * 2, 256);
+    this.xs = new Float64Array(size);
+    this.ys = new Float64Array(size);
+    this.dxs = new Float64Array(size);
+    this.dys = new Float64Array(size);
+    this.ends = new Int32Array(size);
+    this.starts = new Int32Array(size);
   }
 }
 
@@ -517,13 +634,11 @@ export function buildBuildings(
   wantTrees = false,
   terrain: TerrainGrid | null = null,
 ): WorldBuildingResult {
-  const verts: number[] = [];
-  // Per vertex the lightmap chart, see SkyVisibilityLightmap: (atlas u, atlas v) of the start of a wall, (roof chart, -1)
-  // on a roof (see getRoofChart). The tile of the wall atlas is the same for all, see wallTile.
-  const lightmap: number[] = [];
+  // The vertices: position and id, and the lightmap chart, see BuildingVertices
+  const scratch = tileScratch ??= new TileScratch();
+  const verts = scratch.vertices;
+  verts.reset();
   const buildings: BuildingInfo[] = [];
-  const min: [number, number, number] = [Infinity, Infinity, Infinity];
-  const max: [number, number, number] = [-Infinity, -Infinity, -Infinity];
   const metersToNorm = proj.metersToNorm;
 
   // The footprints first, so the walls can be laid out in the lightmap atlas of the tile before the vertices are made.
@@ -663,19 +778,8 @@ export function buildBuildings(
   // bottom start a0 is the first vertex of its 2 triangles: the gBuffer reads the attribute flat from it (the first
   // vertex is the provoking one) and adds the distance along the wall and the height to it, see mapGBuffer.wgsl. A
   // roof triangle has only top vertices.
-  const indices: number[] = [];
-  let vertexCount = 0;
-  // u: the roof chart on a roof. Returns the index of the vertex
-  const push = (x: number, y: number, h: number, id: number, u: number, v: number, roof: boolean): number => {
-    const ex = x, ey = h, ez = -y;
-    verts.push(ex, ey, ez, id);
-    if (roof) lightmap.push(u, -1);
-    else lightmap.push(u, v);
-    if (ex < min[0]) min[0] = ex; if (ex > max[0]) max[0] = ex;
-    if (ey < min[1]) min[1] = ey; if (ey > max[1]) max[1] = ey;
-    if (ez < min[2]) min[2] = ez; if (ez > max[2]) max[2] = ez;
-    return vertexCount++;
-  };
+  const indices = scratch.indices;
+  indices.length = 0;
   // the largest wall atlas position, for the check against what the gBuffer can store, and per axis (the size of the
   // atlas, for the wallAtlas view)
   let atlasMax = 0;
@@ -691,16 +795,29 @@ export function buildBuildings(
     const hasRoof = tris.length > 0;
 
     // the bottom vertex of point k is first + 2k, its top vertex first + 2k + 1
-    const first = vertexCount;
+    const first = verts.count;
+    // written in place, see BuildingVertices: x, the height, -north and the id, and the lightmap chart
+    verts.reserve(coords.length);
+    const positions = verts.positions, charts = verts.lightmap;
+    let vertex = first;
     for (let k = 0; k < coords.length; k += 2) {
       const x = coords[k], y = coords[k + 1];
       // the atlas v at the bottom vertex, which can be over the base
       const bottom = corners[k / 2];
-      push(x, y, bottom, id, atlas[k], atlas[k + 1] + bottom - baseN, false);
-      // without a roof the top vertex is never the first of a triangle: its attribute is not read
-      if (hasRoof) push(x, y, topN, id, roofChart, 0, true);
-      else push(x, y, topN, id, atlas[k], atlas[k + 1], false);
+      let o = vertex * VERTEX_FLOATS;
+      positions[o] = x; positions[o + 1] = bottom; positions[o + 2] = -y; positions[o + 3] = id;
+      charts[vertex * 2] = atlas[k];
+      charts[vertex * 2 + 1] = atlas[k + 1] + bottom - baseN;
+      vertex++;
+      o += VERTEX_FLOATS;
+      positions[o] = x; positions[o + 1] = topN; positions[o + 2] = -y; positions[o + 3] = id;
+      // on a roof (roof chart, -1). Without a roof the top vertex is never the first of a triangle: its attribute is
+      // not read
+      charts[vertex * 2] = hasRoof ? roofChart : atlas[k];
+      charts[vertex * 2 + 1] = hasRoof ? -1 : atlas[k + 1];
+      vertex++;
     }
+    verts.count = vertex;
 
     // Roof (earcut output is CCW -> faces up), on the top vertices
     for (let t = 0; t < tris.length; t++) indices.push(first + tris[t] * 2 + 1);
@@ -718,9 +835,14 @@ export function buildBuildings(
         if (Number.isNaN(edges[pa])) continue;
         const a0 = first + pa * 2, b1 = first + pb * 2 + 1;
         let b0 = b1 - 1;
-        if (edges[pa] !== corners[pb]) b0 = push(bx, by, edges[pa], id, atlas[pb * 2], atlas[pb * 2 + 1], false);
-        indices.push(a0, b0, b1, a0, b1, a0 + 1);
-        const u1 = atlas[pa * 2] + Math.hypot(bx - ax, by - ay), v1 = atlas[pa * 2 + 1] + height;
+        if (edges[pa] !== corners[pb]) b0 = verts.push(bx, by, edges[pa], id, atlas[pb * 2], atlas[pb * 2 + 1]);
+        indices.push(a0);
+        indices.push(b0);
+        indices.push(b1);
+        indices.push(a0);
+        indices.push(b1);
+        indices.push(a0 + 1);
+        const u1 = atlas[pa * 2] + hypot2(bx - ax, by - ay), v1 = atlas[pa * 2 + 1] + height;
         atlasMax = Math.max(atlasMax, u1, v1);
         atlasSize[0] = Math.max(atlasSize[0], u1);
         atlasSize[1] = Math.max(atlasSize[1], v1);
@@ -733,21 +855,102 @@ export function buildBuildings(
     console.warn(`[MapWorld] the wall atlas of tile ${tile.z}/${tile.x}/${tile.y} is ${(atlasMax / metersToNorm / 1000).toFixed(1)} km, ` +
       'over what the gBuffer stores: its far walls get the lighting of its edge. See GBUFFER_ATLAS_STEP_M');
   }
-  if (verts.length === 0) {
-    min[0] = min[1] = min[2] = 0;
-    max[0] = max[1] = max[2] = 0;
-  }
+  const min: [number, number, number] = [0, 0, 0];
+  const max: [number, number, number] = [0, 0, 0];
+  if (verts.count > 0) verts.bounds(min, max);
   // The ground plane of the ray tracing is the ground quad (y 0), the layers lie a few cm over it (see LAYER_GAP). On
   // the terrain the bases are on the ground already
   const buildingFootprints = footprints.slice(0, treeStart);
   const trace = buildTraceBlock(buildingFootprints, traceTrees, terrain ? null : 0, buildingFootprints.map((fp) => fp.id));
-  const { vertices, quantization } = quantizeVertices(verts, min, max);
-  const lightmapData = new Float32Array(lightmap);
+  const { vertices, quantization } = quantizeVertices(verts.positions, verts.count * VERTEX_FLOATS, min, max);
+  const lightmapData = verts.lightmap.slice(0, verts.count * 2);
   return {
     vertices, quantization, lightmap: lightmapData, interleaved: interleaveBuildingVertices(vertices, lightmapData),
-    indices: vertices.length / 4 <= 65536 ? new Uint16Array(indices) : new Uint32Array(indices), trace, buildings, min, max,
+    indices: indices.finish(verts.count <= 65536), trace, buildings, min, max,
     atlasSize: walls ? atlasSize : null, wallTile: [layout.tileX, layout.tileY],
   };
+}
+
+/**
+ * The vertices of the buildings of a tile while buildBuildings makes them, in typed arrays that grow by doubling (as
+ * number[] with a closure that pushed them, each vertex took 6 numbers on the heap for its arguments: 10 MB of garbage
+ * per tile, and passed to a method 3 MB still: buildBuildings writes them in place after reserve), kept from tile to
+ * tile (reset, see GridMesh for why). positions: x, y, z (engine space) and the id per vertex, as doubles: quantizeVertices rounds them. lightmap:
+ * per vertex the lightmap chart, see SkyVisibilityLightmap: (atlas u, atlas v) of the start of a wall, (roof chart, -1)
+ * on a roof (see getRoofChart). The tile of the wall atlas is the same for all, see wallTile.
+ */
+class BuildingVertices {
+  public positions = new Float64Array(8192 * VERTEX_FLOATS);
+  public lightmap = new Float32Array(8192 * 2);
+  public count = 0;
+
+  /** Empty again, the arrays stay. */
+  public reset(): void {
+    this.count = 0;
+  }
+
+  /** Room for this many more vertices: positions and lightmap can be written up to count + vertices after it. */
+  public reserve(vertices: number): void {
+    const needed = (this.count + vertices) * VERTEX_FLOATS;
+    if (needed <= this.positions.length) return;
+    let size = this.positions.length * 2;
+    while (size < needed) size *= 2;
+    const positions = new Float64Array(size);
+    positions.set(this.positions);
+    this.positions = positions;
+    const lightmap = new Float32Array(size / VERTEX_FLOATS * 2);
+    lightmap.set(this.lightmap);
+    this.lightmap = lightmap;
+  }
+
+  /**
+   * A vertex at map (x, north) and height h, with the lightmap chart (u, v). Returns its index. For the few vertices
+   * that are not written in place.
+   */
+  public push(x: number, y: number, h: number, id: number, u: number, v: number): number {
+    this.reserve(1);
+    const index = this.count++;
+    const p = this.positions, o = index * VERTEX_FLOATS;
+    p[o] = x; p[o + 1] = h; p[o + 2] = -y; p[o + 3] = id;
+    this.lightmap[index * 2] = u;
+    this.lightmap[index * 2 + 1] = v;
+    return index;
+  }
+
+  /** The box of the positions into min and max. */
+  public bounds(min: number[], max: number[]): void {
+    let minX = Infinity, minY = Infinity, minZ = Infinity, maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    const p = this.positions;
+    for (let o = 0; o < this.count * VERTEX_FLOATS; o += VERTEX_FLOATS) {
+      const x = p[o], y = p[o + 1], z = p[o + 2];
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+      if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+    }
+    min[0] = minX; min[1] = minY; min[2] = minZ;
+    max[0] = maxX; max[1] = maxY; max[2] = maxZ;
+  }
+}
+
+/** Vertex indices in a typed array that grows by doubling. */
+class IndexList {
+  private data = new Uint32Array(8192 * 6);
+  public length = 0;
+
+  public push(index: number): void {
+    if (this.length === this.data.length) {
+      const data = new Uint32Array(this.data.length * 2);
+      data.set(this.data);
+      this.data = data;
+    }
+    this.data[this.length++] = index;
+  }
+
+  /** The indices in an array of their size, 16 bit when asked. */
+  public finish(uint16: boolean): Uint16Array | Uint32Array {
+    const used = this.data.subarray(0, this.length);
+    return uint16 ? new Uint16Array(used) : used.slice();
+  }
 }
 
 /** The vertex buffer of the buildings, see WorldBuildingResult.interleaved. */
@@ -772,8 +975,8 @@ function interleaveBuildingVertices(vertices: Uint16Array, lightmap: Float32Arra
  * starts MIN_DIST (~1.8 cm) off the surface), the id plus FEATURE_ID_BIAS. Decoded as position * scale + offset with
  * the unorm read as 0 to 1, the id rounded, see mapGBuffer.wgsl and shading.wgsl (QUANTIZED).
  */
-function quantizeVertices(verts: number[], min: number[], max: number[]): { vertices: Uint16Array; quantization: number[] } {
-  const vertices = new Uint16Array(verts.length);
+function quantizeVertices(verts: Float64Array, length: number, min: number[], max: number[]): { vertices: Uint16Array; quantization: number[] } {
+  const vertices = new Uint16Array(length);
   const scale = [0, 0, 0, 65535], offset = [min[0], min[1], min[2], -FEATURE_ID_BIAS];
   const toUnit = [0, 0, 0];
   for (let k = 0; k < 3; k++) {
@@ -782,7 +985,7 @@ function quantizeVertices(verts: number[], min: number[], max: number[]): { vert
     scale[k] = size;
     toUnit[k] = size > 0 ? 65535 / size : 0;
   }
-  for (let i = 0; i < verts.length; i += 4) {
+  for (let i = 0; i < length; i += 4) {
     for (let k = 0; k < 3; k++) vertices[i + k] = Math.round((verts[i + k] - min[k]) * toUnit[k]);
     vertices[i + 3] = verts[i + 3] + FEATURE_ID_BIAS;
   }
