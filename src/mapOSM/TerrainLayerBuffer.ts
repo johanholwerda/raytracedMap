@@ -68,6 +68,22 @@ export default class TerrainLayerBuffer {
     return this.usedIndices;
   }
 
+  /** The bytes of the tiles in the buffers: vertices and indices. */
+  public get usedBytes(): number {
+    return this.usedVerts * BYTES_PER_VERTEX + this.usedIndices * BYTES_PER_INDEX;
+  }
+
+  /** The bytes of the GPU buffers, which grow by doubling. */
+  public get capacityBytes(): number {
+    return this.capacityVerts * BYTES_PER_VERTEX + this.capacityIndices * BYTES_PER_INDEX;
+  }
+
+  /** The bytes a tile takes in the buffers, 0 when it isn't there. */
+  public tileBytes(key: string): number {
+    const range = this.ranges.get(key);
+    return range ? range.count * BYTES_PER_VERTEX + range.indexCount * BYTES_PER_INDEX : 0;
+  }
+
   /**
    * Append a tile under `key`: its positions (xyz) and its triangles, 3 indices into `positions` each. Without indices
    * `positions` is a triangle soup. No-op if empty or already present.

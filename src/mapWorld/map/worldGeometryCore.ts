@@ -350,8 +350,8 @@ export function buildWorldTile(
 /** A ground layer before the terrain: the points (x, north) and the triangles, 3 point indices each. */
 type FlatMesh = { coords: number[]; indices: number[] };
 
-/** The ground grid of the tile, from its heights in m (see ElevationService.getTileGrid). */
-function createTerrainGrid(tile: TileCoord, proj: MapProjection, heightsM: Float32Array): TerrainGrid {
+/** The ground grid of the tile, from its heights in m (see ElevationService.getTileGrid). Also TerrainHeightField. */
+export function createTerrainGrid(tile: TileCoord, proj: MapProjection, heightsM: Float32Array): TerrainGrid {
   // the same corners as getTileGrid: the edges of 2 neighbours are at the same lat/lng
   const sw = tileToLatLon(0, 1, 1, tile), ne = tileToLatLon(1, 0, 1, tile);
   const [x0, y0] = proj.project(sw.lon, sw.lat);

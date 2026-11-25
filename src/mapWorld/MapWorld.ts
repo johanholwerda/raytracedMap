@@ -27,6 +27,7 @@ import OpenFreeMapTileService from './map/OpenFreeMapTileService';
 import WorldWorkerPool from './map/WorldWorkerPool';
 import WorldTileStreamer from './map/WorldTileStreamer';
 import ElevationService from './map/ElevationService';
+import TerrainHeightField from './map/TerrainHeightField';
 import TiltShift from './tiltShift/TiltShift';
 import SkyVisibilityLightmap, { LightmapView } from './skyVisibilityLightmap/SkyVisibilityLightmap';
 import type { LightmapBlur } from './skyVisibilityLightmap/SkyVisibilityLightmap';
@@ -56,6 +57,9 @@ import { saveCanvasToDisk } from 'webGPU-framework/utils/image/ImageUtils';
 // qualities had amount 1, rayMarchSteps 6 (1 on low), randomStep on medium. Cost at 4K (3080): 0.55 ms with 6 steps,
 // 0.19 ms with 1 (only the contact occlusion), 0.20 ms with randomStep (~44% of the occlusion).
 const SSAO_ENABLED = false;
+// 1 / seconds: how fast the orbit pivot eases to the ground under it, and how close (m) it snaps onto it, see followGround
+const PIVOT_GROUND_RATE = 6;
+const PIVOT_GROUND_SNAP_M = .01;
 
 /**
  * The sandbox page loads eruda (the mobile console, a cogwheel + wrench button) for every example on mobile. MapWorld
@@ -102,6 +106,8 @@ export default class MapWorld {
   // The heights of the ground: the tiles are built on it while the elevation param is on, see applyElevation
   private elevation: ElevationService = new ElevationService();
   private elevationParam!: ParamBool;
+  // the ground of the loaded tiles, for the cars, the camera pivot and the plane (empty with the elevation off: flat 0)
+  private heightField!: TerrainHeightField;
   private drawMode!: ParamSelect;
   private quality!: ParamSelect;
   private timeOfDay!: ParamSelect;
@@ -304,6 +310,9 @@ export default class MapWorld {
       },
     });
 
+    this.heightField = new TerrainHeightField(this.projection);
+    this.traffic.setHeightField(this.heightField);
+    this.airplane.ground = (x, z) => this.heightField.heightAt(x, z);
     this.tileStreamer = new WorldTileStreamer({
       renderer: this.renderer,
       camera: this.camera,
@@ -316,6 +325,7 @@ export default class MapWorld {
       cityScene: this.skyLightmap.cityScene,
       roads: this.traffic,
       ground: this.geometry.groundBuffer,
+      heightField: this.heightField,
     });
     // on by default, see the elevation param
     this.tileStreamer.setElevation(this.elevation);
@@ -626,6 +636,19 @@ export default class MapWorld {
     this.dirty = true;
   }
 
+  /**
+   * The orbit pivot eases to the height of the ground under it, so the camera orbits a point on the terrain and rides
+   * over the hills while panning. Snaps when close: a still camera stops changing, so the map converges.
+   */
+  private followGround(): void {
+    const pivot = this.camera.pivot.position;
+    const ground = this.heightField.heightAt(pivot.x, pivot.z) ?? (this.elevationParam?.value === false ? 0 : null);
+    if (ground === null || ground === pivot.y) return;
+    let y = pivot.y + (ground - pivot.y) * (1 - Math.exp(-PIVOT_GROUND_RATE * Math.min(this.renderer.time.dt, .1)));
+    if (Math.abs(ground - y) < PIVOT_GROUND_SNAP_M * this.projection.metersToNorm) y = ground;
+    this.camera.pivot.setPositionValues(pivot.x, y, pivot.z);
+  }
+
   /** The elevation param to the tiles (they load again) and the ground (meshes or the flat quad). */
   private applyElevation(): void {
     const on = this.elevationParam.value;
@@ -715,6 +738,8 @@ export default class MapWorld {
     if (this.airplane.active) this.airplane.update(this.projection.metersToNorm, this.video?.stick ?? this.ui?.joystickValue);
     else {
       if (!this.video && !this.bench) this.orbitKeys.update(this.ui?.joystickValue);
+      // before the update, which sees whether the camera changed
+      this.followGround();
       this.camera.update();
       // eases out the bank left over from airplane mode
       this.airplane.settle();
@@ -765,7 +790,7 @@ export default class MapWorld {
   private shadowsAhead(): ShadowMapAhead | null {
     if (!this.airplane.active) return null;
     const origin = this.camera.worldPosition.clone();
-    origin.y = 0;
+    origin.y = this.camera.pivot.worldPosition.y;
     const forward = Vector3.subtract(this.camera.pivot.worldPosition, origin);
     forward.y = 0;
     // the pivot: where the view ray of the screen center hits the ground, the tilt-shift is sharp there

@@ -142,11 +142,13 @@ Data
 
 Ground layers and building footprints with heights are OpenFreeMap vector tiles (OpenMapTiles schema, zoom 14), 1 request per tile, decoded and triangulated in workers. Addresses of clicked buildings are from Nominatim. © OpenFreeMap © OpenMapTiles, data © OpenStreetMap contributors.
 
-The height of the ground is from the terrarium elevation tiles of the AWS terrain tiles (Mapzen), at zoom 12, decoded on the main thread (`ElevationService.ts`). Each map tile gets a grid of 33 x 33 heights, relative to the ground at the projection center, and the worker builds on it (`terrainGrid.ts`):
+The height of the ground is from the terrarium elevation tiles of the AWS terrain tiles (Mapzen), at zoom 12, decoded on the main thread (`ElevationService.ts`). Each map tile gets a grid of 65 x 65 heights, 1 cell per pixel of the elevation tiles, relative to the ground at the projection center, and the worker builds on it (`terrainGrid.ts`):
 
 - the ground: a mesh of the grid, 2 triangles per cell, instead of the flat ground quad.
-- the ground layers: cut along the grid lines and the cell diagonals where the ground under them isn't planar, so every piece lies on 1 triangle of the ground, and lifted to it. About 3 to 4 times the memory of the flat layers.
+- the ground layers: cut along the grid lines and the cell diagonals where the ground under them isn't planar, so every piece lies on 1 triangle of the ground, and lifted to it. 1.7 to 4 MB per tile in San Francisco and Amsterdam, 5 to 10 times the flat layers (the log has it per tile and in all).
 - the buildings: from the lowest ground under the footprint. A part over the ground (a tower on a podium) from the ground of the part around its center. Trees from the ground at their center.
+
+The main thread keeps the same grids (`TerrainHeightField.ts`) for what moves over the ground: the cars stand on it, sheared along the slope under them, the orbit pivot eases to the ground under it, and the plane flies at its height over the ground, its pivot where the view ray meets the terrain.
 
 The ray tracing still has no ground: a ray that goes down misses, as before, and hills don't shade. Outside the US most sources are surface models, with the buildings in them: Amsterdam's center is a mound of some 12 m. The `elevation` toggle in the layers turns it off. Terrain Tiles © Mapzen.
 

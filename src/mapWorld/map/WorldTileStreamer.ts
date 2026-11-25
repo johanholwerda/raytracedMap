@@ -19,6 +19,7 @@ import type { WallAtlasMeshData } from '../city/WallAtlasView';
 import OpenFreeMapTileService from './OpenFreeMapTileService';
 import WorldWorkerPool from './WorldWorkerPool';
 import type ElevationService from './ElevationService';
+import type TerrainHeightField from './TerrainHeightField';
 import type CityScene from '../city/CityScene';
 import type TerrainLayerBuffer from '../../mapOSM/TerrainLayerBuffer';
 
@@ -37,6 +38,8 @@ export type WorldTileStreamerConfig = {
   roads?: RoadTileSink;
   /** Gets the ground meshes of the terrain tiles with heights (see setElevation). */
   ground?: TerrainLayerBuffer;
+  /** Gets the heights of the terrain tiles, for what moves over the ground. */
+  heightField?: TerrainHeightField;
 };
 
 /** Takes the road center lines of the terrain tiles (WorldTileResult.roads), by tile key. */
@@ -83,6 +86,7 @@ export default class WorldTileStreamer {
   private cityScene?: CityScene;
   private roads?: RoadTileSink;
   private ground?: TerrainLayerBuffer;
+  private heightField?: TerrainHeightField;
   // the heights of the ground, null: the flat ground at 0. See setElevation
   private elevation: ElevationService | null = null;
 
@@ -154,6 +158,7 @@ export default class WorldTileStreamer {
     this.cityScene = config.cityScene;
     this.roads = config.roads;
     this.ground = config.ground;
+    this.heightField = config.heightField;
   }
 
   public init(paramGroup: ParamGroup): void {
@@ -231,6 +236,7 @@ export default class WorldTileStreamer {
   public clearAllTerrainTiles(): void {
     for (const layer of this.layers) layer.buffer.clear();
     this.ground?.clear();
+    this.heightField?.clear();
     this.roads?.clear();
     this.loadedTerrainTiles.clear();
     this.dropStale();
@@ -415,6 +421,7 @@ export default class WorldTileStreamer {
       for (const layer of this.layers) layer.buffer.removeTiles(terrainRemove);
       this.ground?.removeTiles(terrainRemove);
       for (const key of terrainRemove) {
+        this.heightField?.removeTile(key);
         this.loadedTerrainTiles.delete(key);
         this.roads?.removeTile(key);
       }
@@ -455,6 +462,8 @@ export default class WorldTileStreamer {
     // rejections are handled where it is awaited, not when the vector tile fails first
     heightsPromise.catch(() => {});
 
+    // the heights the tile is built on, kept for the height field (the worker gets a copy)
+    let tileHeights: Float32Array | null = null;
     void (async (): Promise<WorldTileResult | null> => {
       const response = await fetch(url);
       let pbf: ArrayBuffer;
@@ -466,16 +475,16 @@ export default class WorldTileStreamer {
         if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
         pbf = await response.arrayBuffer();
       }
-      const heights = await heightsPromise;
+      tileHeights = await heightsPromise;
       if (generation !== this.generation) return null;
-      return this.pool.buildTile(pbf, tile, bounds, entry.terrain, entry.city, this.treesEnabled, heights);
+      return this.pool.buildTile(pbf, tile, bounds, entry.terrain, entry.city, this.treesEnabled, tileHeights?.slice() ?? null);
     })()
       .then((result) => {
         if (generation !== this.generation) return;
         this.inFlight.delete(key);
         this.failedTiles.delete(key);
         this.batchTiles++;
-        this.onTileResult(key, entry, result);
+        this.onTileResult(key, entry, result, tileHeights);
         this.maybeLogBatch();
       })
       .catch((e) => {
@@ -488,7 +497,7 @@ export default class WorldTileStreamer {
       });
   }
 
-  private onTileResult(key: string, entry: QueuedTile, result: WorldTileResult | null): void {
+  private onTileResult(key: string, entry: QueuedTile, result: WorldTileResult | null, heights: Float32Array | null): void {
     if (entry.terrain && this.terrainStreamingEnabled && this.terrainDesired.has(key) && !this.loadedTerrainTiles.has(key)) {
       const terrain = result?.terrain;
       if (terrain) {
@@ -498,6 +507,8 @@ export default class WorldTileStreamer {
         }
       }
       if (result?.ground) this.ground?.addTile(key, result.ground.vertices, result.ground.indices);
+      if (heights) this.heightField?.addTile(entry.tile, heights);
+      if (terrain && LogGL.ENABLED) this.logGroundMemory(key);
       if (result?.roads?.length) this.roads?.addTile(key, result.roads);
       // Empty tiles are recorded too, so they aren't re-requested.
       this.loadedTerrainTiles.add(key);
@@ -517,6 +528,22 @@ export default class WorldTileStreamer {
     ) {
       this.needsRestream = true;
     }
+  }
+
+  /** The GPU memory of the ground of a tile that came in, and of all of them. */
+  private logGroundMemory(key: string): void {
+    const buffers = this.layers.map((l) => l.buffer);
+    if (this.ground) buffers.push(this.ground);
+    let tile = 0, used = 0, capacity = 0;
+    for (const b of buffers) {
+      tile += b.tileBytes(key);
+      used += b.usedBytes;
+      capacity += b.capacityBytes;
+    }
+    const groundTile = this.ground?.tileBytes(key) ?? 0;
+    const mb = (bytes: number) => (bytes / 1048576).toFixed(2);
+    LogGL.log(`[MapWorld] ground tile ${key}: ${mb(tile)} MB (layers ${mb(tile - groundTile)}, ground mesh ${mb(groundTile)}), ` +
+      `all ${this.loadedTerrainTiles.size + 1} ground tiles ${mb(used)} MB in ${mb(capacity)} MB of buffers`);
   }
 
   private maybeLogBatch(): void {

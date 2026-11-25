@@ -11,7 +11,7 @@ to 10 m), elsewhere mostly SRTM (30 to 90 m) and the like, which are surface mod
 as bumps, smoothed at the resolution used here.
 
 The tiles are fetched and decoded on the main thread, once per ELEVATION_ZOOM tile (a z12 tile covers 4 x 4 of the z14
-map tiles). For each map tile getTileGrid samples a grid of TERRAIN_GRID_CELLS + 1 heights over it, uniform in lat and
+map tiles). For each map tile getTileGrid samples a grid of terrainGridCells + 1 heights over it, uniform in lat and
 lng (the projection is equirectangular, so uniform in world x and z too), which the worker builds the ground mesh from
 and drapes the ground layers, buildings and trees on (see terrainGrid.ts). The grids of 2 neighbours sample their
 shared edge at the same lat/lng, so they meet without cracks.
@@ -27,11 +27,15 @@ export const ELEVATION_ATTRIBUTION = 'Terrain Tiles © Mapzen';
 export const ELEVATION_ZOOM = 12;
 const DEM_SIZE = 256;
 /**
- * The cells per side of the height grid of a map tile, see getTileGrid: 2 elevation pixels each (about 76 m at the
- * equator, 47 m at 52 degrees). 64 (1 per pixel) about doubles the vertices of the draped ground layers again: the
- * ground of a tile took 0.9 to 1.8 MB with 32, 1.7 to 3.4 MB with 64, and 0.3 to 0.4 MB flat (San Francisco, Amsterdam).
+ * The cells per side of the height grid of a map tile at zoom z, see getTileGrid: 1 per elevation pixel, so the grid
+ * has the resolution of the data (64 at z14: about 38 m at the equator, 24 m at 52 degrees). Its points are on the
+ * corners of the pixels, each the mean of the 4 pixels around it: the edges of the map tiles are on pixel edges. The
+ * draped ground of a tile took 1.7 to 3.4 MB (San Francisco, Amsterdam), 0.3 to 0.4 MB flat; half of that with a cell
+ * per 2 x 2 pixels.
  */
-export const TERRAIN_GRID_CELLS = 32;
+export function terrainGridCells(z: number): number {
+  return Math.max(1, DEM_SIZE >> Math.max(0, z - ELEVATION_ZOOM));
+}
 // decoded tiles kept (256 KB each)
 const CACHE_MAX = 96;
 // The heights are clamped to the sea level: the tiles have the depth of the sea (ETOPO1), the water layer lies on the
@@ -66,7 +70,7 @@ export default class ElevationService {
    * row, column i from the west. Lat and lng are uniform over the tile, the last row and column at its edge exactly.
    * Rejects when an elevation tile can't be loaded (the map tile retries later).
    */
-  public async getTileGrid(tile: TileCoord, cells = TERRAIN_GRID_CELLS): Promise<Float32Array> {
+  public async getTileGrid(tile: TileCoord, cells = terrainGridCells(tile.z)): Promise<Float32Array> {
     const sw = tileToLatLon(0, 1, 1, tile), ne = tileToLatLon(1, 0, 1, tile);
     const side = cells + 1;
     const lats = new Float64Array(side * side), lngs = new Float64Array(side * side);
