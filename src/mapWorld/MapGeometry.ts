@@ -11,6 +11,7 @@ import MapCamera from 'webGPU-framework/utils/camera/MapCamera';
 import Frustum from 'webGPU-framework/utils/camera/Frustum';
 import hash from 'webGPU-framework/shaders/hash.wgsl?raw';
 import overdraw from '../mapOSM/overdraw.wgsl?raw';
+import terrainNormal from './map/terrainNormal.wgsl?raw';
 import forwardShading from '../mapOSM/shading.wgsl?raw';
 import { LayerRuntime } from '../mapOSM/layerDefs';
 import TerrainLayerBuffer from '../mapOSM/TerrainLayerBuffer';
@@ -91,9 +92,10 @@ export default class MapGeometry {
 
     const createForwardMaterial = (color: Vector3, cullMode: GPUCullMode, city = false) => {
       const material = new VertexFragmentShader(renderer, 'osm', forwardShading, {
-        includes: [hash],
-        // SKY_ALBEDO: the sky term with the albedo, like the deferred shading. TREE_COLORS: the albedos of the trees
-        defines: city ? { FEATURE_IDS: true, SKY_ALBEDO: true, TREE_COLORS: true, QUANTIZED: true } : { SKY_ALBEDO: true },
+        includes: city ? [hash] : [hash, terrainNormal],
+        // SKY_ALBEDO: the sky term with the albedo, like the deferred shading. TREE_COLORS: the albedos of the trees.
+        // TERRAIN_NORMALS: the ground's smooth normal from .w, the buildings keep the flat one of the triangle
+        defines: city ? { FEATURE_IDS: true, SKY_ALBEDO: true, TREE_COLORS: true, QUANTIZED: true } : { SKY_ALBEDO: true, TERRAIN_NORMALS: true },
       });
       if (city) {
         material.setBuffer('materialPalette', gBuffer.paletteBuffer);

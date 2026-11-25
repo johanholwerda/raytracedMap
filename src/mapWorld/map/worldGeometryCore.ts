@@ -17,7 +17,7 @@ import type { TraceTree } from '../city/cityLayout';
 import type { BuildingPolygon, CityTraceBlock } from '../city/cityLayout';
 import { buildTrees, TREE_MATERIAL_BASE_ID } from './worldTrees';
 import { findWallBottoms } from '../city/hiddenWalls';
-import TerrainGrid, { insideRing } from './terrainGrid';
+import TerrainGrid, { GRID_VERTEX_FLOATS, insideRing } from './terrainGrid';
 
 /**
  * Pure (renderer-free) geometry core for the world map. Decodes one
@@ -54,6 +54,9 @@ export type WorldLayerConfig = {
   color: string;
   defaultOn: boolean;
 };
+
+// the layers that keep the normal up on the terrain (see TerrainGrid.drapeTriangles): the water is flat
+const FLAT_NORMAL_LAYERS = new Set(['water', 'waterways']);
 
 // Render layers, lowest first: stacked up from the ground quad at 0, LAYER_GAP apart (see LAYER_GAP).
 export const WORLD_LAYERS: WorldLayerConfig[] = [
@@ -120,10 +123,14 @@ export type WorldBuildingResult = {
   wallTile: [number, number];
 };
 
-/** One ground layer of one tile: xyz vertices and the triangles, 3 vertex indices each. */
+/**
+ * One ground layer of one tile: the vertices, floats (3 or 4) each, and the triangles, 3 vertex indices each. xyz, on
+ * the terrain with the encoded normal of the ground in .w (see encodeTerrainNormal).
+ */
 export type WorldTerrainLayer = {
   vertices: Float32Array;
   indices: Uint32Array;
+  floats: number;
 };
 
 export type WorldTileResult = {
@@ -325,18 +332,18 @@ export function buildWorldTile(
       const y = LAYER_Y[key];
       if (terrain) {
         const out = { vertices: [] as number[], indices: [] as number[] };
-        terrain.drapeTriangles(coords, indices, y, DRAPE_TOLERANCE, out);
-        layers[key] = { vertices: new Float32Array(out.vertices), indices: new Uint32Array(out.indices) };
+        terrain.drapeTriangles(coords, indices, y, DRAPE_TOLERANCE, !FLAT_NORMAL_LAYERS.has(key), out);
+        layers[key] = { vertices: new Float32Array(out.vertices), indices: new Uint32Array(out.indices), floats: GRID_VERTEX_FLOATS };
       } else {
         const vertices = new Float32Array(coords.length / 2 * 3);
         for (let k = 0, o = 0; k < coords.length; k += 2, o += 3) {
           vertices[o] = coords[k]; vertices[o + 1] = y; vertices[o + 2] = -coords[k + 1];
         }
-        layers[key] = { vertices, indices: new Uint32Array(indices) };
+        layers[key] = { vertices, indices: new Uint32Array(indices), floats: 3 };
       }
     }
     result.terrain = layers;
-    if (terrain) result.ground = terrain.buildMesh();
+    if (terrain) result.ground = { ...terrain.buildMesh(), floats: GRID_VERTEX_FLOATS };
     result.roads = new Float32Array(roads);
   }
 
@@ -350,7 +357,7 @@ export function buildWorldTile(
 /** A ground layer before the terrain: the points (x, north) and the triangles, 3 point indices each. */
 type FlatMesh = { coords: number[]; indices: number[] };
 
-/** The ground grid of the tile, from its heights in m (see ElevationService.getTileGrid). Also TerrainHeightField. */
+/** The ground grid of the tile, from its heights in m with their ring (ElevationService.getTileGrid). Also TerrainHeightField. */
 export function createTerrainGrid(tile: TileCoord, proj: MapProjection, heightsM: Float32Array): TerrainGrid {
   // the same corners as getTileGrid: the edges of 2 neighbours are at the same lat/lng
   const sw = tileToLatLon(0, 1, 1, tile), ne = tileToLatLon(1, 0, 1, tile);

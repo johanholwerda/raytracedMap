@@ -23,6 +23,10 @@ struct VertexOutput {
   // the palette index of a tree vertex, 0xFFFFFFFF for baseColor
   @location(2) @interpolate(flat) treeMaterial : u32,
 #endif
+#ifdef TERRAIN_NORMALS
+  // mapWorld's ground: the smooth normal in .w, see mapWorld/map/terrainNormal.wgsl (included with the define)
+  @location(3) normal : vec3<f32>,
+#endif
 };
 
 struct Uniforms {
@@ -81,6 +85,9 @@ fn vs_main(input : VertexInput) -> VertexOutput {
 
   output.position = uniforms.viewProjection * vec4<f32>(world, 1.0);
   output.world = world;
+#ifdef TERRAIN_NORMALS
+  output.normal = decodeTerrainNormal(vertex.w);
+#endif
 #ifdef FEATURE_IDS
   // `.w` is the tile-local feature id, or negative (NO_FEATURE_ID) for untagged
   // geometry. Map "no id" to 0xFFFFFFFF so the index map writes 0 (empty) and it
@@ -198,6 +205,9 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
   }
 #endif
  var n = normalize(cross(dpdy(input.world), dpdx(input.world)));
+#ifdef TERRAIN_NORMALS
+  n = normalize(input.normal);
+#endif
 
   if (DRAW_DEPTH) {
     let d = -input.world.y * 1.;

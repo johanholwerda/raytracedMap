@@ -8,6 +8,7 @@ import Matrix4x4 from 'webGPU-framework/renderer/math/Matrix4x4';
 import Camera from 'webGPU-framework/renderer/camera/Camera';
 import cityLightmapSurface from '../city/cityLightmapSurface.wgsl?raw';
 import packing from './mapGBufferPacking.wgsl?raw';
+import terrainNormal from '../map/terrainNormal.wgsl?raw';
 import shader from './mapGBuffer.wgsl?raw';
 import { GBUFFER_ATLAS_STEP_M } from '../city/cityLayout';
 
@@ -92,7 +93,7 @@ export default class MapGBuffer {
   public createMaterial(baseColor: Vector3, walls: boolean, cullMode: GPUCullMode = 'back'): VertexFragmentShader {
     const index = this.addPaletteColors([[baseColor.x, baseColor.y, baseColor.z]]);
     const material = new VertexFragmentShader(this.renderer, 'mapGBuffer', shader, {
-      includes: [cityLightmapSurface, packing],
+      includes: [cityLightmapSurface, packing, terrainNormal],
       defines: walls ? { WALLS: true } : {},
     });
     material.cullMode = cullMode;

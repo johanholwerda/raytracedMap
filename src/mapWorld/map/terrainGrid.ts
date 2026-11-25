@@ -5,28 +5,77 @@ to the north east one. The ground is planar on each triangle, so a flat polygon 
 the grid lines and the diagonals and its vertices are lifted to the ground: drapeTriangles (which leaves the cuts
 out where the ground is planar enough). The ground mesh (buildMesh) has the same triangles.
 
+The normals are smooth: at the grid points from the heights around them (central differences; the grid comes with a
+ring of the neighbour tiles' heights, so 2 tiles get the same normals on their shared edge), inside a triangle of the
+ground interpolated between its 3 corners. A vertex of the ground mesh or of a draped layer has the normal there in its
+.w, see encodeTerrainNormal: the interpolation over a piece of a layer is the one over the ground under it.
+
 Pure (no renderer imports): runs in the map worker.
  */
 
-/** A mesh in engine space: xyz per vertex (x, height, -north), 3 indices per triangle. */
+/**
+ * A mesh in engine space: x, height, -north and the normal (encodeTerrainNormal, or NO_NORMAL) per vertex, 3 indices
+ * per triangle.
+ */
 export type GridMesh = { vertices: number[]; indices: number[] };
+
+/** Floats per vertex of a GridMesh and of buildMesh. */
+export const GRID_VERTEX_FLOATS = 4;
+
+// the steps of each of the 2 encoded components of a normal: 11 bits
+const NORMAL_STEPS = 2047;
+/** The .w of a vertex without a normal of its own (the flat ground, the water): up, see terrainNormal.wgsl. */
+export const NO_NORMAL = -1;
+
+/**
+ * A unit normal with y > 0 in the .w of a vertex: x and z in 11 bits each, qx * 2048 + qz, an integer under 2^24, so a
+ * float holds it exactly (a bitcast u32 could be a NaN, which a copy may change). y follows from x and z. Decoded by
+ * decodeTerrainNormal of terrainNormal.wgsl.
+ */
+export function encodeTerrainNormal(nx: number, nz: number): number {
+  const q = (n: number) => Math.round((Math.min(Math.max(n, -1), 1) * .5 + .5) * NORMAL_STEPS);
+  return q(nx) * 2048 + q(nz);
+}
 
 export default class TerrainGrid {
   public readonly cells: number;
+  /** The heights of the grid points (world units): (cells + 1)^2, row j (from the south) after row, i from the west. */
+  public readonly heights: Float32Array;
+  // the unit normal of each grid point, xyz in engine space (y up, z south)
+  private readonly normals: Float32Array;
   private readonly dx: number;
   private readonly dy: number;
 
   /**
-   * x0, y0: the south west corner of the tile, x1, y1 the north east one (map coordinates). heights: (cells + 1)^2,
-   * row j (from the south) after row, column i from the west, in world units.
+   * x0, y0: the south west corner of the tile, x1, y1 the north east one (map coordinates). bordered: the heights in
+   * world units, (cells + 3)^2 from row and column -1 to cells + 1 (ElevationService.getTileGrid): the outer ring is in
+   * the neighbour tiles, for the normals on the edges.
    */
   constructor(
     public readonly x0: number, public readonly y0: number, public readonly x1: number, public readonly y1: number,
-    public readonly heights: Float32Array,
+    bordered: Float32Array,
   ) {
-    this.cells = Math.round(Math.sqrt(heights.length)) - 1;
-    this.dx = (x1 - x0) / this.cells;
-    this.dy = (y1 - y0) / this.cells;
+    const outer = Math.round(Math.sqrt(bordered.length));
+    const n = this.cells = outer - 3;
+    this.dx = (x1 - x0) / n;
+    this.dy = (y1 - y0) / n;
+    const side = n + 1;
+    this.heights = new Float32Array(side * side);
+    this.normals = new Float32Array(side * side * 3);
+    const b = (i: number, j: number) => bordered[(j + 1) * outer + i + 1];
+    for (let j = 0; j < side; j++) {
+      for (let i = 0; i < side; i++) {
+        this.heights[j * side + i] = b(i, j);
+        // the surface y = h(x, north) at z = -north: the normal is (-dh/dx, 1, dh/dnorth), normalized
+        const gx = (b(i + 1, j) - b(i - 1, j)) / (2 * this.dx);
+        const gn = (b(i, j + 1) - b(i, j - 1)) / (2 * this.dy);
+        const l = Math.hypot(gx, 1, gn);
+        const o = (j * side + i) * 3;
+        this.normals[o] = -gx / l;
+        this.normals[o + 1] = 1 / l;
+        this.normals[o + 2] = gn / l;
+      }
+    }
   }
 
   /** The x of grid column i: the last one exactly at x1, where the neighbour tile has its first. */
@@ -66,6 +115,27 @@ export default class TerrainGrid {
   }
 
   /**
+   * The normal of the ground at (x, north), encoded (encodeTerrainNormal): interpolated between the corners of the
+   * triangle of the mesh there, as the rasterizer interpolates the ground mesh.
+   */
+  public normalAt(x: number, y: number): number {
+    const i = this.cellX(x), j = this.cellY(y);
+    const u = (x - this.gridX(i)) / this.dx, v = (y - this.gridY(j)) / this.dy;
+    const side = this.cells + 1;
+    const sw = j * side + i, se = sw + 1, nw = sw + side, ne = nw + 1;
+    // the barycentric weights of the triangle (sw, se, ne) or (sw, ne, nw), see heightAt
+    let a: number, wa: number, b: number, wb: number;
+    const wsw = u >= v ? 1 - u : 1 - v;
+    if (u >= v) { a = se; wa = u - v; b = ne; wb = v; } else { a = nw; wa = v - u; b = ne; wb = u; }
+    const m = this.normals;
+    const nx = m[sw * 3] * wsw + m[a * 3] * wa + m[b * 3] * wb;
+    const ny = m[sw * 3 + 1] * wsw + m[a * 3 + 1] * wa + m[b * 3 + 1] * wb;
+    const nz = m[sw * 3 + 2] * wsw + m[a * 3 + 2] * wa + m[b * 3 + 2] * wb;
+    const l = Math.hypot(nx, ny, nz) || 1;
+    return encodeTerrainNormal(nx / l, nz / l);
+  }
+
+  /**
    * The lowest ground under a footprint (ring [start, end) of coords): at its points and at the grid points inside it
    * (the ground under a large building can dip below all its corners).
    */
@@ -91,17 +161,21 @@ export default class TerrainGrid {
     return min;
   }
 
-  /** The ground mesh of the tile: a vertex per grid point, 2 triangles per cell (counter-clockwise in map space). */
+  /**
+   * The ground mesh of the tile: a vertex per grid point (GRID_VERTEX_FLOATS, with its normal), 2 triangles per cell
+   * (counter-clockwise in map space).
+   */
   public buildMesh(): { vertices: Float32Array; indices: Uint32Array } {
     const n = this.cells, side = n + 1;
-    const vertices = new Float32Array(side * side * 3);
+    const vertices = new Float32Array(side * side * GRID_VERTEX_FLOATS);
     for (let j = 0; j < side; j++) {
       const y = this.gridY(j);
       for (let i = 0; i < side; i++) {
-        const o = (j * side + i) * 3;
+        const k = j * side + i, o = k * GRID_VERTEX_FLOATS;
         vertices[o] = this.gridX(i);
-        vertices[o + 1] = this.heights[j * side + i];
+        vertices[o + 1] = this.heights[k];
         vertices[o + 2] = -y;
+        vertices[o + 3] = encodeTerrainNormal(this.normals[k * 3], this.normals[k * 3 + 2]);
       }
     }
     const indices = new Uint32Array(n * n * 6);
@@ -122,10 +196,13 @@ export default class TerrainGrid {
    * on the vertices of its points (shared with the triangles around it). Elsewhere it is split along the grid lines,
    * halving the cells it covers, until the ground under a piece is planar or the piece is in 1 cell, which its diagonal
    * cuts: then every piece lies on 1 triangle of the ground. The pieces keep the winding of their triangle and share
-   * their vertices where the cuts give the same points.
+   * their vertices where the cuts give the same points. normals: the vertices get the smooth normal of the ground, else
+   * NO_NORMAL (up: the water, which is flat however the ground under it slopes).
    */
-  public drapeTriangles(coords: ArrayLike<number>, tris: ArrayLike<number>, lift: number, tolerance: number, out: GridMesh): void {
-    const drape: Drape = { out, lift, tolerance, points: new Int32Array(coords.length / 2).fill(-1), cut: new Map() };
+  public drapeTriangles(
+    coords: ArrayLike<number>, tris: ArrayLike<number>, lift: number, tolerance: number, normals: boolean, out: GridMesh,
+  ): void {
+    const drape: Drape = { out, lift, tolerance, normals, points: new Int32Array(coords.length / 2).fill(-1), cut: new Map() };
     for (let t = 0; t + 2 < tris.length; t += 3) {
       const ia = tris[t], ib = tris[t + 1], ic = tris[t + 2];
       const ax = coords[ia * 2], ay = coords[ia * 2 + 1], bx = coords[ib * 2], by = coords[ib * 2 + 1];
@@ -143,11 +220,16 @@ export default class TerrainGrid {
 
   /** The vertex of source point k, made on first use. */
   private pointVertex(drape: Drape, k: number, x: number, y: number): number {
-    if (drape.points[k] < 0) {
-      drape.points[k] = drape.out.vertices.length / 3;
-      drape.out.vertices.push(x, this.heightAt(x, y) + drape.lift, -y);
-    }
+    if (drape.points[k] < 0) drape.points[k] = this.pushVertex(drape, x, y);
     return drape.points[k];
+  }
+
+  /** A vertex of out on the ground at (x, north) plus the lift, with the normal there. Returns its index. */
+  private pushVertex(drape: Drape, x: number, y: number): number {
+    const out = drape.out;
+    const index = out.vertices.length / GRID_VERTEX_FLOATS;
+    out.vertices.push(x, this.heightAt(x, y) + drape.lift, -y, drape.normals ? this.normalAt(x, y) : NO_NORMAL);
+    return index;
   }
 
   /**
@@ -225,8 +307,7 @@ export default class TerrainGrid {
       const key = x + ',' + y;
       let v = cut.get(key);
       if (v === undefined) {
-        v = out.vertices.length / 3;
-        out.vertices.push(x, this.heightAt(x, y) + drape.lift, -y);
+        v = this.pushVertex(drape, x, y);
         cut.set(key, v);
       }
       index[k] = v;
@@ -246,10 +327,10 @@ export function insideRing(c: ArrayLike<number>, s: number, e: number, x: number
 }
 
 /**
- * One drapeTriangles call: the output, the lift and the tolerance, the vertices of the source points (-1: none yet) and
+ * One drapeTriangles call: the output, the lift, the tolerance and whether the vertices get normals, the vertices of the source points (-1: none yet) and
  * the vertices of the pieces by position.
  */
-type Drape = { out: GridMesh; lift: number; tolerance: number; points: Int32Array; cut: Map<string, number> };
+type Drape = { out: GridMesh; lift: number; tolerance: number; normals: boolean; points: Int32Array; cut: Map<string, number> };
 
 /**
  * The part of the convex polygon poly (x, y pairs) where a * x + b * y + c >= 0 (Sutherland-Hodgman), into out (which

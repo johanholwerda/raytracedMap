@@ -503,10 +503,10 @@ export default class WorldTileStreamer {
       if (terrain) {
         for (const layer of this.layers) {
           const l = terrain[layer.def.key];
-          if (l && l.indices.length) layer.buffer.addTile(key, l.vertices, l.indices);
+          if (l && l.indices.length) layer.buffer.addTile(key, l.vertices, l.indices, l.floats);
         }
       }
-      if (result?.ground) this.ground?.addTile(key, result.ground.vertices, result.ground.indices);
+      if (result?.ground) this.ground?.addTile(key, result.ground.vertices, result.ground.indices, result.ground.floats);
       if (heights) this.heightField?.addTile(entry.tile, heights);
       if (terrain && LogGL.ENABLED) this.logGroundMemory(key);
       if (result?.roads?.length) this.roads?.addTile(key, result.roads);

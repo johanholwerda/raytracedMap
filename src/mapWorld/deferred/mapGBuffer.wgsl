@@ -1,8 +1,9 @@
 // The gBuffer of MapWorld, see MapGBuffer.ts and the packing in mapGBufferPacking.wgsl. The targets are cleared to 0
 // and the depth to 1, which is the sky. The camera distance is the depth.
 // WALLS: the buildings and the trees, with the lightmap attribute (see city/cityLayout.ts) and in .w the feature id for
-// the selection highlight, or on a tree its palette entry (see map/worldTrees.ts). Without it the ground layers and the
-// ground quad, on the ground chart of the lightmap.
+// the selection highlight, or on a tree its palette entry (see map/worldTrees.ts), with the flat normal of the triangle.
+// Without it the ground layers and the ground quad, on the ground chart of the lightmap, with the smooth normal of the
+// terrain in .w (see terrainNormal.wgsl).
 
 struct VertexInput {
 #ifdef WALLS
@@ -28,6 +29,9 @@ struct VertexOutput {
   @location(3) @interpolate(flat) material : u32,
   // relative to the camera, like relative
   @location(4) @interpolate(flat) corner : vec3<f32>,
+#else
+  // the smooth normal of the ground, see terrainNormal.wgsl
+  @location(1) normal : vec3<f32>,
 #endif
 };
 
@@ -79,6 +83,7 @@ fn vs_main(input : VertexInput) -> VertexOutput {
 #else
   output.position = uniforms.viewProjection * vec4<f32>(input.position.xyz, 1.0);
   output.relative = input.position.xyz - uniforms.cameraPosition;
+  output.normal = decodeTerrainNormal(input.position.w);
 #endif
   return output;
 }
@@ -90,11 +95,15 @@ struct FragmentOutput {
 
 @fragment
 fn fs_main(input : VertexOutput) -> FragmentOutput {
+#ifdef WALLS
   // the flat normal facing the camera
   var n = normalize(cross(dpdx(input.relative), dpdy(input.relative)));
   if (dot(n, input.relative) > 0.0) {
     n = -n;
   }
+#else
+  let n = normalize(input.normal);
+#endif
   var id = SURFACE_GROUND;
   var atlas = vec2<u32>(0u);
   var selected = false;

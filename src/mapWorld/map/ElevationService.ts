@@ -66,19 +66,21 @@ export default class ElevationService {
   }
 
   /**
-   * The heights (m, relative to the origin) of the grid over a map tile: (cells + 1)^2, row j (from the south) after
-   * row, column i from the west. Lat and lng are uniform over the tile, the last row and column at its edge exactly.
-   * Rejects when an elevation tile can't be loaded (the map tile retries later).
+   * The heights (m, relative to the origin) of the grid over a map tile with a ring of the neighbour tiles' around it:
+   * (cells + 3)^2, row j (from the south, -1 to cells + 1) after row, column i from the west. Lat and lng are uniform
+   * over the tile, row and column 0 and cells at its edges exactly. The ring is for the normals on the edges, see
+   * TerrainGrid. Rejects when an elevation tile can't be loaded (the map tile retries later).
    */
   public async getTileGrid(tile: TileCoord, cells = terrainGridCells(tile.z)): Promise<Float32Array> {
     const sw = tileToLatLon(0, 1, 1, tile), ne = tileToLatLon(1, 0, 1, tile);
-    const side = cells + 1;
-    const lats = new Float64Array(side * side), lngs = new Float64Array(side * side);
-    for (let j = 0; j < side; j++) {
-      const lat = j === cells ? ne.lat : sw.lat + (ne.lat - sw.lat) * j / cells;
-      for (let i = 0; i < side; i++) {
-        lats[j * side + i] = lat;
-        lngs[j * side + i] = i === cells ? ne.lon : sw.lon + (ne.lon - sw.lon) * i / cells;
+    const outer = cells + 3;
+    const at = (k: number, from: number, to: number) => k === 0 ? from : k === cells ? to : from + (to - from) * k / cells;
+    const lats = new Float64Array(outer * outer), lngs = new Float64Array(outer * outer);
+    for (let j = 0; j < outer; j++) {
+      const lat = at(j - 1, sw.lat, ne.lat);
+      for (let i = 0; i < outer; i++) {
+        lats[j * outer + i] = lat;
+        lngs[j * outer + i] = at(i - 1, sw.lon, ne.lon);
       }
     }
     const origin = this.origin;

@@ -85,28 +85,33 @@ export default class TerrainLayerBuffer {
   }
 
   /**
-   * Append a tile under `key`: its positions (xyz) and its triangles, 3 indices into `positions` each. Without indices
-   * `positions` is a triangle soup. No-op if empty or already present.
+   * Append a tile under `key`: its positions (xyz, or with srcFloats 4 xyzw: the .w is kept, mapWorld's terrain has its
+   * normal there) and its triangles, 3 indices into `positions` each. Without indices `positions` is a triangle soup.
+   * No-op if empty or already present.
    */
-  public addTile(key: string, positions: Float32Array, indices?: Uint32Array): void {
+  public addTile(key: string, positions: Float32Array, indices?: Uint32Array, srcFloats = SRC_FLOATS_PER_VERTEX): void {
     if (positions.length === 0 || this.ranges.has(key)) return;
-    const nVerts = positions.length / SRC_FLOATS_PER_VERTEX;
+    const nVerts = positions.length / srcFloats;
     const nIndices = indices ? indices.length : nVerts;
     if (nIndices === 0) return;
 
     this.ensureCapacity(this.usedVerts + nVerts, this.usedIndices + nIndices);
 
     const start = this.usedVerts;
-    // Expand xyz -> (xyz, NO_FEATURE_ID) straight into the stride-4 CPU mirror,
+    // Expand xyz -> (xyz, NO_FEATURE_ID) straight into the stride-4 CPU mirror (xyzw as it is),
     // then upload only this tile's expanded region.
     const base = start * FLOATS_PER_VERTEX;
-    for (let v = 0; v < nVerts; v++) {
-      const s = v * SRC_FLOATS_PER_VERTEX;
-      const d = base + v * FLOATS_PER_VERTEX;
-      this.cpu[d] = positions[s];
-      this.cpu[d + 1] = positions[s + 1];
-      this.cpu[d + 2] = positions[s + 2];
-      this.cpu[d + 3] = NO_FEATURE_ID;
+    if (srcFloats === FLOATS_PER_VERTEX) {
+      this.cpu.set(positions, base);
+    } else {
+      for (let v = 0; v < nVerts; v++) {
+        const s = v * srcFloats;
+        const d = base + v * FLOATS_PER_VERTEX;
+        this.cpu[d] = positions[s];
+        this.cpu[d + 1] = positions[s + 1];
+        this.cpu[d + 2] = positions[s + 2];
+        this.cpu[d + 3] = NO_FEATURE_ID;
+      }
     }
     this.renderer.device.queue.writeBuffer(
       this.mesh!.vertexBuffer,

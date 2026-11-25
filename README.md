@@ -145,6 +145,7 @@ Ground layers and building footprints with heights are OpenFreeMap vector tiles 
 The height of the ground is from the terrarium elevation tiles of the AWS terrain tiles (Mapzen), at zoom 12, decoded on the main thread (`ElevationService.ts`). Each map tile gets a grid of 65 x 65 heights, 1 cell per pixel of the elevation tiles, relative to the ground at the projection center, and the worker builds on it (`terrainGrid.ts`):
 
 - the ground: a mesh of the grid, 2 triangles per cell, instead of the flat ground quad.
+- the normals: smooth, at the grid points from the heights around them (the grid has a ring of the neighbour tiles' heights, so both sides of a tile edge get the same ones), interpolated inside a triangle of the ground. A ground or layer vertex has its normal in the free .w of its vec4, x and z in 11 bits each, as an integer a float holds exactly (`terrainNormal.wgsl`). The water keeps the normal up, the buildings the flat one of the fragment shader.
 - the ground layers: cut along the grid lines and the cell diagonals where the ground under them isn't planar, so every piece lies on 1 triangle of the ground, and lifted to it. 1.7 to 4 MB per tile in San Francisco and Amsterdam, 5 to 10 times the flat layers (the log has it per tile and in all).
 - the buildings: from the lowest ground under the footprint. A part over the ground (a tower on a podium) from the ground of the part around its center. Trees from the ground at their center.
 
