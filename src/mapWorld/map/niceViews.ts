@@ -5,7 +5,11 @@
 export const NICE_VIEWS: string[] = [
   'lat=4.609368&lng=-74.058333&dist=960&pitch=-25.77&yaw=11.12&time=sunset',
   'lat=1.285584&lng=103.859607&dist=915&pitch=-27.27&yaw=25.48&time=afternoon',
-  'lat=55.720917&lng=37.895266&dist=535&pitch=-30.87&yaw=-68.53&time=noon'
+  'lat=55.720917&lng=37.895266&dist=535&pitch=-30.87&yaw=-68.53&time=noon',
+  'lat=52.513973&lng=13.378825&dist=137&pitch=-26.03&yaw=48.48&time=afternoon',
+  'lat=52.515823&lng=13.376545&dist=148&pitch=-20.80&yaw=-79.47&time=sunset',
+  'lat=50.089779&lng=14.401372&dist=440&pitch=-25.70&yaw=171.34&time=afternoon',
+  'lat=39.914328&lng=116.390864&dist=560&pitch=-30.96&yaw=3.73&time=sunrise'
 ];
 
 export type NiceView = { lat: number; lng: number; dist: number; pitch: number; yaw: number; time?: string };

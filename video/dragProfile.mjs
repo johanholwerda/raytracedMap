@@ -83,19 +83,56 @@ try {
       if (ms > 5) perf.slowWrites.push({ t: t0, ms, bytes, before: writes.reduce((s, w) => s + w[1], 0), label: buffer.label });
       return result;
     };
-    for (const name of ['createRenderPipeline', 'createComputePipeline']) {
+    // --pipelineCosts: the shader code of each module and the descriptor of each pipeline, compiled again one by one
+    // after the load (see pipelineCosts below)
+    perf.modules = new Map();
+    perf.descriptors = [];
+    const createShaderModule = GPUDevice.prototype.createShaderModule;
+    GPUDevice.prototype.createShaderModule = function (descriptor) {
+      const module = createShaderModule.apply(this, arguments);
+      perf.modules.set(module, descriptor.code);
+      return module;
+    };
+    for (const name of ['createRenderPipeline', 'createComputePipeline', 'createRenderPipelineAsync', 'createComputePipelineAsync']) {
       const create = GPUDevice.prototype[name];
-      GPUDevice.prototype[name] = function () {
-        perf.pipelines.push(performance.now());
-        (perf.pipelineLabels ??= []).push(`${(performance.now() / 1000).toFixed(2)} ${arguments[0]?.label ?? arguments[0]?.vertex?.module?.label ?? arguments[0]?.compute?.module?.label ?? '?'}`);
+      GPUDevice.prototype[name] = function (descriptor) {
+        perf.descriptors.push({ compute: name.startsWith('createCompute'), descriptor });
         return create.apply(this, arguments);
       };
     }
+    // --timePipelines: each sync pipeline is also made async, to see how long it takes to compile (+ms)
+    const timePipelines = window.location.search.includes('timePipelines');
+    for (const name of ['createRenderPipeline', 'createComputePipeline']) {
+      const create = GPUDevice.prototype[name];
+      const createAsync = GPUDevice.prototype[name + 'Async'];
+      GPUDevice.prototype[name] = function () {
+        perf.pipelines.push(performance.now());
+        const entry = `${(performance.now() / 1000).toFixed(2)} ${arguments[0]?.label ?? arguments[0]?.vertex?.module?.label ?? arguments[0]?.compute?.module?.label ?? '?'}`;
+        (perf.pipelineLabels ??= []).push(entry);
+        if (timePipelines) {
+          const index = perf.pipelineLabels.length - 1, t0 = performance.now();
+          createAsync.apply(this, arguments).then(() => perf.pipelineLabels[index] = entry + ` (+${(performance.now() - t0).toFixed(0)} ms)`, () => {});
+        }
+        return create.apply(this, arguments);
+      };
+    }
+    // async ones: when they are asked for, and when they are ready (+ms)
+    const createAsync = GPUDevice.prototype.createRenderPipelineAsync;
+    GPUDevice.prototype.createRenderPipelineAsync = function (descriptor) {
+      const t0 = performance.now();
+      const entry = `${(t0 / 1000).toFixed(2)} async ${descriptor?.label ?? '?'}`;
+      (perf.pipelineLabels ??= []).push(entry);
+      const index = perf.pipelineLabels.length - 1;
+      return createAsync.apply(this, arguments).then((p) => {
+        perf.pipelineLabels[index] = entry + ` (+${(performance.now() - t0).toFixed(0)} ms)`;
+        return p;
+      });
+    };
     new PerformanceObserver((list) => {
       if (!perf.recording) return;
       for (const e of list.getEntries()) {
         perf.loaf.push({
-          duration: e.duration, blocking: e.blockingDuration, render: e.renderStart ? e.startTime + e.duration - e.renderStart : 0,
+          t: e.startTime, duration: e.duration, blocking: e.blockingDuration, render: e.renderStart ? e.startTime + e.duration - e.renderStart : 0,
           scripts: e.scripts.map(s => ({ d: s.duration, invoker: s.invoker, fn: s.sourceFunctionName, url: s.sourceURL.split('/').pop(), pos: s.sourceCharPosition })),
         });
       }
@@ -123,7 +160,7 @@ try {
   const url = `http://localhost:5198/?bench=${rounds}&dragDir=same&dragFrames=${dragFrames}&dragSpeed=${dragSpeed}&city=${encodeURIComponent(city)}${extra ? '&' + extra : ''}`;
   console.log(url);
   if (fromStart) await client.send('Profiler.start');
-  await page.goto(url + (fromStart ? '&fromStart' : ''));
+  await page.goto(url + (fromStart ? '&fromStart' : '') + (args.includes('--timePipelines') ? '&timePipelines' : ''));
   // the city loaded and settled: the bench starts its first drag. From the start: as soon as the streamer is there
   await page.waitForFunction(() => window.__mapWorld?.tileStreamer &&
     window.__mapWorldBench.results.length >= (window.location.search.includes('fromStart') ? 0 : 1), { timeout: 600_000, polling: 20 });
@@ -150,6 +187,43 @@ try {
   const { profile } = await client.send('Profiler.stop');
   // --screenshot file.png: the page after the last settle
   if (option('screenshot', '')) await page.screenshot({ path: option('screenshot', '') });
+  // --pipelineCosts: every pipeline the app made, compiled again one at a time on a device of its own, with a comment
+  // added to its code so no shader cache has it. Layout 'auto'. The time until each is ready, the slowest first
+  if (args.includes('--pipelineCosts')) {
+    const costs = await page.evaluate(async () => {
+      const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+      const requiredLimits = {};
+      for (const key in adapter.limits) requiredLimits[key] = adapter.limits[key];
+      const device = await adapter.requestDevice({ requiredFeatures: [...adapter.features], requiredLimits });
+      const modules = new Map();
+      const bust = String(Math.random());
+      const remake = (stage) => {
+        if (!stage) return stage;
+        let m = modules.get(stage.module);
+        if (!m) {
+          m = device.createShaderModule({ code: window.__perf.modules.get(stage.module) + `\n// ${bust}\n` });
+          modules.set(stage.module, m);
+        }
+        return { ...stage, module: m };
+      };
+      const results = [];
+      // a copy: the pipelines made here are recorded too
+      for (const { compute, descriptor: d } of window.__perf.descriptors.slice()) {
+        const t0 = performance.now();
+        try {
+          if (compute) await device.createComputePipelineAsync({ ...d, layout: 'auto', compute: remake(d.compute) });
+          else await device.createRenderPipelineAsync({ ...d, layout: 'auto', vertex: remake(d.vertex), fragment: remake(d.fragment) });
+          results.push([performance.now() - t0, d.label]);
+        } catch (e) {
+          results.push([performance.now() - t0, d.label + ' (failed: ' + String(e.message).slice(0, 80) + ')']);
+        }
+      }
+      device.destroy();
+      return results.sort((a, b) => b[0] - a[0]);
+    });
+    console.log(`\npipeline compile times, one at a time (${costs.length}, ${costs.reduce((s, c) => s + c[0], 0).toFixed(0)} ms together):`);
+    for (const [ms, label] of costs) console.log(`  ${ms.toFixed(0).padStart(6)} ms  ${label}`);
+  }
   if (workerSessions.length) {
     const byFn = new Map();
     let total = 0;
@@ -287,7 +361,7 @@ try {
   console.log('\nlongest animation frames:');
   for (const l of perf.loaf.sort((a, b) => b.duration - a.duration).slice(0, 12)) {
     const scripts = l.scripts.sort((a, b) => b.d - a.d).slice(0, 4).map(s => `${s.d.toFixed(0)}ms ${s.invoker} ${s.fn}@${s.url}`).join(' | ');
-    console.log(`  ${l.duration.toFixed(0)} ms (render ${l.render.toFixed(0)}): ${scripts}`);
+    console.log(`  ${l.duration.toFixed(0)} ms at ${(l.t / 1000).toFixed(2)} s (render ${l.render.toFixed(0)}): ${scripts}`);
   }
   console.log(`\nprofile: ${out}`);
 } finally {

@@ -182,7 +182,7 @@ export default class CarTraffic implements RoadTileSink {
       kernel: 'main',
     });
     this.lightingShader.setBuffer('cityBuffer', this.dummyCityBuffer);
-    this.compositeMaterial = new VertexFragmentShader(renderer, 'carLayerComposite', compositeShader);
+    this.compositeMaterial = new VertexFragmentShader(renderer, 'carLayerComposite', compositeShader, { asyncPipeline: true });
     this.compositeMaterial.setPremultipliedAlphaBlending();
     this.compositeMaterial.depthWriteEnabled = false;
     this.compositeMaterial.depthCompare = 'always';
@@ -195,6 +195,8 @@ export default class CarTraffic implements RoadTileSink {
       // terrainSun.wgsl: the hills in the way of the sun, which the rays don't trace
       includes: perPixel ? [...SkyVisibilityLightmap.resolveIncludes, skyVisibilityTrace, terrainSun] : [...SkyVisibilityLightmap.resolveIncludes, terrainSun],
       defines: { SHADOW: shadow, PER_PIXEL: perPixel, ...(perPixel ? CityScene.traceDefines : {}) },
+      // drawn every frame: the cars are missing for the frames that the pipeline compiles in, instead of stalling them
+      asyncPipeline: true,
     });
     const car = create('cars', false);
     car.cullMode = 'back';

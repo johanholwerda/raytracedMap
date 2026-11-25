@@ -546,8 +546,9 @@ export default class Renderer {
     return cache.key;
   }
 
-  //sets everything a draw needs on the render pass, skipping what is already set
-  private prepareDraw(material: VertexFragmentShader, mesh: Mesh | null, indexBuffer: GPUBuffer | null, indexFormat: GPUIndexFormat): GPURenderPassEncoder {
+  //sets everything a draw needs on the render pass, skipping what is already set. null: the pipeline of the material
+  //is still being made (VertexFragmentShader.asyncPipeline), skip the draw
+  private prepareDraw(material: VertexFragmentShader, mesh: Mesh | null, indexBuffer: GPUBuffer | null, indexFormat: GPUIndexFormat): GPURenderPassEncoder | null {
     const uniformBufferOffset = this.setUniformData(material);
     const pass = this.renderPassEncoder;
     const state = this.renderPassState;
@@ -571,6 +572,7 @@ export default class Renderer {
     }
 
     const pipeline = material.pipeline;
+    if (!pipeline) return null;
     if (state.pipeline !== pipeline) {
       pass.setPipeline(pipeline);
       state.pipeline = pipeline;
@@ -617,6 +619,7 @@ export default class Renderer {
   public draw(mesh: Mesh, material: VertexFragmentShader, options: Partial<DrawOptions> = {}) {
     const instanceCount = options.instanceCount || 1;
     const pass = this.prepareDraw(material, mesh, mesh.indexBuffer, mesh.indexFormat);
+    if (!pass) return;
     if (mesh.indexBuffer) {
       pass.drawIndexed(mesh.indexCount, instanceCount);
     } else {
@@ -626,6 +629,7 @@ export default class Renderer {
 
   public drawIndirect(mesh: Mesh, material: VertexFragmentShader, indirectBuffer: GPUBuffer, indirectOffset: GPUSize64 = 0) {
     const pass = this.prepareDraw(material, mesh, mesh.indexBuffer, mesh.indexFormat);
+    if (!pass) return;
     if (mesh.indexBuffer) {
       pass.drawIndexedIndirect(indirectBuffer, indirectOffset);
     } else {
@@ -640,6 +644,7 @@ export default class Renderer {
     const firstIndex = options.firstIndex || 0;
 
     const pass = this.prepareDraw(material, null, indexBuffer, options.indexFormat ?? 'uint32');
+    if (!pass) return;
     if (indexBuffer) {
       pass.drawIndexed(vertexCount, instanceCount, firstIndex, firstVertex, firstInstance);
     } else {
@@ -655,6 +660,7 @@ export default class Renderer {
     indexFormat: GPUIndexFormat = 'uint32'
   ) {
     const pass = this.prepareDraw(material, null, indexBuffer, indexFormat);
+    if (!pass) return;
     if (indexBuffer) {
       pass.drawIndexedIndirect(indirectBuffer, indirectOffset);
     } else {

@@ -8,9 +8,10 @@
 // 1 where no ground is between the point p (with normal n) and the sun, 0 behind a hill: the 4 texels around it compared
 // and blended bilinearly, a soft edge of a texel. p goes off the surface along n by terrainSunOffset first (a texel and a
 // half): the map is too coarse for the ground to compare with itself, a slope would shadow its own lit side. Lit outside
-// the map
+// the map. A wall goes up by it too: off a wall along its normal is sideways, which over flat ground gains nothing
+// toward the sun, and the foot of every wall was shadowed by the ground texels next to it (up to a texel high)
 fn getTerrainSunShadow(p : vec3<f32>, n : vec3<f32>) -> f32 {
-  let q = p + n * uniforms.terrainSunOffset;
+  let q = p + (n + vec3<f32>(0.0, 1.0 - abs(n.y), 0.0)) * uniforms.terrainSunOffset;
   let clip = uniforms.terrainSunViewProjection * vec4<f32>(q, 1.0);
   // texture v runs down, ndc y up (as in the cascades)
   let uv = vec2<f32>(clip.x * 0.5 + 0.5, 0.5 - clip.y * 0.5);

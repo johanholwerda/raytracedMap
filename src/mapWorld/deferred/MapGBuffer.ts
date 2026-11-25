@@ -95,6 +95,8 @@ export default class MapGBuffer {
     const material = new VertexFragmentShader(this.renderer, 'mapGBuffer', shader, {
       includes: [cityLightmapSurface, packing, terrainNormal],
       defines: walls ? { WALLS: true } : {},
+      // the scene is drawn every frame, so it can be missing for the frames that its pipeline compiles in
+      asyncPipeline: true,
     });
     material.cullMode = cullMode;
     // the reversed depth: nearer is larger

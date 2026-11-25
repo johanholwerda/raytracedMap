@@ -43,6 +43,8 @@ export default class DeferredShading {
     this.material = new VertexFragmentShader(renderer, 'mapDeferredShading', shader, {
       includes: [toneMap, r2, cameraRay, ...SkyVisibilityLightmap.resolveIncludes, waterReflection, skyVisibilityTrace, terrainSun],
       defines: CityScene.traceDefines,
+      // about 600 ms to compile on a cold shader cache: the first frames are empty instead of stalled
+      asyncPipeline: true,
     });
     this.material.depthWriteEnabled = false;
     this.material.depthCompare = 'always';
