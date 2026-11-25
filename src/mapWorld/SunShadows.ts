@@ -100,9 +100,6 @@ export default class SunShadows {
     // the angular radius of the sun the soft ray traced shadows sample, in radians: the real sun is .0047. Not the sunSize
     // of the sun drawn in the sky, which is larger
     this.sunRadius = pgShading.addParamFloat('shadowSunRadius', .01, 0, .05, params);
-    // the hills (TerrainSunMap) shadow the buildings and the trees too, else only the ground. The ray traced shadows only:
-    // the cascades of the shadow map have the ground in them as a caster of everything
-    pgShading.addParamBool('terrainShadowOnBuildings', true, params);
   }
 
   /** Sets the sunAngleX/Y params (the GUI follows), see TimeOfDay. */

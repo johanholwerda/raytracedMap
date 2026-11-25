@@ -85,9 +85,6 @@ struct Uniforms {
   sunFresnel : f32,
   // how far a point goes off its surface before it is compared with terrainSunMap, see getTerrainSunShadow
   terrainSunOffset : f32,
-  // 1 the hills shadow the buildings and the trees too (getTerrainSunShadow), 0 only the ground, see the
-  // terrainShadowOnBuildings param of SunShadows
-  terrainShadowOnBuildings : f32,
 };
 
 // the reflectance of water seen straight down (index of refraction 1.33)
@@ -287,21 +284,16 @@ fn getRayTracedShadow(world : vec3<f32>, n : vec3<f32>, d : f32, coord : vec2<u3
 // the sun the point gets, 0 to 1, see SUN_SHADOWS. lightmapSun: with SUN_SHADOWS 2 and LIGHTMAP_ENABLED, the sun
 // visibility of the lightmap texels of the surface point and the paths it holds (zw of getLightmapLookup), lit where it
 // has none yet. The rays trace only the buildings and the trees: the hills come from the sun's view of the ground
-// (getTerrainSunShadow), on a building (not SURFACE_GROUND: a roof or a wall) only with terrainShadowOnBuildings. The
-// cascades have the ground in them
-fn getSunShadow(world : vec3<f32>, n : vec3<f32>, d : f32, coord : vec2<u32>, lightmapSun : vec2<f32>, surfaceId : u32) -> f32 {
+// (getTerrainSunShadow). The cascades have the ground in them
+fn getSunShadow(world : vec3<f32>, n : vec3<f32>, d : f32, coord : vec2<u32>, lightmapSun : vec2<f32>) -> f32 {
   if (SUN_SHADOWS == 0u) {
     return 1.;
   }
-  var terrain = 1.;
-  if (SUN_SHADOWS >= 2u && (surfaceId == SURFACE_GROUND || uniforms.terrainShadowOnBuildings > .5)) {
-    terrain = getTerrainSunShadow(world, n);
-  }
   if (SUN_SHADOWS == 2u && LIGHTMAP_ENABLED) {
-    return select(1., lightmapSun.x, lightmapSun.y > 0.) * terrain;
+    return select(1., lightmapSun.x, lightmapSun.y > 0.) * getTerrainSunShadow(world, n);
   }
   if (SUN_SHADOWS >= 2u) {
-    return getRayTracedShadow(world, n, d, coord) * terrain;
+    return getRayTracedShadow(world, n, d, coord) * getTerrainSunShadow(world, n);
   }
   return getShadowMap(world, n);
 }
@@ -520,7 +512,7 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
   if (SHADOW_VIEW == 1u) {
     // a face away from the sun is unlit: black, the same at full and at half resolution (the half resolution pass has no
     // sun there, see skyVisibilityHalfRes.wgsl)
-    return vec4<f32>(vec3<f32>(select(0.0, getSunShadow(world, n, d, coord, lightmap.zw, g.x), nDotL > 0.0)), 1.0);
+    return vec4<f32>(vec3<f32>(select(0.0, getSunShadow(world, n, d, coord, lightmap.zw), nDotL > 0.0)), 1.0);
   } else if (SHADOW_VIEW == 2u) {
     return vec4<f32>(cascadeDebugColor(world), 1.0);
   }
@@ -530,7 +522,7 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
   let albedo = albedoSample * albedoSample;
   var shadow = 1.0;
   if (nDotL > 0.0) {
-    shadow = mix(1.0, getSunShadow(world, n, d, coord, lightmap.zw, g.x), uniforms.shadowStrength);
+    shadow = mix(1.0, getSunShadow(world, n, d, coord, lightmap.zw), uniforms.shadowStrength);
   }
 
   var c = albedo * sunColor * (nDotL * shadow);
