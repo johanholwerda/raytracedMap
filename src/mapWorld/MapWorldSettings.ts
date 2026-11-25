@@ -188,7 +188,7 @@ export type TimeOfDaySettings = {
 };
 
 export const timeOfDaySettings: Record<TimeOfDay, TimeOfDaySettings> = {
-  [TimeOfDay.Sunrise]: { sunElevation: .12, sunSide: -1, skyColor: '#4f5663', sunColor: '#ffa866', backgroundColor: '#c9b8b0' },
+  [TimeOfDay.Sunrise]: { sunElevation: .12, sunSide: -1, skyColor: '#4f5663', sunColor: '#ff9466', backgroundColor: '#c9b8b0' },
   [TimeOfDay.Morning]: { sunElevation: .55, sunSide: -1, skyColor: '#657995', sunColor: '#d8b794', backgroundColor: '#bcd4ec' },
   [TimeOfDay.Noon]: { sunElevation: 1., sunSide: 0, skyColor: '#b2c1d2', sunColor: '#60503d', backgroundColor: '#a9bbcc' },
   [TimeOfDay.Afternoon]: { sunElevation: .3, sunSide: 1, skyColor: '#596b80', sunColor: '#dfba9f', backgroundColor: '#b8dbff' },
