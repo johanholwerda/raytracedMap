@@ -66,9 +66,14 @@ export default class WorldTileStreamer {
   private static readonly KEEP_MARGIN_TILES = 1;
   private static readonly RETRY_COOLDOWN_MS = 10000;
   private static readonly MAX_CITY_FINALIZE_PER_FRAME = 1;
-  // Concurrent tile fetches. Queued tiles beyond this can still be cancelled
-  // when the camera moves away.
-  private static readonly MAX_CONCURRENT_FETCHES = 8;
+  // The budget of applyTileResults per frame: the bytes of the ground uploaded, and the main thread time
+  private static readonly RESULT_BYTES_PER_FRAME = 4 * 1048576;
+  private static readonly RESULT_MS_PER_FRAME = 3;
+  // Concurrent tile requests (the fetch, then the worker), per worker of the pool: about half of a request is the fetch,
+  // with 1 per worker they were idle half the time. Queued tiles beyond this can still be cancelled when the camera moves
+  // away.
+  private static readonly FETCHES_PER_WORKER = 2;
+  private static readonly MIN_CONCURRENT_FETCHES = 8;
   // Tallest buildings we expect, used for the tile-vs-frustum test.
   private static readonly MAX_BUILDING_HEIGHT_M = 400;
   // The range of the ground (m, relative to the projection center's) of the tile-vs-frustum test while its elevation tile
@@ -97,6 +102,8 @@ export default class WorldTileStreamer {
   private fetchQueue: QueuedTile[] = [];
   private failedTiles: Map<string, number> = new Map();
   private cityReadyQueue: { key: string; result: WorldBuildingResult }[] = [];
+  // The tiles the workers finished, applied a few per frame (see applyTileResults), by key
+  private resultQueue: Map<string, { entry: QueuedTile; result: WorldTileResult | null; heights: Float32Array | null }> = new Map();
   // Bumped on every clear so results of requests made for an old region (or an
   // old projection center) are dropped when they arrive.
   private generation = 0;
@@ -228,7 +235,7 @@ export default class WorldTileStreamer {
   }
 
   public isIdle(): boolean {
-    return this.inFlight.size === 0 && this.fetchQueue.length === 0 && this.cityReadyQueue.length === 0;
+    return this.inFlight.size === 0 && this.fetchQueue.length === 0 && this.resultQueue.size === 0 && this.cityReadyQueue.length === 0;
   }
 
   // --- lifecycle ---------------------------------------------------------------
@@ -265,6 +272,7 @@ export default class WorldTileStreamer {
   private dropStale(): void {
     this.generation++;
     this.inFlight.clear();
+    this.resultQueue.clear();
     this.fetchQueue = [];
     this.failedTiles.clear();
     // Requests for still-wanted tiles may have been dropped; re-evaluate.
@@ -310,7 +318,24 @@ export default class WorldTileStreamer {
     }
 
     this.pumpFetchQueue();
+    this.applyTileResults();
     this.finalizeCityMeshes();
+  }
+
+  /**
+   * The tiles the workers finished, oldest first, until this frame has uploaded RESULT_BYTES_PER_FRAME or spent
+   * RESULT_MS_PER_FRAME on them (at least 1 per frame): many arrive together when the map moves fast, and uploading
+   * them all at once stalls the frame (the uploads, the roads and heights on the main thread).
+   */
+  private applyTileResults(): void {
+    const start = performance.now();
+    let bytes = 0;
+    for (const [key, { entry, result, heights }] of this.resultQueue) {
+      if (bytes > 0 && (bytes >= WorldTileStreamer.RESULT_BYTES_PER_FRAME || performance.now() - start >= WorldTileStreamer.RESULT_MS_PER_FRAME)) break;
+      this.resultQueue.delete(key);
+      bytes += this.onTileResult(key, entry, result, heights) || 1;
+      this.maybeLogBatch();
+    }
   }
 
   // --- streaming ---------------------------------------------------------------
@@ -404,7 +429,7 @@ export default class WorldTileStreamer {
         const needTerrain = terrainOn && inView && !this.loadedTerrainTiles.has(key);
         const needCity = cityOn && ring <= cityRadius && inView && !this.loadedCityTiles.has(key) && !this.cityReadyQueued(key);
         if (!needTerrain && !needCity) continue;
-        if (this.inFlight.has(key)) continue;
+        if (this.inFlight.has(key) || this.resultQueue.has(key)) continue;
         const failedAt = this.failedTiles.get(key);
         if (failedAt && now - failedAt < WorldTileStreamer.RETRY_COOLDOWN_MS) continue;
 
@@ -444,9 +469,10 @@ export default class WorldTileStreamer {
   }
 
   private pumpFetchQueue(): void {
-    while (this.fetchQueue.length > 0 && this.inFlight.size < WorldTileStreamer.MAX_CONCURRENT_FETCHES) {
+    const max = Math.max(WorldTileStreamer.MIN_CONCURRENT_FETCHES, this.pool.size * WorldTileStreamer.FETCHES_PER_WORKER);
+    while (this.fetchQueue.length > 0 && this.inFlight.size < max) {
       const entry = this.fetchQueue.shift()!;
-      if (this.inFlight.has(entry.key)) continue;
+      if (this.inFlight.has(entry.key) || this.resultQueue.has(entry.key)) continue;
       this.loadTile(entry);
     }
   }
@@ -484,8 +510,9 @@ export default class WorldTileStreamer {
         this.inFlight.delete(key);
         this.failedTiles.delete(key);
         this.batchTiles++;
-        this.onTileResult(key, entry, result, tileHeights);
-        this.maybeLogBatch();
+        this.resultQueue.set(key, { entry, result, heights: tileHeights });
+        // the next request right away, not at the next frame (which a busy GPU can hold up)
+        this.pumpFetchQueue();
       })
       .catch((e) => {
         if (generation !== this.generation) return;
@@ -494,19 +521,27 @@ export default class WorldTileStreamer {
         LogGL.warn(`[MapWorld] failed tile ${key}:`, e);
         this.onTileError?.(`Tile service error: GET ${url} - ${e?.message ?? e}`);
         this.maybeLogBatch();
+        this.pumpFetchQueue();
       });
   }
 
-  private onTileResult(key: string, entry: QueuedTile, result: WorldTileResult | null, heights: Float32Array | null): void {
+  /** Returns the bytes of the ground it uploaded. */
+  private onTileResult(key: string, entry: QueuedTile, result: WorldTileResult | null, heights: Float32Array | null): number {
+    let bytes = 0;
     if (entry.terrain && this.terrainStreamingEnabled && this.terrainDesired.has(key) && !this.loadedTerrainTiles.has(key)) {
       const terrain = result?.terrain;
       if (terrain) {
         for (const layer of this.layers) {
           const l = terrain[layer.def.key];
-          if (l && l.indices.length) layer.buffer.addTile(key, l.vertices, l.indices, l.floats);
+          if (!l || !l.indices.length) continue;
+          layer.buffer.addTile(key, l.vertices, l.indices, l.floats);
+          bytes += l.vertices.byteLength + l.indices.byteLength;
         }
       }
-      if (result?.ground) this.ground?.addTile(key, result.ground.vertices, result.ground.indices, result.ground.floats);
+      if (result?.ground && this.ground) {
+        this.ground.addTile(key, result.ground.vertices, result.ground.indices, result.ground.floats);
+        bytes += result.ground.vertices.byteLength + result.ground.indices.byteLength;
+      }
       if (heights) this.heightField?.addTile(entry.tile, heights);
       if (terrain && LogGL.ENABLED) this.logGroundMemory(key);
       if (result?.roads?.length) this.roads?.addTile(key, result.roads);
@@ -516,7 +551,7 @@ export default class WorldTileStreamer {
 
     if (entry.city && this.cityStreamingEnabled && this.cityDesired.has(key) && !this.loadedCityTiles.has(key)) {
       const buildings = result?.buildings ?? {
-        vertices: new Float32Array(0), lightmap: new Float32Array(0), indices: new Uint32Array(0), trace: null, buildings: [], min: [0, 0, 0], max: [0, 0, 0],
+        vertices: new Uint16Array(0), lightmap: new Float32Array(0), interleaved: new ArrayBuffer(0), indices: new Uint16Array(0), trace: null, buildings: [], min: [0, 0, 0], max: [0, 0, 0],
       };
       this.cityReadyQueue.push({ key, result: buildings as WorldBuildingResult });
     }
@@ -528,6 +563,7 @@ export default class WorldTileStreamer {
     ) {
       this.needsRestream = true;
     }
+    return bytes;
   }
 
   /** The GPU memory of the ground of a tile that came in, and of all of them. */
@@ -567,11 +603,19 @@ export default class WorldTileStreamer {
       let mesh: Mesh | null = null;
       if (result.vertices.length > 0) {
         mesh = new Mesh(this.renderer);
-        mesh.setAttribute('position', 4, result.vertices);
-        // The lightmap chart per vertex, read by the materials that declare it (see SkyVisibilityLightmap).
-        if (result.lightmap.length * 2 === result.vertices.length) mesh.setAttribute('lightmap', 2, result.lightmap);
-        // Indexed, see buildBuildings. A result without indices (an older worker) is a triangle soup
-        if (result.indices?.length) mesh.setIndices(result.indices);
+        // The layout of the vertex buffer the worker interleaved (WorldBuildingResult.interleaved): the quantized
+        // position, and the lightmap chart per vertex, read by the materials that declare it (see SkyVisibilityLightmap)
+        mesh.setAttribute('position', 4, new Uint16Array(0));
+        mesh.setAttribute('lightmap', 2, new Float32Array(0));
+        const vertexBuffer = this.renderer.device.createBuffer({
+          size: result.interleaved.byteLength,
+          usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+          label: `cityTile ${key}`,
+        });
+        this.renderer.device.queue.writeBuffer(vertexBuffer, 0, result.interleaved);
+        mesh.setVertexBuffer(vertexBuffer, result.vertices.length / 4);
+        // Indexed, see buildBuildings; 16 bit when they fit
+        mesh.setIndices(result.indices, result.indices instanceof Uint16Array ? 'uint16' : 'uint32');
         const { vertices, lightmap, indices, atlasSize } = result;
         if (atlasSize) this.lastCityTile = { key, result: { vertices, quantization: result.quantization, lightmap, indices, atlasSize } };
         this.meshBounds.set(mesh, new AABox(

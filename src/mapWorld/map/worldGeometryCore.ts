@@ -110,8 +110,13 @@ export type WorldBuildingResult = {
   quantization: number[];
   /** Per vertex the lightmap chart (vec2), see buildBuildings. */
   lightmap: Float32Array;
-  /** The triangles, 3 vertex indices each. */
-  indices: Uint32Array;
+  /**
+   * The vertex buffer: vertices and lightmap interleaved, 16 bytes per vertex (unorm16x4, float32x2), made here so the
+   * main thread uploads it as it is.
+   */
+  interleaved: ArrayBuffer;
+  /** The triangles, 3 vertex indices each: 16 bit up to 65536 vertices. */
+  indices: Uint16Array | Uint32Array;
   /** The ray tracing data of the buildings, null without buildings. See CityScene. */
   trace: CityTraceBlock | null;
   buildings: BuildingInfo[];
@@ -737,10 +742,28 @@ export function buildBuildings(
   const buildingFootprints = footprints.slice(0, treeStart);
   const trace = buildTraceBlock(buildingFootprints, traceTrees, terrain ? null : 0, buildingFootprints.map((fp) => fp.id));
   const { vertices, quantization } = quantizeVertices(verts, min, max);
+  const lightmapData = new Float32Array(lightmap);
   return {
-    vertices, quantization, lightmap: new Float32Array(lightmap), indices: new Uint32Array(indices), trace, buildings, min, max,
+    vertices, quantization, lightmap: lightmapData, interleaved: interleaveBuildingVertices(vertices, lightmapData),
+    indices: vertices.length / 4 <= 65536 ? new Uint16Array(indices) : new Uint32Array(indices), trace, buildings, min, max,
     atlasSize: walls ? atlasSize : null, wallTile: [layout.tileX, layout.tileY],
   };
+}
+
+/** The vertex buffer of the buildings, see WorldBuildingResult.interleaved. */
+function interleaveBuildingVertices(vertices: Uint16Array, lightmap: Float32Array): ArrayBuffer {
+  const count = vertices.length / 4;
+  const buffer = new ArrayBuffer(count * 16);
+  const u16 = new Uint16Array(buffer), f32 = new Float32Array(buffer);
+  for (let v = 0; v < count; v++) {
+    u16[v * 8] = vertices[v * 4];
+    u16[v * 8 + 1] = vertices[v * 4 + 1];
+    u16[v * 8 + 2] = vertices[v * 4 + 2];
+    u16[v * 8 + 3] = vertices[v * 4 + 3];
+    f32[v * 4 + 2] = lightmap[v * 2];
+    f32[v * 4 + 3] = lightmap[v * 2 + 1];
+  }
+  return buffer;
 }
 
 /**

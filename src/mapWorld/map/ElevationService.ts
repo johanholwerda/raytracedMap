@@ -109,31 +109,43 @@ export default class ElevationService {
     const n = 1 << ELEVATION_ZOOM;
     const world = n * DEM_SIZE;
     const count = lats.length;
-    // the pixel coordinates, from the pixel centers
+    // the pixel coordinates, from the pixel centers, and the range of pixels the bilinear samples read
     const px = new Float64Array(count), py = new Float64Array(count);
-    const needed = new Map<string, [number, number]>();
+    let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity;
     for (let k = 0; k < count; k++) {
       const latRad = Math.max(Math.min(lats[k], 85.05), -85.05) * Math.PI / 180;
-      px[k] = (lngs[k] + 180) / 360 * world - .5;
-      py[k] = (1 - Math.asinh(Math.tan(latRad)) / Math.PI) / 2 * world - .5;
-      const x0 = Math.floor(px[k]), y0 = Math.floor(py[k]);
-      for (const [x, y] of [[x0, y0], [x0 + 1, y0], [x0, y0 + 1], [x0 + 1, y0 + 1]]) {
-        const tx = this.wrap(Math.floor(x / DEM_SIZE), n), ty = Math.min(Math.max(Math.floor(y / DEM_SIZE), 0), n - 1);
-        const key = this.key(tx, ty);
-        if (!needed.has(key)) needed.set(key, [tx, ty]);
-      }
+      const x = px[k] = (lngs[k] + 180) / 360 * world - .5;
+      const y = py[k] = (1 - Math.asinh(Math.tan(latRad)) / Math.PI) / 2 * world - .5;
+      if (x < xMin) xMin = x;
+      if (x > xMax) xMax = x;
+      if (y < yMin) yMin = y;
+      if (y > yMax) yMax = y;
     }
-    const tiles = new Map<string, DemTile | null>();
-    await Promise.all([...needed].map(async ([key, [tx, ty]]) => tiles.set(key, await this.load(tx, ty))));
+    // the tiles of that range (by ty * n + tx): the points are close together (a map tile and its ring), so a few
+    const tx0 = Math.floor(Math.floor(xMin) / DEM_SIZE), tx1 = Math.floor((Math.floor(xMax) + 1) / DEM_SIZE);
+    const ty0 = Math.min(Math.max(Math.floor(Math.floor(yMin) / DEM_SIZE), 0), n - 1);
+    const ty1 = Math.min(Math.max(Math.floor((Math.floor(yMax) + 1) / DEM_SIZE), 0), n - 1);
+    const needed: [number, number][] = [];
+    for (let ty = ty0; ty <= ty1; ty++) {
+      for (let tx = tx0; tx <= tx1; tx++) needed.push([this.wrap(tx, n), ty]);
+    }
+    const tiles = new Map<number, DemTile | null>();
+    await Promise.all(needed.map(async ([tx, ty]) => tiles.set(ty * n + tx, await this.load(tx, ty))));
 
+    // the tile of the last pixel is mostly the one of the next
+    let lastKey = -1;
+    let lastDem: DemTile | null = null;
     const pixel = (x: number, y: number): number => {
-      const tx = this.wrap(Math.floor(x / DEM_SIZE), n);
+      const tileX = Math.floor(x / DEM_SIZE);
       const yc = Math.min(Math.max(y, 0), world - 1);
       const ty = Math.floor(yc / DEM_SIZE);
-      const dem = tiles.get(this.key(tx, ty));
-      if (!dem) return MIN_HEIGHT_M;
-      const lx = x - Math.floor(x / DEM_SIZE) * DEM_SIZE, ly = yc - ty * DEM_SIZE;
-      return dem.heights[ly * DEM_SIZE + lx];
+      const key = ty * n + this.wrap(tileX, n);
+      if (key !== lastKey) {
+        lastKey = key;
+        lastDem = tiles.get(key) ?? null;
+      }
+      if (!lastDem) return MIN_HEIGHT_M;
+      return lastDem.heights[(yc - ty * DEM_SIZE) * DEM_SIZE + x - tileX * DEM_SIZE];
     };
     const out = new Float32Array(count);
     for (let k = 0; k < count; k++) {

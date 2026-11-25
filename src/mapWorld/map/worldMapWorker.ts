@@ -47,7 +47,8 @@ ctx.onmessage = (e: MessageEvent<WorldWorkerRequest>) => {
     if (result.ground) transfers.push(result.ground.vertices.buffer, result.ground.indices.buffer);
     if (result.roads) transfers.push(result.roads.buffer);
     if (result.buildings) {
-      transfers.push(result.buildings.vertices.buffer, result.buildings.lightmap.buffer, result.buildings.indices.buffer);
+      const b = result.buildings;
+      transfers.push(b.vertices.buffer, b.lightmap.buffer, b.interleaved, b.indices.buffer);
       if (result.buildings.trace) transfers.push(result.buildings.trace.words.buffer, result.buildings.trace.ids.buffer);
     }
     ctx.postMessage({ id: msg.id, result }, transfers);

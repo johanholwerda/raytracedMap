@@ -202,7 +202,7 @@ export default class TerrainGrid {
   public drapeTriangles(
     coords: ArrayLike<number>, tris: ArrayLike<number>, lift: number, tolerance: number, normals: boolean, out: GridMesh,
   ): void {
-    const drape: Drape = { out, lift, tolerance, normals, points: new Int32Array(coords.length / 2).fill(-1), cut: new Map() };
+    const drape: Drape = { out, lift, tolerance, normals, points: new Int32Array(coords.length / 2).fill(-1), cut: new PointMap() };
     for (let t = 0; t + 2 < tris.length; t += 3) {
       const ia = tris[t], ib = tris[t + 1], ic = tris[t + 2];
       const ax = coords[ia * 2], ay = coords[ia * 2 + 1], bx = coords[ib * 2], by = coords[ib * 2 + 1];
@@ -304,11 +304,10 @@ export default class TerrainGrid {
     const index = new Array<number>(n);
     for (let k = 0; k < n; k++) {
       const x = poly[k * 2], y = poly[k * 2 + 1];
-      const key = x + ',' + y;
-      let v = cut.get(key);
-      if (v === undefined) {
+      let v = cut.get(x, y);
+      if (v < 0) {
         v = this.pushVertex(drape, x, y);
-        cut.set(key, v);
+        cut.set(x, y, v);
       }
       index[k] = v;
     }
@@ -330,7 +329,53 @@ export function insideRing(c: ArrayLike<number>, s: number, e: number, x: number
  * One drapeTriangles call: the output, the lift, the tolerance and whether the vertices get normals, the vertices of the source points (-1: none yet) and
  * the vertices of the pieces by position.
  */
-type Drape = { out: GridMesh; lift: number; tolerance: number; normals: boolean; points: Int32Array; cut: Map<string, number> };
+type Drape = { out: GridMesh; lift: number; tolerance: number; normals: boolean; points: Int32Array; cut: PointMap };
+
+/**
+ * A map from a point (x, y, exactly) to a number, for the vertices of the cuts: by a hash of the bits of the 2 floats,
+ * with chains of the points of the same hash. A string key (x + ',' + y) made the floats strings: most of the time of
+ * the draping went to that.
+ */
+class PointMap {
+  private static readonly bits = new Float64Array(2);
+  private static readonly words = new Uint32Array(PointMap.bits.buffer);
+  // per hash the first entry, then per entry the next one of the same hash (-1: none)
+  private readonly first = new Map<number, number>();
+  private readonly next: number[] = [];
+  private readonly xs: number[] = [];
+  private readonly ys: number[] = [];
+  private readonly values: number[] = [];
+
+  private static hash(x: number, y: number): number {
+    // + 0: -0 is 0, as x === y has it
+    PointMap.bits[0] = x + 0;
+    PointMap.bits[1] = y + 0;
+    const w = PointMap.words;
+    let h = Math.imul(w[0] ^ Math.imul(w[1], 0x9e3779b1), 0x85ebca6b);
+    h = Math.imul(h ^ w[2] ^ Math.imul(w[3], 0xc2b2ae35), 0x27d4eb2f);
+    // a small integer (a Smi): the fast keys of a Map
+    return (h ^ (h >>> 15)) & 0x3fffffff;
+  }
+
+  /** The value of the point, -1 when it has none. */
+  public get(x: number, y: number): number {
+    for (let e = this.first.get(PointMap.hash(x, y)) ?? -1; e >= 0; e = this.next[e]) {
+      if (this.xs[e] === x && this.ys[e] === y) return this.values[e];
+    }
+    return -1;
+  }
+
+  /** For a point that has no value yet. */
+  public set(x: number, y: number, value: number): void {
+    const h = PointMap.hash(x, y);
+    const e = this.values.length;
+    this.xs.push(x);
+    this.ys.push(y);
+    this.values.push(value);
+    this.next.push(this.first.get(h) ?? -1);
+    this.first.set(h, e);
+  }
+}
 
 /**
  * The part of the convex polygon poly (x, y pairs) where a * x + b * y + c >= 0 (Sutherland-Hodgman), into out (which

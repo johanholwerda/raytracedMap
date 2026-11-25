@@ -13,6 +13,7 @@ import ParamsGui from 'webGPU-framework/utils/paramsGui/ParamsGui';
 import MapCamera from 'webGPU-framework/utils/camera/MapCamera';
 import RenderTexture from 'webGPU-framework/renderer/texture/RenderTexture';
 import { isMobile } from 'webGPU-framework/renderer/utils/Browser';
+import { clamp } from 'webGPU-framework/renderer/utils/MathUtils';
 import type { LatLngBounds } from '../mapOSM/osmGeometryCore';
 import { DEFAULT_BOUNDS } from '../mapOSM/layerDefs';
 import MapProjection from '../mapOSM/MapProjection';
@@ -60,6 +61,34 @@ const SSAO_ENABLED = false;
 // 1 / seconds: how fast the orbit pivot eases to the ground under it, and how close (m) it snaps onto it, see followGround
 const PIVOT_GROUND_RATE = 6;
 const PIVOT_GROUND_SNAP_M = .01;
+// the orbit camera: the pitch (eulerX, radians, always a bit down) and the distance to the pivot (world units)
+const CAMERA_PITCH_MIN = -1.4;
+const CAMERA_PITCH_MAX = -.2;
+const CAMERA_DISTANCE_MIN = .1;
+const CAMERA_DISTANCE_MAX = 2;
+// ms the orbit camera has to stand still before its view goes into the URL, see updateUrl
+const URL_CAMERA_DELAY_MS = 500;
+// ms after the last input (pointer, wheel, key) in which the camera moving counts as the user moving it: the zoom
+// easing and the rotation inertia run on after the input, a random city or a searched place loads a bit after the click
+const USER_INPUT_WINDOW_MS = 2000;
+
+/**
+ * The orbit camera in the URL: ?lat=&lng= the pivot (the ground point it orbits), dist= its distance to the pivot in
+ * meters, pitch= and yaw= in degrees (pitch < 0: looking down). The time of day preset goes in as ?time=, see TIMES_OF_DAY.
+ */
+type UrlCamera = { lat: number; lng: number; dist: number; pitch: number; yaw: number };
+
+/** The camera of the URL, or null without a (valid) lat and lng. The missing others are NaN. */
+function parseUrlCamera(params: URLSearchParams): UrlCamera | null {
+  const num = (key: string) => {
+    const value = params.get(key);
+    return value === null || value.trim() === '' ? NaN : Number(value);
+  };
+  const lat = num('lat');
+  const lng = num('lng');
+  if (!(Math.abs(lat) <= 85) || !(Math.abs(lng) <= 180)) return null;
+  return { lat, lng, dist: num('dist'), pitch: num('pitch'), yaw: num('yaw') };
+}
 
 /**
  * The sandbox page loads eruda (the mobile console, a cogwheel + wrench button) for every example on mobile. MapWorld
@@ -118,6 +147,13 @@ export default class MapWorld {
   private cap60!: ParamBool;
   // The rAF time of the last rendered frame, ms.
   private lastFrameTime: number = -Infinity;
+  // the user moved the camera or changed the time of day since the URL was last written, the time (performance.now) the
+  // camera last moved and of the last user input, see updateUrl
+  private urlPending: boolean = false;
+  private cameraStillSince: number = 0;
+  private lastInputTime: number = -Infinity;
+  // ?time=sunset: the time of day preset to start with, see init
+  private urlTimeOfDay?: TimeOfDay;
   // QualitySettings.forward of the quality param
   private forward: boolean = false;
   private drawBuildings!: ParamBool;
@@ -238,8 +274,8 @@ export default class MapWorld {
     });
     this.camera.rotationController.eulerXY = new Vector2(-.7, 0);
     // always look a bit down, never from under the map
-    this.camera.rotationController.rotationLimitX = new Vector2(-1.4, -.2);
-    this.camera.setDistanceLimit(.1, 2);
+    this.camera.rotationController.rotationLimitX = new Vector2(CAMERA_PITCH_MIN, CAMERA_PITCH_MAX);
+    this.camera.setDistanceLimit(CAMERA_DISTANCE_MIN, CAMERA_DISTANCE_MAX);
     // Geometry is projected relative to the bounds center (world origin).
     this.camera.pivot.position = new Vector3(0, 0, 0);
     this.airplane = new AirplaneController(this.renderer, this.camera);
@@ -333,16 +369,85 @@ export default class MapWorld {
 
     // Start on one of a few well-known cities (pickStartCity). The projection
     // is centered on it so vertex coordinates stay small (fp32 precision).
-    // ?city=Paris: always the same city, for timings
-    const cityName = urlParams.get('city');
-    const city = (cityName ? await findCity(cityName) : undefined) ?? pickStartCity();
-    this.bounds = this.boundsAround(city.lat, city.lng);
-    LogGL.log(`[MapWorld] centering on ${describeCity(city)}`);
-    this.ui.showLocationTitle(city.name, city.landmark || undefined);
+    // ?lat=&lng=(&dist=&pitch=&yaw=): the camera of a shared link, see updateUrl. Not in a bench or a video,
+    // they move the camera themselves.
+    const urlCamera = this.bench || this.video ? null : parseUrlCamera(urlParams);
+    // not in a bench: its frames have to compare between runs
+    const timeIndex = TIMES_OF_DAY.indexOf(urlParams.get('time') ?? '');
+    if (!this.bench && timeIndex >= 0) this.urlTimeOfDay = timeIndex as TimeOfDay;
+    // the user's input, for telling their camera moves from the program's, see updateUrl
+    const markInput = () => this.lastInputTime = performance.now();
+    const inputOptions = { capture: true, passive: true };
+    window.addEventListener('pointerdown', markInput, inputOptions);
+    window.addEventListener('pointermove', (e) => { if (e.buttons) markInput(); }, inputOptions);
+    window.addEventListener('wheel', markInput, inputOptions);
+    window.addEventListener('keydown', markInput, inputOptions);
+    if (urlCamera) {
+      this.bounds = this.boundsAround(urlCamera.lat, urlCamera.lng);
+      LogGL.log(`[MapWorld] centering on the URL camera (${urlCamera.lat}, ${urlCamera.lng})`);
+    } else {
+      // ?city=Paris: always the same city, for timings
+      const cityName = urlParams.get('city');
+      const city = (cityName ? await findCity(cityName) : undefined) ?? pickStartCity();
+      this.bounds = this.boundsAround(city.lat, city.lng);
+      LogGL.log(`[MapWorld] centering on ${describeCity(city)}`);
+      this.ui.showLocationTitle(city.name, city.landmark || undefined);
+    }
     if (!this.video && !this.bench) this.ui.showControlsHint();
 
     await this.loadFromBounds(this.bounds);
+    if (urlCamera) this.applyUrlCamera(urlCamera);
     return true;
+  }
+
+  /** The pitch, yaw and distance of the URL (the pivot is at its lat/lng already, loadFromBounds centered there). */
+  private applyUrlCamera(urlCamera: UrlCamera): void {
+    const euler = this.camera.rotationController.eulerXY;
+    const toRad = Math.PI / 180;
+    const pitch = Number.isFinite(urlCamera.pitch) ? clamp(urlCamera.pitch * toRad, CAMERA_PITCH_MIN, CAMERA_PITCH_MAX) : euler.x;
+    const yaw = Number.isFinite(urlCamera.yaw) ? urlCamera.yaw * toRad : euler.y;
+    this.camera.rotationController.eulerXY = new Vector2(pitch, yaw);
+    if (Number.isFinite(urlCamera.dist)) {
+      this.camera.distance = clamp(urlCamera.dist * this.projection.metersToNorm, CAMERA_DISTANCE_MIN, CAMERA_DISTANCE_MAX);
+    }
+  }
+
+  /**
+   * Writes the orbit camera (lat, lng, dist, pitch, yaw, see UrlCamera) and the time of day to the URL once the camera
+   * has stood still for URL_CAMERA_DELAY_MS, with replaceState: no history entry per view. Only after the user moved
+   * the camera (within USER_INPUT_WINDOW_MS of their input) or changed the time of day: a fresh load, the pivot easing
+   * onto the loaded ground, keep the URL as it is. Not while flying (the plane never stands still), in a bench or a video.
+   */
+  private updateUrl(moving: boolean): void {
+    if (this.bench || this.video || this.airplane.active) return;
+    const now = performance.now();
+    if (moving) {
+      if (now - this.lastInputTime < USER_INPUT_WINDOW_MS) this.urlPending = true;
+      this.cameraStillSince = now;
+      return;
+    }
+    if (!this.urlPending || now - this.cameraStillSince < URL_CAMERA_DELAY_MS) return;
+    this.urlPending = false;
+
+    const pivot = this.camera.pivot.position;
+    const { lat, lng } = this.projection.worldToLatLng(pivot.x, pivot.z);
+    const euler = this.camera.rotationController.eulerXY;
+    // the yaw adds up over the turns: into -180..180
+    const yaw = euler.y - Math.PI * 2 * Math.round(euler.y / (Math.PI * 2));
+    const toDeg = 180 / Math.PI;
+    const params = new URLSearchParams(window.location.search);
+    // the camera's lat / lng win over it on load
+    params.delete('city');
+    params.set('lat', lat.toFixed(6));
+    params.set('lng', lng.toFixed(6));
+    params.set('dist', (this.camera.distance / this.projection.metersToNorm).toFixed(0));
+    params.set('pitch', (euler.x * toDeg).toFixed(2));
+    params.set('yaw', (yaw * toDeg).toFixed(2));
+    params.set('time', TIMES_OF_DAY[this.timeOfDay.value]);
+    const url = `${window.location.pathname}?${params}${window.location.hash}`;
+    if (url !== window.location.pathname + window.location.search + window.location.hash) {
+      window.history.replaceState(window.history.state, '', url);
+    }
   }
 
   /** Bounds centered on the camera pivot, keeping the current span. */
@@ -467,9 +572,13 @@ export default class MapWorld {
     const paramGroup = new ParamGroup('controls');
     this.drawMode = paramGroup.addParamSelect('drawMode', DrawMode.Full, DRAW_MODES, { callback: () => this.applyDrawMode() });
     this.quality = paramGroup.addParamSelect('quality', isMobile() ? Quality.Medium : Quality.High, QUALITIES, { callback: () => this.applyQuality() });
-    // a random one on every load, except in a bench: its frames have to compare between runs
-    const timeOfDay = this.bench ? TimeOfDay.Afternoon : randomTimeOfDay();
-    this.timeOfDay = paramGroup.addParamSelect('timeOfDay', timeOfDay, TIMES_OF_DAY, { callback: () => this.applyTimeOfDay() });
+    // the one of the URL, else a random one on every load, except in a bench: its frames have to compare between runs
+    const timeOfDay = this.bench ? TimeOfDay.Afternoon : this.urlTimeOfDay ?? randomTimeOfDay();
+    this.timeOfDay = paramGroup.addParamSelect('timeOfDay', timeOfDay, TIMES_OF_DAY, { callback: () => {
+      this.applyTimeOfDay();
+      // the GUI or a random city changed it: into the URL (once the camera stands still)
+      this.urlPending = true;
+    } });
     this.cap60 = paramGroup.addParamBool('cap60fps', isMobile());
     this.logDrawInfo = paramGroup.addParamBool('logDrawInfo', false);
     const setDirty = () => this.dirty = true;
@@ -752,6 +861,7 @@ export default class MapWorld {
     this.geometry.updateFrustum(this.camera);
 
     const cameraMoving = this.camera.changed;
+    this.updateUrl(cameraMoving);
     if (!this.tileStreamer.isIdle()) {
       this.loadingCooldown = 0.5;
     } else {

@@ -12,7 +12,7 @@ import type { WorldWorkerRequest } from './worldMapWorker';
  */
 
 type Pending = { resolve: (v: WorldTileResult) => void; reject: (e: any) => void };
-type Queued = { req: WorldWorkerRequest; transfer: Transferable[] };
+type Queued = { req: WorldWorkerRequest; transfer: Transferable[]; queued: number };
 
 export default class WorldWorkerPool {
   private workers: Worker[] = [];
@@ -20,6 +20,10 @@ export default class WorldWorkerPool {
   private queue: Queued[] = [];
   private pending = new Map<number, Pending>();
   private nextId = 1;
+  // when each busy worker got its job
+  private started = new Map<Worker, number>();
+  /** For profiling: the ms the workers worked together, the jobs done and the ms they waited in the queue together. */
+  public readonly stats = { busyMs: 0, jobs: 0, queueMs: 0 };
 
   constructor(size?: number) {
     const hw = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
@@ -58,22 +62,33 @@ export default class WorldWorkerPool {
     return new Promise<WorldTileResult>((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
       const worker = this.idle.pop();
-      if (worker) worker.postMessage(req, transfer);
-      else this.queue.push({ req, transfer });
+      if (worker) this.post(worker, req, transfer);
+      else this.queue.push({ req, transfer, queued: performance.now() });
     });
   }
 
   private onMessage(worker: Worker, data: { id: number; result?: WorldTileResult; error?: string }): void {
     const job = this.pending.get(data.id);
     this.pending.delete(data.id);
+    const now = performance.now();
+    this.stats.busyMs += now - (this.started.get(worker) ?? now);
+    this.stats.jobs++;
+    this.started.delete(worker);
 
     const next = this.queue.shift();
-    if (next) worker.postMessage(next.req, next.transfer);
-    else this.idle.push(worker);
+    if (next) {
+      this.stats.queueMs += now - next.queued;
+      this.post(worker, next.req, next.transfer);
+    } else this.idle.push(worker);
 
     if (!job) return;
     if (data.error) job.reject(new Error(data.error));
     else job.resolve(data.result!);
+  }
+
+  private post(worker: Worker, req: WorldWorkerRequest, transfer: Transferable[]): void {
+    this.started.set(worker, performance.now());
+    worker.postMessage(req, transfer);
   }
 
   public destroy(): void {

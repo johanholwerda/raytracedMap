@@ -117,7 +117,7 @@ export default class RoadGraph {
     const edges = this.tileEdges.get(key);
     if (!edges) return;
     this.tileEdges.delete(key);
-    const cells = new Set<SpawnCell>();
+    const cells = new Set<number>();
     const nodes = new Set<RoadNode>();
     for (const e of edges) {
       e.alive = false;
@@ -126,7 +126,7 @@ export default class RoadGraph {
       const cell = this.spawnGrid.get(e.cellKey);
       if (cell) {
         cell.length -= e.length;
-        cells.add(cell);
+        cells.add(e.cellKey);
       }
     }
     for (const node of nodes) {
@@ -138,8 +138,8 @@ export default class RoadGraph {
       if (index >= 0) list.splice(index, 1);
       if (list.length === 0) this.snapGrid.delete(node.snapKey);
     }
-    for (const [k, cell] of this.spawnGrid) {
-      if (!cells.has(cell)) continue;
+    for (const k of cells) {
+      const cell = this.spawnGrid.get(k)!;
       cell.edges = cell.edges.filter(e => e.alive);
       if (cell.edges.length === 0) this.spawnGrid.delete(k);
     }
@@ -192,9 +192,12 @@ export default class RoadGraph {
     const ix = Math.floor(x / s), iz = Math.floor(z / s);
     let best: RoadNode | null = null;
     let bestD = radius * radius;
-    for (let dx = -1; dx <= 1; dx++) {
-      for (let dz = -1; dz <= 1; dz++) {
-        const list = this.snapGrid.get(cellKey(ix + dx, iz + dz));
+    // the cells the radius reaches (at most the 3 x 3 around it): mostly only its own
+    const x0 = Math.floor((x - radius) / s), x1 = Math.floor((x + radius) / s);
+    const z0 = Math.floor((z - radius) / s), z1 = Math.floor((z + radius) / s);
+    for (let cx = x0; cx <= x1; cx++) {
+      for (let cz = z0; cz <= z1; cz++) {
+        const list = this.snapGrid.get(cellKey(cx, cz));
         if (!list) continue;
         for (const n of list) {
           const d = (n.x - x) * (n.x - x) + (n.z - z) * (n.z - z);

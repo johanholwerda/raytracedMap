@@ -14,13 +14,18 @@ import { NO_FEATURE_ID, VERTEX_FLOATS } from './cityGlTFCore';
  * each incoming vertex is expanded into the unified stride-4 layout the map
  * shares — xyz position + a `.w` building id, always {@link NO_FEATURE_ID} for
  * terrain — so terrain draws with the exact same vertex layout as the buildings
- * and ground quad (one g-buffer pipeline, no per-mesh layout churn). Merging
- * tiles is concatenating their (expanded) vertices and their indices, offset
- * by where the tile's vertices start. Each tile keeps its vertex and index
- * range; removing a tile compacts everything after it to the left so the used
- * regions stay contiguous (one draw covers them with no holes), and lowers the
- * indices of the moved tiles by how far their vertices moved. CPU mirrors of
- * both buffers are kept so the compaction only re-uploads what moved.
+ * and ground quad (one g-buffer pipeline, no per-mesh layout churn).
+ *
+ * Each tile gets a range of the vertex buffer and a range of the index buffer
+ * (first fit, see RangeAllocator) and keeps them until it is removed: nothing
+ * moves, so adding a tile writes only its own data and removing one writes only
+ * zeros over its indices. Zeros are degenerate triangles (all corners vertex 0),
+ * which the GPU skips, so the single draw covers the index buffer up to the end
+ * of the last tile, holes and all; a later tile fills a hole it fits in. The
+ * buffers live on the GPU only (no CPU mirrors). When they are full they grow by
+ * doubling, copied on the GPU. A compaction instead (moving the tiles after a
+ * removed one to the left) re-uploaded much of the buffer on every eviction:
+ * 50-200 ms of main thread per frame while the map was dragged.
  *
  * The draw uses drawIndexedIndirect: the index count lives in an indirect
  * buffer that is rewritten on every add/remove. This is required because
@@ -34,25 +39,89 @@ const SRC_FLOATS_PER_VERTEX = 3;
 const FLOATS_PER_VERTEX = VERTEX_FLOATS; // 4: xyz + id
 const BYTES_PER_VERTEX = FLOATS_PER_VERTEX * Float32Array.BYTES_PER_ELEMENT; // 16
 const BYTES_PER_INDEX = Uint32Array.BYTES_PER_ELEMENT; // always 32 bit: the tiles together pass 65535 vertices
-const INITIAL_CAPACITY_VERTS = 1 << 14; // 16384 verts (~256 KB)
-const INITIAL_CAPACITY_INDICES = 1 << 15; // 32768 indices (128 KB)
+const INITIAL_CAPACITY_VERTS = 1 << 16; // 65536 verts (1 MB)
+const INITIAL_CAPACITY_INDICES = 1 << 17; // 131072 indices (512 KB)
 
 // vertices [start, start + count), indices [indexStart, indexStart + indexCount)
 type Range = { start: number; count: number; indexStart: number; indexCount: number };
 
+/** The free ranges of a buffer of `capacity` elements: first fit, neighbours merged. */
+class RangeAllocator {
+  // sorted by start, never touching each other
+  private free: { start: number; size: number }[];
+
+  constructor(public capacity: number) {
+    this.free = capacity > 0 ? [{ start: 0, size: capacity }] : [];
+  }
+
+  /** The start of a free range of `size`, the lowest one: -1 when none is large enough. */
+  public allocate(size: number): number {
+    for (let i = 0; i < this.free.length; i++) {
+      const range = this.free[i];
+      if (range.size < size) continue;
+      const start = range.start;
+      range.start += size;
+      range.size -= size;
+      if (range.size === 0) this.free.splice(i, 1);
+      return start;
+    }
+    return -1;
+  }
+
+  public release(start: number, size: number): void {
+    let i = 0;
+    while (i < this.free.length && this.free[i].start < start) i++;
+    this.free.splice(i, 0, { start, size });
+    if (i + 1 < this.free.length && start + size === this.free[i + 1].start) {
+      this.free[i].size += this.free[i + 1].size;
+      this.free.splice(i + 1, 1);
+    }
+    if (i > 0 && this.free[i - 1].start + this.free[i - 1].size === start) {
+      this.free[i - 1].size += this.free[i].size;
+      this.free.splice(i, 1);
+    }
+  }
+
+  /** Everything free again. */
+  public reset(): void {
+    this.free = this.capacity > 0 ? [{ start: 0, size: this.capacity }] : [];
+  }
+
+  /** The capacity grows to `capacity`: the new part is free. */
+  public grow(capacity: number): void {
+    const last = this.free[this.free.length - 1];
+    if (last && last.start + last.size === this.capacity) last.size += capacity - this.capacity;
+    else this.free.push({ start: this.capacity, size: capacity - this.capacity });
+    this.capacity = capacity;
+  }
+
+  /** The end of the last used range: all after it is free. */
+  public get end(): number {
+    const last = this.free[this.free.length - 1];
+    return last && last.start + last.size === this.capacity ? last.start : this.capacity;
+  }
+}
+
 export default class TerrainLayerBuffer {
   private renderer: Renderer;
   private mesh: Mesh | null = null;
+  private vertexBuffer: GPUBuffer | null = null;
+  private indexBuffer: GPUBuffer | null = null;
   private indirectBuffer: GPUBuffer | null = null;
-  private cpu: Float32Array = new Float32Array(0);
-  private capacityVerts = 0;
+  private indirectArgs = new Uint32Array([0, 1, 0, 0, 0]);
+  private vertices = new RangeAllocator(0);
+  private indices = new RangeAllocator(0);
   private usedVerts = 0;
-  private cpuIndices: Uint32Array = new Uint32Array(0);
-  private capacityIndices = 0;
   private usedIndices = 0;
   private ranges: Map<string, Range> = new Map();
+  // reused for the expanded vertices and the offset indices of a tile, and the zeros over a removed one's indices
+  // (queue.writeBuffer copies the data right away)
+  private vertexScratch = new Float32Array(0);
+  private indexScratch = new Uint32Array(0);
+  private zeros = new Uint32Array(0);
 
-  constructor(renderer: Renderer) {
+  /** initialVerts, initialIndices: the capacity of the buffers when the first tile comes. */
+  constructor(renderer: Renderer, private initialVerts = INITIAL_CAPACITY_VERTS, private initialIndices = INITIAL_CAPACITY_INDICES) {
     this.renderer = renderer;
   }
 
@@ -75,7 +144,7 @@ export default class TerrainLayerBuffer {
 
   /** The bytes of the GPU buffers, which grow by doubling. */
   public get capacityBytes(): number {
-    return this.capacityVerts * BYTES_PER_VERTEX + this.capacityIndices * BYTES_PER_INDEX;
+    return this.vertices.capacity * BYTES_PER_VERTEX + this.indices.capacity * BYTES_PER_INDEX;
   }
 
   /** The bytes a tile takes in the buffers, 0 when it isn't there. */
@@ -85,7 +154,7 @@ export default class TerrainLayerBuffer {
   }
 
   /**
-   * Append a tile under `key`: its positions (xyz, or with srcFloats 4 xyzw: the .w is kept, mapWorld's terrain has its
+   * Add a tile under `key`: its positions (xyz, or with srcFloats 4 xyzw: the .w is kept, mapWorld's terrain has its
    * normal there) and its triangles, 3 indices into `positions` each. Without indices `positions` is a triangle soup.
    * No-op if empty or already present.
    */
@@ -95,41 +164,40 @@ export default class TerrainLayerBuffer {
     const nIndices = indices ? indices.length : nVerts;
     if (nIndices === 0) return;
 
-    this.ensureCapacity(this.usedVerts + nVerts, this.usedIndices + nIndices);
+    let start = this.vertices.allocate(nVerts);
+    let indexStart = this.indices.allocate(nIndices);
+    if (start < 0 || indexStart < 0) {
+      if (start >= 0) this.vertices.release(start, nVerts);
+      if (indexStart >= 0) this.indices.release(indexStart, nIndices);
+      this.grow(nVerts, nIndices);
+      start = this.vertices.allocate(nVerts);
+      indexStart = this.indices.allocate(nIndices);
+    }
+    const queue = this.renderer.device.queue;
 
-    const start = this.usedVerts;
-    // Expand xyz -> (xyz, NO_FEATURE_ID) straight into the stride-4 CPU mirror (xyzw as it is),
-    // then upload only this tile's expanded region.
-    const base = start * FLOATS_PER_VERTEX;
-    if (srcFloats === FLOATS_PER_VERTEX) {
-      this.cpu.set(positions, base);
-    } else {
+    // xyz -> (xyz, NO_FEATURE_ID), xyzw as it is
+    let vertexData = positions;
+    if (srcFloats !== FLOATS_PER_VERTEX) {
+      vertexData = this.vertexScratch = TerrainLayerBuffer.atLeast(this.vertexScratch, nVerts * FLOATS_PER_VERTEX);
       for (let v = 0; v < nVerts; v++) {
         const s = v * srcFloats;
-        const d = base + v * FLOATS_PER_VERTEX;
-        this.cpu[d] = positions[s];
-        this.cpu[d + 1] = positions[s + 1];
-        this.cpu[d + 2] = positions[s + 2];
-        this.cpu[d + 3] = NO_FEATURE_ID;
+        const d = v * FLOATS_PER_VERTEX;
+        vertexData[d] = positions[s];
+        vertexData[d + 1] = positions[s + 1];
+        vertexData[d + 2] = positions[s + 2];
+        vertexData[d + 3] = NO_FEATURE_ID;
       }
     }
-    this.renderer.device.queue.writeBuffer(
-      this.mesh!.vertexBuffer,
-      start * BYTES_PER_VERTEX,
-      this.cpu.buffer as ArrayBuffer,
-      base * Float32Array.BYTES_PER_ELEMENT,
-      nVerts * BYTES_PER_VERTEX,
-    );
+    queue.writeBuffer(this.vertexBuffer!, start * BYTES_PER_VERTEX, vertexData.buffer as ArrayBuffer, vertexData.byteOffset, nVerts * BYTES_PER_VERTEX);
 
     // The indices of the tile, offset to where its vertices start in the buffer.
-    const indexStart = this.usedIndices;
-    const idx = this.cpuIndices;
+    const idx = this.indexScratch = TerrainLayerBuffer.atLeast(this.indexScratch, nIndices);
     if (indices) {
-      for (let i = 0; i < nIndices; i++) idx[indexStart + i] = start + indices[i];
+      for (let i = 0; i < nIndices; i++) idx[i] = start + indices[i];
     } else {
-      for (let i = 0; i < nIndices; i++) idx[indexStart + i] = start + i;
+      for (let i = 0; i < nIndices; i++) idx[i] = start + i;
     }
-    this.uploadIndices(indexStart, nIndices);
+    queue.writeBuffer(this.indexBuffer!, indexStart * BYTES_PER_INDEX, idx.buffer as ArrayBuffer, 0, nIndices * BYTES_PER_INDEX);
 
     this.ranges.set(key, { start, count: nVerts, indexStart, indexCount: nIndices });
     this.usedVerts += nVerts;
@@ -137,81 +205,35 @@ export default class TerrainLayerBuffer {
     this.updateIndirect();
   }
 
-  /** Remove a tile, compacting the tiles after it left so the region stays packed. */
+  /** Remove a tile: its indices become degenerate triangles, its ranges free. */
   public removeTile(key: string): void {
     this.removeTiles([key]);
   }
 
-  /**
-   * Remove several tiles at once: a single compaction pass + a single
-   * re-upload of the moved region. Calling removeTile() per key instead costs
-   * one full-tail memmove and one GPU re-upload (from the removed offset to the
-   * end) *per tile* — evicting a handful of early tiles on a camera move then
-   * re-uploads most of the buffer several times over. This does it once.
-   */
   public removeTiles(keys: Iterable<string>): void {
-    const removeSet = new Set<string>();
-    for (const k of keys) if (this.ranges.has(k)) removeSet.add(k);
-    if (removeSet.size === 0) return;
-
-    // Walk survivors in address order, sliding each left to close the gaps left
-    // by removed tiles. firstDirtyVert tracks the earliest vertex that moved so
-    // we re-upload only [firstDirtyVert, usedVerts).
-    const survivors: Range[] = [];
-    for (const [key, range] of this.ranges) {
-      if (!removeSet.has(key)) survivors.push(range);
+    let removed = false;
+    for (const key of keys) {
+      const range = this.ranges.get(key);
+      if (!range) continue;
+      this.ranges.delete(key);
+      const zeros = this.zeros = TerrainLayerBuffer.atLeast(this.zeros, range.indexCount);
+      this.renderer.device.queue.writeBuffer(this.indexBuffer!, range.indexStart * BYTES_PER_INDEX, zeros.buffer as ArrayBuffer, 0, range.indexCount * BYTES_PER_INDEX);
+      this.vertices.release(range.start, range.count);
+      this.indices.release(range.indexStart, range.indexCount);
+      this.usedVerts -= range.count;
+      this.usedIndices -= range.indexCount;
+      removed = true;
     }
-    survivors.sort((a, b) => a.start - b.start);
-
-    // The index ranges are in the same order as the vertex ranges (both are appended on add and compacted together),
-    // so they close their gaps in the same pass. A tile whose vertices move gets its indices lowered by as much.
-    let writeVert = 0;
-    let firstDirtyVert = Infinity;
-    let writeIndex = 0;
-    let firstDirtyIndex = Infinity;
-    const idx = this.cpuIndices;
-    for (const range of survivors) {
-      const shift = range.start - writeVert;
-      if (shift !== 0) {
-        this.cpu.copyWithin(
-          writeVert * FLOATS_PER_VERTEX,
-          range.start * FLOATS_PER_VERTEX,
-          (range.start + range.count) * FLOATS_PER_VERTEX,
-        );
-        if (writeVert < firstDirtyVert) firstDirtyVert = writeVert;
-        range.start = writeVert;
-      }
-      if (shift !== 0 || range.indexStart !== writeIndex) {
-        // writeIndex <= indexStart, so copying forward never overwrites indices still to be read
-        const from = range.indexStart;
-        for (let i = 0; i < range.indexCount; i++) idx[writeIndex + i] = idx[from + i] - shift;
-        if (writeIndex < firstDirtyIndex) firstDirtyIndex = writeIndex;
-        range.indexStart = writeIndex;
-      }
-      writeVert += range.count;
-      writeIndex += range.indexCount;
-    }
-
-    for (const key of removeSet) this.ranges.delete(key);
-    this.usedVerts = writeVert;
-    this.usedIndices = writeIndex;
-
-    if (this.mesh && firstDirtyVert < this.usedVerts) {
-      this.renderer.device.queue.writeBuffer(
-        this.mesh.vertexBuffer,
-        firstDirtyVert * BYTES_PER_VERTEX,
-        this.cpu.buffer as ArrayBuffer,
-        firstDirtyVert * BYTES_PER_VERTEX,
-        (this.usedVerts - firstDirtyVert) * BYTES_PER_VERTEX,
-      );
-    }
-    if (firstDirtyIndex < this.usedIndices) this.uploadIndices(firstDirtyIndex, this.usedIndices - firstDirtyIndex);
-    this.updateIndirect();
+    if (removed) this.updateIndirect();
   }
 
   /** Drop all tiles. Keeps the allocated GPU buffers for reuse. */
   public clear(): void {
+    // The old indices are past the end of the draw. First fit fills from the start, so a hole (which the draw covers) is
+    // only ever made by removeTiles, which zeroes it.
     this.ranges.clear();
+    this.vertices.reset();
+    this.indices.reset();
     this.usedVerts = 0;
     this.usedIndices = 0;
     this.updateIndirect();
@@ -225,86 +247,78 @@ export default class TerrainLayerBuffer {
 
   public destruct(): void {
     this.mesh?.destruct();
-    this.indirectBuffer?.destroy();
+    if (this.indirectBuffer) this.renderer.destroyAfterSubmit(this.indirectBuffer);
     this.mesh = null;
+    this.vertexBuffer = null;
+    this.indexBuffer = null;
     this.indirectBuffer = null;
     this.ranges.clear();
+    this.vertices = new RangeAllocator(0);
+    this.indices = new RangeAllocator(0);
     this.usedVerts = 0;
-    this.capacityVerts = 0;
-    this.cpu = new Float32Array(0);
     this.usedIndices = 0;
-    this.capacityIndices = 0;
-    this.cpuIndices = new Uint32Array(0);
   }
 
-  /** Update the indirect draw args: [indexCount, instanceCount, firstIndex, baseVertex, firstInstance]. */
+  /** The indirect draw args: [indexCount, instanceCount, firstIndex, baseVertex, firstInstance], to the last tile's end. */
   private updateIndirect(): void {
     if (!this.indirectBuffer) return;
-    this.renderer.writeBuffer(this.indirectBuffer, new Uint32Array([this.usedIndices, 1, 0, 0, 0]));
+    this.indirectArgs[0] = this.indices.end;
+    this.renderer.device.queue.writeBuffer(this.indirectBuffer, 0, this.indirectArgs);
   }
 
-  /** Upload [start, start + count) of the CPU index mirror. */
-  private uploadIndices(start: number, count: number): void {
-    if (!this.mesh?.indexBuffer || count === 0) return;
-    this.renderer.device.queue.writeBuffer(
-      this.mesh.indexBuffer,
-      start * BYTES_PER_INDEX,
-      this.cpuIndices.buffer as ArrayBuffer,
-      start * BYTES_PER_INDEX,
-      count * BYTES_PER_INDEX,
-    );
+  private static atLeast<T extends Float32Array | Uint32Array>(array: T, length: number): T {
+    if (array.length >= length) return array;
+    return new (array.constructor as new (length: number) => T)(Math.max(length, array.length * 2));
   }
 
   /**
-   * Make sure the GPU/CPU buffers hold at least `neededVerts` vertices and
-   * `neededIndices` indices. Grows by doubling and re-uploads the kept data.
-   * Growth is rare; the GPU buffers are recreated (new Mesh -> new bundle), and
-   * the old ones are destructed.
+   * Room for a tile of `verts` vertices and `indices` indices after the end of the last one: doubles the buffers until
+   * it fits. The new buffers get the contents of the old ones by a copy on the GPU, in a submit of its own: after the
+   * queue writes made before it, before the ones after it. A new Mesh, so the render bundles with the old buffers are
+   * made again.
    */
-  private ensureCapacity(neededVerts: number, neededIndices: number): void {
-    if (this.mesh && neededVerts <= this.capacityVerts && neededIndices <= this.capacityIndices) return;
+  private grow(verts: number, indices: number): void {
+    const device = this.renderer.device;
+    const vertexEnd = this.vertices.end, indexEnd = this.indices.end;
+    let vertexCapacity = this.vertices.capacity || this.initialVerts;
+    while (vertexCapacity - vertexEnd < verts) vertexCapacity *= 2;
+    let indexCapacity = this.indices.capacity || this.initialIndices;
+    while (indexCapacity - indexEnd < indices) indexCapacity *= 2;
 
-    let newCapacity = this.capacityVerts || INITIAL_CAPACITY_VERTS;
-    while (newCapacity < neededVerts) newCapacity *= 2;
-    let newIndexCapacity = this.capacityIndices || INITIAL_CAPACITY_INDICES;
-    while (newIndexCapacity < neededIndices) newIndexCapacity *= 2;
-
-    const newCpu = new Float32Array(newCapacity * FLOATS_PER_VERTEX);
-    newCpu.set(this.cpu.subarray(0, this.usedVerts * FLOATS_PER_VERTEX));
-    const newCpuIndices = new Uint32Array(newIndexCapacity);
-    newCpuIndices.set(this.cpuIndices.subarray(0, this.usedIndices));
-
-    const newMesh = new Mesh(this.renderer);
-    // Unified stride-4 layout (xyz + id), bound as `position` like every other
-    // map mesh. Single attribute => no interleave copy on upload.
-    newMesh.setAttribute('position', FLOATS_PER_VERTEX, newCpu);
-    // Force buffer creation + upload now (capacity-sized, VERTEX | COPY_DST).
-    void newMesh.vertexBuffer;
-    // The index buffer is made here instead of by setIndices: always 32 bit, capacity-sized and written per tile.
-    newMesh.indexBuffer = this.renderer.device.createBuffer({
-      size: newIndexCapacity * BYTES_PER_INDEX,
-      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+    // new buffers are zeros: no indices after the copied ones
+    const vertexBuffer = device.createBuffer({
+      size: vertexCapacity * BYTES_PER_VERTEX,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+      label: 'terrainLayerVertices',
+    });
+    const indexBuffer = device.createBuffer({
+      size: indexCapacity * BYTES_PER_INDEX,
+      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
       label: 'terrainLayerIndices',
     });
-    newMesh.indexFormat = 'uint32';
-    newMesh.indexCount = newIndexCapacity;
-
-    this.mesh?.destruct();
-    this.mesh = newMesh;
-    this.cpu = newCpu;
-    this.capacityVerts = newCapacity;
-    this.cpuIndices = newCpuIndices;
-    this.capacityIndices = newIndexCapacity;
-    this.uploadIndices(0, this.usedIndices);
-
-    if (!this.indirectBuffer) {
-      this.indirectBuffer = this.renderer.createBuffer(
-        20,
-        GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST,
-        false,
-        'terrainLayerIndirect',
-      );
-      this.updateIndirect();
+    if (this.vertexBuffer && this.indexBuffer && (vertexEnd > 0 || indexEnd > 0)) {
+      const encoder = device.createCommandEncoder();
+      if (vertexEnd > 0) encoder.copyBufferToBuffer(this.vertexBuffer, 0, vertexBuffer, 0, vertexEnd * BYTES_PER_VERTEX);
+      if (indexEnd > 0) encoder.copyBufferToBuffer(this.indexBuffer, 0, indexBuffer, 0, indexEnd * BYTES_PER_INDEX);
+      device.queue.submit([encoder.finish()]);
     }
+
+    const mesh = new Mesh(this.renderer);
+    // Unified stride-4 layout (xyz + id), bound as `position` like every other map mesh; the data is written per tile.
+    mesh.setAttribute('position', FLOATS_PER_VERTEX, new Float32Array(0));
+    mesh.setVertexBuffer(vertexBuffer, vertexCapacity);
+    mesh.indexBuffer = indexBuffer;
+    mesh.indexFormat = 'uint32';
+    mesh.indexCount = indexCapacity;
+    // destroys the old buffers after the submit of the frame
+    this.mesh?.destruct();
+    this.mesh = mesh;
+    this.vertexBuffer = vertexBuffer;
+    this.indexBuffer = indexBuffer;
+    if (vertexCapacity > this.vertices.capacity) this.vertices.grow(vertexCapacity);
+    if (indexCapacity > this.indices.capacity) this.indices.grow(indexCapacity);
+
+    this.indirectBuffer ??= this.renderer.createBuffer(20, GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST, false, 'terrainLayerIndirect');
+    this.updateIndirect();
   }
 }
