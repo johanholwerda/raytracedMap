@@ -63,12 +63,12 @@ export default class SunShadows {
     });
     this.bindResources(this.depthMaterial);
     this.bindResources(this.terrainDepthMaterial);
-    // the ground for the terrain sun map: the distance toward the sun instead of the height, see TerrainSunMap
-    const sunDepthMaterial = new VertexFragmentShader(renderer, 'osm', shaderSource, { includes: [hash], defines: { DEPTH_CLAMP: true, SUN_DEPTH: true } });
-    sunDepthMaterial.setConstant('DRAW_DEPTH', true);
-    sunDepthMaterial.cullMode = 'none';
-    this.bindResources(sunDepthMaterial);
-    this.terrainSun = new TerrainSunMap(renderer, sunDepthMaterial);
+    // the ground top down for the terrain sun map: -height, as the cascades, see TerrainSunMap
+    const heightMaterial = new VertexFragmentShader(renderer, 'osm', shaderSource, { includes: [hash], defines: { DEPTH_CLAMP: true } });
+    heightMaterial.setConstant('DRAW_DEPTH', true);
+    heightMaterial.cullMode = 'none';
+    this.bindResources(heightMaterial);
+    this.terrainSun = new TerrainSunMap(renderer, heightMaterial);
 
     this.viewMaterial = new VertexFragmentShader(renderer, 'shadowMapView', viewShaderSource);
     this.viewMaterial.depthWriteEnabled = false;
@@ -159,7 +159,7 @@ export default class SunShadows {
   public updateTerrainSun(camera: MapCamera, viewDistance: number, ground: TerrainLayerBuffer | null): void {
     const p = camera.worldPosition;
     const center = new Vector3(p.x, camera.pivot.worldPosition.y, p.z);
-    this.terrainSun.update(this.lightDir, center, viewDistance, ground);
+    this.terrainSun.update(this.lightDir, center, viewDistance, this.sunRadius.value, ground);
   }
 
   /** The 4 cascades as a 2 x 2 grid on the screen, letterboxed to a square (the shadowMap drawMode). */
