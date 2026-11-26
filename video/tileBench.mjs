@@ -99,8 +99,8 @@ for (const group of groups) {
   elevation.setOrigin((bounds.south + bounds.north) / 2, (bounds.west + bounds.east) / 2);
   for (const t of group) {
     try {
-      const heights = await elevation.getTileGrid(t.tile);
-      jobs.push({ ...t, bounds, heights, pbf: new Uint8Array(fs.readFileSync(t.file)) });
+      const { heights, seaLevel } = await elevation.getTileGrid(t.tile);
+      jobs.push({ ...t, bounds, heights, seaLevel, pbf: new Uint8Array(fs.readFileSync(t.file)) });
     } catch (e) {
       console.warn(`no elevation for ${t.url}: ${e.message}`);
     }
@@ -161,7 +161,7 @@ for (let pass = 0; pass < passes; pass++) {
   for (const [index, job] of jobs.entries()) {
     const start = performance.now();
     // the worker gets copies too (transferred in)
-    const result = buildWorldTile(job.pbf.slice(), job.tile, job.bounds, true, true, true, job.heights.slice());
+    const result = buildWorldTile(job.pbf.slice(), job.tile, job.bounds, true, true, true, job.heights.slice(), job.seaLevel);
     const ms = performance.now() - start;
     if (pass === 0) firstMs.push(ms);
     else bestMs[index] = Math.min(bestMs[index], ms);
@@ -196,7 +196,7 @@ if (args.includes('--allocs')) {
   await session.post('HeapProfiler.startSampling', {
     samplingInterval: 16384, includeObjectsCollectedByMajorGC: true, includeObjectsCollectedByMinorGC: true,
   });
-  for (const job of jobs) buildWorldTile(job.pbf.slice(), job.tile, job.bounds, true, true, true, job.heights.slice());
+  for (const job of jobs) buildWorldTile(job.pbf.slice(), job.tile, job.bounds, true, true, true, job.heights.slice(), job.seaLevel);
   const { profile } = await session.post('HeapProfiler.stopSampling');
   const lines = fs.readFileSync(bundle, 'utf8').split(/\r?\n/);
   const bySite = new Map();
@@ -225,7 +225,7 @@ if (threads > 0) {
     for (let pass = 0; pass < 2; pass++) {
       for (const job of workerData.jobs) {
         const start = performance.now();
-        buildWorldTile(job.pbf.slice(), job.tile, job.bounds, true, true, true, job.heights.slice());
+        buildWorldTile(job.pbf.slice(), job.tile, job.bounds, true, true, true, job.heights.slice(), job.seaLevel);
         ms.push(performance.now() - start);
       }
     }
@@ -234,7 +234,7 @@ if (threads > 0) {
   const start = performance.now();
   // each thread its share of the tiles, as the pool of the map deals them out
   const results = await Promise.all(Array.from({ length: threads }, (_, t) => new Promise((resolve, reject) => {
-    const share = jobs.filter((_, i) => i % threads === t).map(({ pbf, tile, bounds, heights }) => ({ pbf, tile, bounds, heights }));
+    const share = jobs.filter((_, i) => i % threads === t).map(({ pbf, tile, bounds, heights, seaLevel }) => ({ pbf, tile, bounds, heights, seaLevel }));
     const worker = new Worker(source, { eval: true, workerData: { bundle: pathToFileURL(bundle).href, jobs: share } });
     worker.once('message', resolve);
     worker.once('error', reject);
