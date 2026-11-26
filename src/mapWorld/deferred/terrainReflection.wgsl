@@ -3,7 +3,7 @@
 // that TerrainSunMap.ts renders top down for the sun shadows. In world space, so the hills beside and behind the view are
 // in the water too. A march per water pixel was more than the rest of the shading (.3 ms of .55 at 1080p under a hill),
 // so the pixels share one: getTerrainHorizon, 1 per block of pixels (waterTerrainHorizon.wgsl), is how steep a ray has
-// to go up to pass over the ground, and a pixel compares its ray with it (isTerrainOccluded of
+// to go up to pass over the ground, and a pixel compares its ray with it (getTerrainReflection of
 // terrainHorizonLookup.wgsl). traceTerrain is the march of 1 ray, for the pixels without a horizon near them.
 // The including shader declares
 //   terrainHeights : texture_2d<f32> (per texel -height, 1e9 where no ground)
@@ -116,17 +116,33 @@ fn traceTerrain(ro : vec3<f32>, rd : vec3<f32>) -> bool {
   return false;
 }
 
+struct TerrainHorizon {
+  // of the steepest angle at which the ground is in the way. 0: none is
+  tangent : f32,
+  // the ground the water mirrors, for its color: how far along direction it is (world units), and its height (world y)
+  distance : f32,
+  height : f32,
+}
+
 // The horizon of the ground from ro (on the water) toward direction (across the ground, normalized): the tangent of
 // the steepest angle at which the ground is in the way, the highest (height above ro) / (distance to it). 0: open water
 // to the edge of the map. A ray from there along rd hits the ground where rd.y < horizon * length(rd.xz). As
-// traceTerrain, with the line to the highest ground so far for the ray: only the ground above it raises the horizon
-fn getTerrainHorizon(ro : vec3<f32>, direction : vec2<f32>) -> f32 {
+// traceTerrain, with the line to the highest ground so far for the ray: only the ground above it raises the horizon.
+// And the ground the mirror ray itself hits, which rises by mirrorTangent: the first ground above it, which is where
+// the horizon first goes above the ray. Where the ray passes over all the ground: the ground of the horizon, what the
+// rays the ripples tilt down hit about
+fn getTerrainHorizon(ro : vec3<f32>, direction : vec2<f32>, mirrorTangent : f32) -> TerrainHorizon {
   let size = vec2<i32>(textureDimensions(terrainHeights));
   let sizeF = vec2<f32>(size);
   let ray = getTerrainRay(ro, vec3<f32>(direction.x, 0.0, direction.y), sizeF);
   if (ray.speed == 0.0) {
-    return 0.0;
+    return TerrainHorizon(0.0, 0.0, 0.0);
   }
+  // the rise of the mirror ray per texel
+  let mirrorRise = mirrorTangent / ray.speed;
+  // of the ground the water mirrors: in texels along d, and its height. hit: the mirror ray hit it
+  var mirrored = vec2<f32>(0.0);
+  var hit = false;
   let d = ray.d;
   let y0 = ro.y + uniforms.terrainReflectionBias;
   let coarseLast = vec2<i32>(textureDimensions(terrainMaxHeights)) - 1;
@@ -150,9 +166,17 @@ fn getTerrainHorizon(ro : vec3<f32>, direction : vec2<f32>) -> f32 {
       s += max(getTerrainCellExit(p, d, cf, TERRAIN_FINE), max(1.0, s * TERRAIN_STEP_GROWTH));
       continue;
     }
-    rise = max(rise, (getTerrainHeight(p, size) - y0) / s);
+    let h = getTerrainHeight(p, size);
+    let slope = (h - y0) / s;
+    if (slope > rise) {
+      rise = slope;
+      if (!hit) {
+        mirrored = vec2<f32>(s, h);
+        hit = slope > mirrorRise;
+      }
+    }
     s += max(1.0, s * TERRAIN_STEP_GROWTH);
   }
   // per texel to per world unit
-  return rise * ray.speed;
+  return TerrainHorizon(rise * ray.speed, mirrored.x / ray.speed, mirrored.y);
 }

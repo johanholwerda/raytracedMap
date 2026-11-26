@@ -3,11 +3,9 @@
 // for 1 pixel per block of the gBuffer (REFLECTION_BLOCK_X x Y pixels), the one at getReflectionSampleOffset(phase). The
 // shading blends the samples around a pixel (getHalfResReflection in deferredShading.wgsl) instead of tracing a ray per
 // water pixel, which was more than half of its time at 4K.
-// The ground too, where it is in reach (reflectTerrainInWater): isTerrainOccluded of terrainHorizonLookup.wgsl.
-// Out, rgba8unorm. x: 0 no water (no sample), .5 the ray reaches the sky, 1 it hits a building or the ground. yzw: the
-// ray (* .5 + .5), the shading weighs a sample by how alike its ray and the ray of the pixel are
-// Needs cameraRay.wgsl, cityLightmapSurface.wgsl, mapGBufferPacking.wgsl, waterReflection.wgsl, skyVisibilityTrace.wgsl
-// terrainReflection.wgsl and terrainHorizonLookup.wgsl
+// Out, rgba8unorm. x: 0 no water (no sample), .5 the ray reaches the sky, 1 it hits a building. yzw: the ray (* .5 + .5),
+// the shading weighs a sample by how alike its ray and the ray of the pixel are
+// Needs cameraRay.wgsl, cityLightmapSurface.wgsl, mapGBufferPacking.wgsl, waterReflection.wgsl and skyVisibilityTrace.wgsl
 
 struct Uniforms {
   inverseProjection : mat4x4<f32>,
@@ -26,11 +24,6 @@ struct Uniforms {
   // the city the rays trace, see CityScene.bind
   cityTileCount : u32,
   cityRoot : u32,
-  // the ground in the reflections, see terrainReflection.wgsl and terrainHorizonLookup.wgsl
-  terrainSunViewProjection : mat4x4<f32>,
-  reflectTerrainInWater : u32,
-  terrainReflectionTop : f32,
-  terrainReflectionBias : f32,
 };
 
 // the rays are mirrored on the ripples of rippleTexture, else on the flat water: as the shading's
@@ -45,12 +38,6 @@ override WATER_RIPPLES : bool = false;
 // the ripples of the water, see WaterRippleTexture.ts
 @group(0) @binding(4) var rippleTexture : texture_2d<f32>;
 @group(0) @binding(5) var rippleSampler : sampler;
-// the height map of the ground, see TerrainSunMap.bindHeights
-@group(0) @binding(6) var terrainHeights : texture_2d<f32>;
-@group(0) @binding(7) var terrainMaxHeights : texture_2d<f32>;
-@group(0) @binding(8) var terrainMaxHeightsFine : texture_2d<f32>;
-// the horizon of the ground per block of pixels, see WaterTerrainHorizon.ts
-@group(0) @binding(9) var terrainHorizon : texture_2d<f32>;
 
 struct VertexInput {
   @location(0) position : vec3<f32>,
@@ -81,5 +68,5 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
   let d = getGBufferDistance(textureLoad(gBufferDepth, coord, 0), uv, uniforms.inverseProjection, uniforms.depthParams);
   let world = depthToPosition(d, uv * 2. - 1.);
   let rd = getWaterReflectionRay(getGBufferNormal(g), world, d);
-  return vec4<f32>(select(.5, 1., isOccluded(world, rd) || isTerrainOccluded(coord, world, rd)), rd * .5 + .5);
+  return vec4<f32>(select(.5, 1., isOccluded(world, rd)), rd * .5 + .5);
 }
