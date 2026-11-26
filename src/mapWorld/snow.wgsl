@@ -1,6 +1,7 @@
 // The snow on the ground above the snow line (see map/snowLine.ts), with a hard edge: getSnowField is signed, the snow
-// is where it is above 0, getSnowCover antialiases that edge over SNOW_EDGE_PIXELS. Included by deferredShading.wgsl
-// and osm/shading.wgsl (SNOW).
+// is where it is above 0. Included with the define SNOW by deferred/mapGBuffer.wgsl, where the pixels in the snow take
+// the snow material (a hard edge, the TAA antialiases it), and by osm/shading.wgsl, the forward shading without a TAA:
+// getSnowCoverAt antialiases the edge over SNOW_EDGE_PIXELS there.
 // world: the point, n: its normal. line: the snow line in world y (relative to the ground at the projection center, like
 // the heights). noise: how far (m) value noise (a few hundred meters wide patches, a smaller octave on top) moves the
 // line up and down, so it isn't a contour line. metersPerUnit: the noise is in meters, the same at every map scale.

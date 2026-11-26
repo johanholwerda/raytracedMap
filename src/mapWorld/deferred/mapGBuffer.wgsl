@@ -4,6 +4,9 @@
 // the selection highlight, or on a tree its palette entry (see map/worldTrees.ts), with the flat normal of the triangle.
 // Without it the ground layers and the ground quad, on the ground chart of the lightmap, with the smooth normal of the
 // terrain in .w (see terrainNormal.wgsl).
+// SNOW: the ground and the layers the snow lies on: above the snow line (getSnowField of snow.wgsl, included with the
+// define) the pixel takes snowMaterial instead, a hard edge the TAA antialiases like the edges of the geometry. See
+// MapGeometry.setSnow.
 
 struct VertexInput {
 #ifdef WALLS
@@ -52,9 +55,22 @@ struct Uniforms {
   // WALLS: the decoding of the unorm16 vertices of the mesh, see quantizeVertices in worldGeometryCore.ts
   positionScale : vec4<f32>,
   positionOffset : vec4<f32>,
+#ifdef SNOW
+  // the material of the snow (that of the glaciers), the snow line in world y, how far (m) the noise moves it, and the
+  // meters per world unit
+  snowMaterial : u32,
+  snowLine : f32,
+  snowNoise : f32,
+  snowMetersPerUnit : f32,
+#endif
 };
 
 @group(0) @binding(0) var<uniform> uniforms : Uniforms;
+
+#ifdef SNOW
+// whether the snow can be anywhere in view (MapGeometry.setSnow): off, the pipeline has none of its code
+override SNOW_IN_SCENE : bool = false;
+#endif
 
 // the .w of a tree vertex with palette entry k is TREE_MATERIAL_BASE_ID - k, see map/worldTrees.ts
 const TREE_MATERIAL_BASE_ID = -2.0;
@@ -122,6 +138,15 @@ fn fs_main(input : VertexOutput) -> FragmentOutput {
   }
   selected = input.selected != 0u;
   material = input.material;
+#endif
+#ifdef SNOW
+  if (SNOW_IN_SCENE) {
+    let world = input.relative + uniforms.cameraPosition;
+    if (isSnowPossible(world.y, uniforms.snowLine, uniforms.snowNoise, uniforms.snowMetersPerUnit)
+      && getSnowField(world, n, uniforms.snowLine, uniforms.snowNoise, uniforms.snowMetersPerUnit) > 0.) {
+      material = uniforms.snowMaterial;
+    }
+  }
 #endif
   let g = packGBuffer(id, n, material, selected, atlas);
   return FragmentOutput(g.xy, g.z);

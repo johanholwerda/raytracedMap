@@ -103,6 +103,12 @@ export default class VertexFragmentShader extends ShaderBase {
     return this._version;
   }
 
+  //whether a pipeline of it is being made async (asyncPipeline): the draws use the one before until it is there, so a
+  //host that only draws when something changed draws again once this is false
+  public get pipelinePending(): boolean {
+    return this.pendingPipelines.size > 0;
+  }
+
   private markDirty() {
     this._dirty = true;
     this._version++;

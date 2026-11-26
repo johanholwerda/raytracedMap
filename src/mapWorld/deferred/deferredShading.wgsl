@@ -10,8 +10,7 @@
 // The sun shadows (SUN_SHADOWS) are the VSM cascades, a ray to the sun traced against the same city (getRayTracedShadow),
 // or the sun visibility the lightmap texels hold (the zw of getLightmapLookup: from the half resolution samples, or in
 // the lookup of the sky visibility).
-// The ground above the snow line is snow covered: its albedo goes to the snow color (snow.wgsl, see setSnow).
-// Needs snow.wgsl, hash.wgsl, r2.wgsl, toneMap.wgsl, cameraRay.wgsl, waterReflection.wgsl, skyVisibilityTrace.wgsl and the includes of the lightmap resolve (see SkyVisibilityLightmap.resolveIncludes):
+// Needs hash.wgsl, r2.wgsl, toneMap.wgsl, cameraRay.wgsl, waterReflection.wgsl, skyVisibilityTrace.wgsl and the includes of the lightmap resolve (see SkyVisibilityLightmap.resolveIncludes):
 // the lightmap holds the part of the sky a point sees, times the sky color here
 
 struct Uniforms {
@@ -86,13 +85,6 @@ struct Uniforms {
   sunFresnel : f32,
   // how far a point goes off its surface before it is compared with terrainSunMap, see getTerrainSunShadow
   terrainSunOffset : f32,
-  // the snow on the ground (snow.wgsl): the gBuffer materials it lies on, a bit each (0 no snow), the snow line in world
-  // y, how far (m) the noise moves it, the meters per world unit, and its albedo (as the param, not squared)
-  snowMaterials : u32,
-  snowLine : f32,
-  snowNoise : f32,
-  snowMetersPerUnit : f32,
-  snowColor : vec3<f32>,
 };
 
 // the reflectance of water seen straight down (index of refraction 1.33)
@@ -449,41 +441,6 @@ fn getHalfResReflection(coord : vec2<u32>, rd : vec3<f32>) -> f32 {
   return select(0., dot(w, step(vec4(.75), vec4(s00.x, s10.x, s01.x, s11.x))) / sum, sum > 0.);
 }
 
-// The pixel coord + offset on the surface of world, for the snow field: the point on the plane of world and n, with the
-// normal of that pixel where it is of the same material (the smooth normal of the ground changes across the slope edge),
-// else n. As the differences to world and n. d: the camera distance of world. A ray (almost) along the plane takes the
-// point 4 d away
-struct SnowNeighbour {
-  dWorld : vec3<f32>,
-  dNormal : vec3<f32>,
-};
-
-fn getSnowNeighbour(coord : vec2<u32>, offset : vec2<u32>, world : vec3<f32>, n : vec3<f32>, d : f32, material : u32) -> SnowNeighbour {
-  let c = min(coord + offset, vec2<u32>(uniforms.resolution) - 1u);
-  let uv = (vec2<f32>(c) + .5) / uniforms.resolution;
-  let rd = getRay(uv * 2. - 1.);
-  let denom = dot(rd, n);
-  let t = select(4. * d, clamp(dot(world - uniforms.cameraPosition, n) / denom, 0., 4. * d), denom < -1e-4);
-  let g = vec3<u32>(0u, textureLoad(gBufferTexture, c, 0).y, 0u);
-  let nc = select(n, getGBufferNormal(g), getGBufferMaterial(g) == material);
-  return SnowNeighbour(uniforms.cameraPosition + rd * t - world, nc - n);
-}
-
-// The part of the pixel in the snow, with its edge antialiased over SNOW_EDGE_PIXELS (getSnowCoverAt of snow.wgsl). The
-// change of the field per pixel is that of fwidth, from the pixels right of and below this one on its surface (see
-// getSnowNeighbour): fwidth itself needs uniform control flow (the sky returns before), and the neighbours in its
-// 2 x 2 quads are often a tree or a building, whose field is nothing like the ground's: a fringe around each one
-fn getSnowCoverDeferred(coord : vec2<u32>, world : vec3<f32>, n : vec3<f32>, d : f32, material : u32) -> f32 {
-  // out of reach of the snow: no noise, no neighbours
-  if (!isSnowPossible(world.y, uniforms.snowLine, uniforms.snowNoise, uniforms.snowMetersPerUnit)) {
-    return 0.;
-  }
-  let x = getSnowNeighbour(coord, vec2(1u, 0u), world, n, d, material);
-  let y = getSnowNeighbour(coord, vec2(0u, 1u), world, n, d, material);
-  return getSnowCoverAt(world, n, x.dWorld, x.dNormal, y.dWorld, y.dNormal, uniforms.snowLine, uniforms.snowNoise,
-    uniforms.snowMetersPerUnit);
-}
-
 // The distance fog: exponential (distanceFog per world unit), with a smoothstep from .7 of viewDistanceMax that takes
 // it to 1 at viewDistanceMax, where the loaded map ends (see MapWorld.viewDistanceMax). 0 (not set): only the exp.
 // d is the horizontal (xz) distance to the camera, not the 3d one: the map is loaded in a radius around the camera in
@@ -562,11 +519,7 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
 
   let skyColor = uniforms.skyColor * uniforms.skyColor;
   let sunColor = uniforms.sunColor * uniforms.sunColor;
-  var albedoSnow = albedoSample;
-  if (materialIndex < 32u && ((uniforms.snowMaterials >> materialIndex) & 1u) != 0u) {
-    albedoSnow = mix(albedoSample, uniforms.snowColor, getSnowCoverDeferred(coord, world, n, d, materialIndex));
-  }
-  let albedo = albedoSnow * albedoSnow;
+  let albedo = albedoSample * albedoSample;
   var shadow = 1.0;
   if (nDotL > 0.0) {
     shadow = mix(1.0, getSunShadow(world, n, d, coord, lightmap.zw), uniforms.shadowStrength);

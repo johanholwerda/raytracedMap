@@ -54,8 +54,8 @@ struct Uniforms {
   // QUANTIZED: the decoding of the vertices
   positionScale : vec4<f32>,
   positionOffset : vec4<f32>,
-  // SNOW: the snow on the ground of mapWorld, see mapWorld/snow.wgsl (included with the define) and setSnow of its
-  // DeferredShading
+  // SNOW: the snow on the ground of mapWorld, see mapWorld/snow.wgsl (included with the define) and setSnow of
+  // MapGeometry
   snowLine : f32,
   snowNoise : f32,
   snowMetersPerUnit : f32,

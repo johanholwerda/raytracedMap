@@ -28,6 +28,8 @@ import type { SnowParams } from './map/snowLine';
 // the ground layers the snow lies on (and the ground under them), see snow.wgsl. Not the water, the roads (cleared) or
 // the railways, nor the urban areas
 const SNOW_LAYERS = new Set(['farmland', 'sand', 'green', 'forest', 'paths']);
+// the layer whose material the snow takes in the gBuffer: the glaciers, in the snow color
+const SNOW_MATERIAL_LAYER = 'glacier';
 
 /** The building meshes to draw, with their picking slots (parallel), see WorldTileStreamer. */
 // tiles: per mesh the map tile of its wall atlas, x and y after each other (the uniform wallTile of the gBuffer).
@@ -76,13 +78,13 @@ export default class MapGeometry {
     // under the camera, as far as the view reaches, see setViewDistanceMax
     this.groundQuad.centerOnCamera = true;
     this.groundBuffer = new TerrainLayerBuffer(renderer);
-    this.groundGBufferMaterial = gBuffer.createMaterial(new Vector3(.5, .5, .5), false, 'none');
+    this.groundGBufferMaterial = gBuffer.createMaterial(new Vector3(.5, .5, .5), false, 'none', true);
     this.cityGBufferMaterial = gBuffer.createMaterial(new Vector3(1, 1, 1), true);
 
     // One gBuffer material (with the albedo of the layer) + packed buffer per ground layer (one draw call each).
     for (const def of WORLD_LAYERS) {
       const color = Color.fromHex(def.color);
-      const material = gBuffer.createMaterial(color.vector3, false);
+      const material = gBuffer.createMaterial(color.vector3, false, 'back', SNOW_LAYERS.has(def.key));
       this.layers.push({
         def: { key: def.key, label: def.label, color: [color.r, color.g, color.b], defaultOn: def.defaultOn },
         material,
@@ -177,25 +179,39 @@ export default class MapGeometry {
     forwardMaterial.setVector3('baseColor', color);
   }
 
-  /** The gBuffer materials the snow lies on, a bit each (see MapGBuffer.materialIndex): the ground and SNOW_LAYERS. */
-  public get snowMaterials(): number {
-    let bits = 1 << this.gBuffer.materialIndex(this.groundGBufferMaterial);
-    for (const layer of this.layers) {
-      if (SNOW_LAYERS.has(layer.def.key)) bits |= 1 << this.gBuffer.materialIndex(layer.material);
-    }
-    return bits;
-  }
-
-  /** The snow of the forward shading, like DeferredShading.setSnow: on the ground and SNOW_LAYERS, which have the define. */
+  /**
+   * The snow above the snow line on the ground and SNOW_LAYERS, which have the define SNOW: in the gBuffer their pixels
+   * in the snow take the material of the glaciers (a hard edge, the TAA antialiases it), the forward shading mixes in
+   * params.color over an antialiased edge. Off: the line out of reach, and the gBuffer pipelines without the snow
+   * (the override SNOW_IN_SCENE of mapGBuffer.wgsl, see snowPipelinePending).
+   */
   public setSnow(params: SnowParams): void {
-    // off: the line out of reach
     const line = params.enabled ? params.line : 1e9;
-    for (const m of this.forwardMaterials) {
+    const snowMaterial = this.gBuffer.materialIndex(this.layers.find(layer => layer.def.key === SNOW_MATERIAL_LAYER)!.material);
+    const gBufferMaterials = this.snowGBufferMaterials;
+    for (const m of gBufferMaterials) {
+      m.setConstant('SNOW_IN_SCENE', params.enabled);
+      m.setFloat('snowMaterial', snowMaterial);
+    }
+    for (const m of [...gBufferMaterials, ...this.forwardMaterials]) {
       m.setFloat('snowLine', line);
       m.setFloat('snowNoise', params.noise);
       m.setFloat('snowMetersPerUnit', params.metersPerUnit);
-      m.setVector3('snowColor', params.color);
     }
+    for (const m of this.forwardMaterials) m.setVector3('snowColor', params.color);
+  }
+
+  /**
+   * Whether the gBuffer pipeline of SNOW_IN_SCENE that setSnow switched to is still being made (async): the frames draw
+   * with the one before (with or without the snow) until it is there.
+   */
+  public get snowPipelinePending(): boolean {
+    return this.snowGBufferMaterials.some(m => m.pipelinePending);
+  }
+
+  // the gBuffer materials with SNOW: the ground and SNOW_LAYERS
+  private get snowGBufferMaterials(): VertexFragmentShader[] {
+    return [this.groundGBufferMaterial, ...this.layers.filter(layer => SNOW_LAYERS.has(layer.def.key)).map(layer => layer.material)];
   }
 
   /** The materials of drawForward: they take the shading params (sky, sun, fog, shadows) by name, like the deferred shading. */

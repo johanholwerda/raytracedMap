@@ -207,6 +207,8 @@ export default class MapWorld {
   // how far (m) the noise moves the snow line up and down
   private snowLineNoise!: ParamFloat;
   private snowColor!: ParamColor;
+  // see updateSnow
+  private snowPipelineWasPending = false;
   private snowParams: SnowParams = { enabled: false, line: 0, noise: 0, metersPerUnit: 1, color: new Vector3(1, 1, 1) };
   private projection: MapProjection = new MapProjection();
 
@@ -1021,8 +1023,12 @@ export default class MapWorld {
     p.noise = this.snowLineNoise.value;
     p.metersPerUnit = 1 / metersToNorm;
     p.color = this.snowColor.value;
-    this.deferred.setSnow(this.geometry.snowMaterials, p);
     this.geometry.setSnow(p);
+    // a still view draws again when the pipeline of the snow switched on or off is there (the frames before used the old
+    // one): while it is made, and once after
+    const pending = this.geometry.snowPipelinePending;
+    if (pending || this.snowPipelineWasPending) this.dirty = true;
+    this.snowPipelineWasPending = pending;
   }
 
   /**
