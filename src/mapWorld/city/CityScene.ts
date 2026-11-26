@@ -43,7 +43,7 @@ export default class CityScene {
   private static readonly CHANGES_MAX = 16;
   //how far around a tile the sky visibility changes when it comes or goes, in times the height of its tallest
   //building: the sky it hides. Not the sun it hides: that is where its shadows fall, see the class comment
-  private static readonly CHANGE_REACH = 2;
+  public static readonly CHANGE_REACH = 2;
   private renderer: Renderer;
   private readonly capacity: number;
   public buffer: GPUBuffer | null = null;

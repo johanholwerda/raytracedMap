@@ -3,6 +3,8 @@ import type { WorldTileResult } from './worldGeometryCore';
 import type { WorldWorkerReply, WorldWorkerRequest, WorldWorkerSetup } from './worldMapWorker';
 import type { FetchJobEvent, FetchJobMessage } from './tileFetchWorker';
 import type ElevationClient from './ElevationClient';
+import { jobClock } from './jobTimes';
+import type { JobTimes } from './jobTimes';
 
 /**
  * Pool of {@link worldMapWorker} Web Workers that build the map tiles, fed by the tile fetch worker
@@ -18,7 +20,13 @@ import type ElevationClient from './ElevationClient';
 export type WorldTileJob = Omit<WorldWorkerRequest, 'id'>;
 
 /** A made tile: null result when the server has no data for it and the ground is flat. heights: with elevation. */
-export type WorldTileBuilt = { result: WorldTileResult | null; heights: Float32Array | null };
+export type WorldTileBuilt = {
+  result: WorldTileResult | null;
+  heights: Float32Array | null;
+  // for the tile timings: the times of the workers (null when the fetch worker ended the job), when it got here (jobClock)
+  times: JobTimes | null;
+  arrived: number;
+};
 
 type Pending = { resolve: (v: WorldTileBuilt) => void; reject: (e: any) => void };
 
@@ -27,7 +35,7 @@ export default class WorldWorkerPool {
   public static readonly CANCELLED = new Error('cancelled');
   // The jobs under way at once per build worker, and at least (see capacity): about half of the time of a job is
   // waiting for its data, with as many jobs as workers they were idle half the time
-  private static readonly JOBS_PER_WORKER = 2;
+  public static JOBS_PER_WORKER = 2;
   private static readonly JOBS_MIN = 8;
 
   private workers: Worker[] = [];
@@ -63,7 +71,7 @@ export default class WorldWorkerPool {
     this.jobs.onmessage = (e: MessageEvent<FetchJobEvent>) => {
       // a job that ended in the fetch worker
       if (e.data.error) this.settle(e.data.id, new Error(e.data.error), null);
-      else this.settle(e.data.id, null, { result: null, heights: null });
+      else this.settle(e.data.id, null, { result: null, heights: null, times: null, arrived: jobClock() });
     };
     const count = Math.max(1, size ?? WorldWorkerPool.defaultWorkerCount);
     for (let i = 0; i < count; i++) {
@@ -138,13 +146,18 @@ export default class WorldWorkerPool {
     this.send({ cancel: id });
   }
 
+  /** The job, asked for ahead of the view (WorldTileJob.margin), is in view now: built before the jobs that are not. */
+  public prioritize(id: number): void {
+    if (this.pending.has(id)) this.send({ prioritize: id });
+  }
+
   private onBuilt(data: WorldWorkerReply): void {
     this.stats.busyMs += data.buildMs;
     this.stats.queueMs += data.waitMs;
     this.stats.fetchMs += data.fetchMs;
     this.stats.jobs++;
     if (data.error) this.settle(data.id, new Error(data.error), null);
-    else this.settle(data.id, null, { result: data.result ?? null, heights: data.heights ?? null });
+    else this.settle(data.id, null, { result: data.result ?? null, heights: data.heights ?? null, times: data.times, arrived: jobClock() });
   }
 
   /** The promise of a job, when it is still wanted (not cancelled). */
