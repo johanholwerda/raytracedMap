@@ -64,6 +64,12 @@ const AO_MARGIN_M = .8;
 // the length of an average car, for minPixels
 const CAR_LENGTH_M = 4.5;
 
+/**
+ * The car of the drive mode (DriveController), drawn with the others: world units, the unit heading (hx, hz) in xz, the
+ * ground under its center and the rise per world unit along the heading.
+ */
+export type PlayerCar = { x: number; z: number; hx: number; hz: number; ground: number; slope: number };
+
 type CarMaterials = {
   car: VertexFragmentShader;
   shadow: VertexFragmentShader;
@@ -152,6 +158,8 @@ export default class CarTraffic implements RoadTileSink {
   private _active = false;
   // toward the sun, for the rays of lightingShader: set by MapWorld before the draw
   public readonly lightDirection = new Vector3(0, 1, 0);
+  /** The car of the drive mode, null without: drawn after the traffic, also with the traffic off or too small. */
+  public player: PlayerCar | null = null;
 
   public enabled!: ParamBool;
   // cars per km of road around the camera
@@ -275,11 +283,16 @@ export default class CarTraffic implements RoadTileSink {
     this.clearCars();
   }
 
+  /** The nearest point on a road within radius (world units), see RoadGraph.nearestPoint. */
+  public nearestRoad(x: number, z: number, radius: number, accept?: (x: number, z: number) => boolean) {
+    return this.graph.nearestPoint(x, z, radius, accept);
+  }
+
   // --- simulation -------------------------------------------------------------------
 
   /** Whether the last update moved the cars: they are drawn this frame, and the frame changes because of them. */
   public get active(): boolean {
-    return this._active;
+    return this._active || this.player !== null;
   }
 
   private clearCars(): void {
@@ -557,10 +570,12 @@ export default class CarTraffic implements RoadTileSink {
 
   //the cars into the instance buffer, grown to fit. Returns their count
   private writeInstances(): number {
-    const cars = this.cars;
-    if (cars.length === 0) return 0;
-    if (this.instanceData.length < cars.length * CAR_FLOATS) {
-      const capacity = Math.max(cars.length, Math.ceil(this.instanceData.length / CAR_FLOATS * 1.5), 256);
+    // the traffic only when its update ran (it isn't moved below minPixels)
+    const cars = this._active ? this.cars : [];
+    const count = cars.length + (this.player ? 1 : 0);
+    if (count === 0) return 0;
+    if (this.instanceData.length < count * CAR_FLOATS) {
+      const capacity = Math.max(count, Math.ceil(this.instanceData.length / CAR_FLOATS * 1.5), 256);
       this.instanceData = new Float32Array(capacity * CAR_FLOATS);
       this.instanceBuffer?.destroy();
       this.instanceBuffer = this.renderer.createBuffer(this.instanceData.byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, false, 'cars');
@@ -583,9 +598,26 @@ export default class CarTraffic implements RoadTileSink {
       data[o + 7] = car.type;
       data[o + 8] = car.ground;
       data[o + 9] = car.slope;
+      data[o + 10] = 0;
     }
-    this.renderer.writeBuffer(this.instanceBuffer!, data.subarray(0, cars.length * CAR_FLOATS));
-    return cars.length;
+    const player = this.player;
+    if (player) {
+      const mtn = this.projection.metersToNorm;
+      const o = cars.length * CAR_FLOATS;
+      data[o] = player.x;
+      data[o + 1] = player.z;
+      data[o + 2] = player.hx;
+      data[o + 3] = player.hz;
+      data[o + 4] = 2.25 * mtn;
+      data[o + 5] = .9 * mtn;
+      data[o + 6] = 1.5 * mtn;
+      data[o + 7] = TYPE_CAR;
+      data[o + 8] = player.ground;
+      data[o + 9] = player.slope;
+      data[o + 10] = 1;
+    }
+    this.renderer.writeBuffer(this.instanceBuffer!, data.subarray(0, count * CAR_FLOATS));
+    return count;
   }
 
   //the layer the cars are drawn into, at the canvas size, made again when the msaa param changed

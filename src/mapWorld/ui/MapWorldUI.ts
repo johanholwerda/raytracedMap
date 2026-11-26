@@ -10,6 +10,9 @@ import Joystick from './Joystick';
 /** A place picked in the search box. */
 export type SearchedPlace = { lat: number; lng: number; title: string; subtitle?: string };
 
+/** How the camera moves: orbiting, flying (AirplaneController) or driving (DriveController). */
+export type CameraMode = 'orbit' | 'fly' | 'drive';
+
 // a row of the search suggestions
 type Suggestion = { label: string; detail?: string; pick: () => void };
 
@@ -21,12 +24,12 @@ export type MapWorldUICallbacks = {
   onRandomCity: () => void;
   // a place picked in the search box
   onGoToPlace: (place: SearchedPlace) => void;
-  // returns whether airplane mode is on now
-  onToggleAirplane: () => boolean;
+  // the fly or drive button: that mode on, or off when it is on. Returns the mode it is in now
+  onToggleMode: (mode: Exclude<CameraMode, 'orbit'>) => CameraMode;
 };
 
 /**
- * The DOM overlays of MapWorld: the button bar (map, city search, random city, fly / orbit), the 2D (Leaflet) region picker, the
+ * The DOM overlays of MapWorld: the button bar (map, city search, random city, fly / drive / orbit), the 2D (Leaflet) region picker, the
  * OpenStreetMap attribution and the tile error toasts.
  */
 export default class MapWorldUI {
@@ -98,12 +101,15 @@ export default class MapWorldUI {
     this.createButton(bar, 'Map', () => void this.openSelector());
     this.createSearchBox(bar);
     this.createButton(bar, 'Random', () => this.callbacks.onRandomCity());
-    const airplane = this.createButton(bar, 'Fly', () => {
-      const flying = this.callbacks.onToggleAirplane();
-      airplane.textContent = flying ? 'Orbit' : 'Fly';
+    const toggle = (mode: 'fly' | 'drive', button: HTMLButtonElement) => {
+      const now = this.callbacks.onToggleMode(mode);
+      airplane.textContent = now === 'fly' ? 'Orbit' : 'Fly';
+      drive.textContent = now === 'drive' ? 'Orbit' : 'Drive';
       // the arrow keys and space would otherwise act on the focused button
-      airplane.blur();
-    });
+      button.blur();
+    };
+    const airplane: HTMLButtonElement = this.createButton(bar, 'Fly', () => toggle('fly', airplane));
+    const drive: HTMLButtonElement = this.createButton(bar, 'Drive', () => toggle('drive', drive));
     return bar;
   }
 

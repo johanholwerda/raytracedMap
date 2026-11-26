@@ -46,10 +46,12 @@ import MapGeometry, { CityMeshes } from './MapGeometry';
 import SunShadows from './SunShadows';
 import WallAtlasView from './city/WallAtlasView';
 import type { ShadowMapAhead } from './osm/shadowMap/ShadowMap';
+import type { CameraMode } from './ui/MapWorldUI';
 import BuildingPicker from './BuildingPicker';
 import CarTraffic from './cars/CarTraffic';
 import MapWorldUI from './ui/MapWorldUI';
 import AirplaneController from './AirplaneController';
+import DriveController from './DriveController';
 import OrbitKeyRotation from './OrbitKeyRotation';
 import { TREE_CROWN_COLORS, TREE_TRUNK_COLOR } from './map/worldTrees';
 import WaterRippleTexture from './deferred/waterRipples/WaterRippleTexture';
@@ -144,6 +146,8 @@ export default class MapWorld {
   private camera!: MapCamera;
   // the airplane button: flies the camera with WASD / the arrows instead of orbiting
   private airplane!: AirplaneController;
+  // the drive button: drops the camera out of the sky and drives it like a car, colliding with the BVH of the buildings
+  private drive!: DriveController;
   // not flying: WASD / the arrows and the touch joystick rotate the orbit camera
   private orbitKeys!: OrbitKeyRotation;
   private bounds: LatLngBounds = DEFAULT_BOUNDS;
@@ -319,6 +323,7 @@ export default class MapWorld {
     // Geometry is projected relative to the bounds center (world origin).
     this.camera.pivot.position = new Vector3(0, 0, 0);
     this.airplane = new AirplaneController(this.renderer, this.camera);
+    this.drive = new DriveController(this.renderer, this.camera);
     this.orbitKeys = new OrbitKeyRotation(this.renderer, this.camera);
 
     if (SSAO_ENABLED) this.ssao = new ReprojectedSSAO(this.renderer, preloader);
@@ -385,7 +390,7 @@ export default class MapWorld {
       getViewBounds: () => this.currentViewBounds(),
       onSelectBounds: (bounds) => void this.loadFromBounds(bounds),
       onRandomCity: () => void this.goToRandomCity(),
-      onToggleAirplane: () => this.toggleAirplane(),
+      onToggleMode: (mode) => this.toggleMode(mode),
       onGoToPlace: (place) => {
         LogGL.log(`[MapWorld] search: ${place.title} (${place.lat.toFixed(5)}, ${place.lng.toFixed(5)})`);
         this.ui.showLocationTitle(place.title, place.subtitle);
@@ -395,6 +400,10 @@ export default class MapWorld {
 
     this.traffic.setHeightField(this.heightField);
     this.airplane.ground = (x, z) => this.heightField.heightAt(x, z);
+    this.drive.ground = (x, z) => this.heightField.heightAt(x, z) ?? (this.elevationParam?.value === false ? 0 : null);
+    const cityScene = this.skyLightmap.cityScene;
+    this.drive.raycast = (ox, oy, oz, dx, dy, dz, tMax) => this.drawBuildings.value ? cityScene.raycast(ox, oy, oz, dx, dy, dz, tMax) : Infinity;
+    this.drive.road = (x, z, radius, accept) => this.traffic.nearestRoad(x, z, radius, accept);
     // where the tiles startTiles asked for go: the built ones wait for the first frame
     this.tileStreamer.attach({
       renderer: this.renderer,
@@ -525,7 +534,7 @@ export default class MapWorld {
    * onto the loaded ground, keep the URL as it is. Not while flying (the plane never stands still), in a bench or a video.
    */
   private updateUrl(moving: boolean): void {
-    if (this.bench || this.video || this.airplane.active) return;
+    if (this.bench || this.video || this.airplane.active || this.drive.active) return;
     const now = performance.now();
     if (moving) {
       if (now - this.lastInputTime < USER_INPUT_WINDOW_MS) this.urlPending = true;
@@ -636,12 +645,27 @@ export default class MapWorld {
     });
   }
 
-  /** Airplane mode on or off, returns whether it is on now. */
-  private toggleAirplane(): boolean {
+  /** Airplane or drive mode on, or off when it is on already: back to orbiting. Returns the mode it is in now. */
+  private toggleMode(mode: CameraMode): CameraMode {
+    const current = this.cameraMode;
     if (this.airplane.active) this.airplane.exit();
-    else this.airplane.enter(this.projection.metersToNorm);
+    if (this.drive.active) this.drive.exit(this.projection.metersToNorm);
+    if (mode !== current) {
+      if (mode === 'fly') this.airplane.enter(this.projection.metersToNorm);
+      else if (mode === 'drive') this.drive.enter(this.projection.metersToNorm);
+    }
     this.orbitKeys.reset();
-    return this.airplane.active;
+    // from the driver's seat the view is level: the tilt-shift would blur all of it
+    this.tiltShift.suppressed = this.drive.active;
+    // another near plane, another camera height: no history reprojects
+    this.taa.invalidate();
+    this.ssao?.reset();
+    this.dirty = true;
+    return this.cameraMode;
+  }
+
+  private get cameraMode(): CameraMode {
+    return this.airplane.active ? 'fly' : this.drive.active ? 'drive' : 'orbit';
   }
 
   /** Re-center the projection on a region and (re)start tile streaming there. */
@@ -675,6 +699,8 @@ export default class MapWorld {
     this.sun?.shadowMap.reset();
     // the plane keeps flying, around the new center
     if (this.airplane.active) this.airplane.recenter();
+    // the car drops out of the sky again, onto the new center
+    if (this.drive.active) this.drive.recenter(this.projection.metersToNorm);
     this.camera.pivot.position = new Vector3(0, 0, 0);
     this.tileStreamer.resetStreamingPosition();
     // The projection is recentered: all geometry jumps, no history reprojects.
@@ -997,6 +1023,7 @@ export default class MapWorld {
     this.camera.projection.resetJitter();
     this.bench?.moveCamera(this.camera);
     if (this.airplane.active) this.airplane.update(this.projection.metersToNorm, this.video?.stick ?? this.ui?.joystickValue);
+    else if (this.drive.active) this.drive.update(this.projection.metersToNorm, this.ui?.joystickValue);
     else {
       if (!this.video && !this.bench) this.orbitKeys.update(this.ui?.joystickValue);
       // before the update, which sees whether the camera changed
@@ -1005,6 +1032,8 @@ export default class MapWorld {
       // eases out the bank left over from airplane mode
       this.airplane.settle();
     }
+    // the car of the drive mode, drawn with the traffic
+    this.traffic.player = this.drive.car;
     this.updateFarPlane();
 
     // the tiles whose building shadows fall into the view load too
@@ -1086,7 +1115,7 @@ export default class MapWorld {
    * each cascade would lie behind it, never seen.
    */
   private shadowsAhead(): ShadowMapAhead | null {
-    if (!this.airplane.active) return null;
+    if (!this.airplane.active && !this.drive.active) return null;
     const origin = this.camera.worldPosition.clone();
     origin.y = this.camera.pivot.worldPosition.y;
     const forward = Vector3.subtract(this.camera.pivot.worldPosition, origin);

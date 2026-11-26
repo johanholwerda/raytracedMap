@@ -74,6 +74,7 @@ export default class TiltShift {
   public readonly target: RenderTexture;
   //called when a param changes the blur (getBlur), which the AO and the lightmap of the host follow
   public onChange: (() => void) | null = null;
+  private _suppressed = false;
 
   public enabled!: ParamBool;
   //lens diameter as a fraction of the camera distance
@@ -137,7 +138,19 @@ export default class TiltShift {
   }
 
   public get active(): boolean {
-    return this.enabled.value && this.aperture.value > 0;
+    return this.enabled.value && this.aperture.value > 0 && !this._suppressed;
+  }
+
+  /** Off without changing the enabled param, e.g. while the view is level (driving): it would blur all of it. */
+  public get suppressed(): boolean {
+    return this._suppressed;
+  }
+
+  public set suppressed(value: boolean) {
+    if (value === this._suppressed) return;
+    this._suppressed = value;
+    this.blursValid = false;
+    this.onChange?.();
   }
 
   /** Whether target still holds the last input at the canvas size, so it need not be drawn again. */

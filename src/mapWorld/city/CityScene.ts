@@ -293,7 +293,22 @@ export default class CityScene {
    * without one. Takes all tiles, also those without a place in the city buffer.
    */
   public pick(ro: Vector3, rd: Vector3): { key: string; featureId: number } | null {
-    const o = [ro.x, ro.y, ro.z], d = [rd.x, rd.y, rd.z];
+    const hit = this.closestHit([ro.x, ro.y, ro.z], [rd.x, rd.y, rd.z], Infinity);
+    if (!hit) return null;
+    const block = hit.tile.block;
+    return { key: hit.key, featureId: hit.record < block.buildingCount ? block.ids[hit.record] : -1 };
+  }
+
+  /**
+   * The distance along the ray (in the length of rd) to the first building or tree it hits before tMax, Infinity when
+   * it hits none. For the collisions of the drive mode (see DriveController).
+   */
+  public raycast(ox: number, oy: number, oz: number, dx: number, dy: number, dz: number, tMax: number = Infinity): number {
+    return this.closestHit([ox, oy, oz], [dx, dy, dz], tMax)?.t ?? Infinity;
+  }
+
+  //the closest hit of the ray over all tiles before tMax: its tile and record, see intersectTraceBlock
+  private closestHit(o: number[], d: number[], tMax: number): { key: string; tile: Tile; t: number; record: number } | null {
     const inv = d.map(v => (v >= 0 ? 1 : -1) / Math.max(Math.abs(v), 1e-12));
     //the tiles the ray passes, nearest first, so the closest hit culls the tiles behind it
     const candidates: { key: string; tile: Tile; near: number }[] = [];
@@ -305,18 +320,17 @@ export default class CityScene {
         near = Math.max(near, Math.min(t0, t1));
         far = Math.min(far, Math.max(t0, t1));
       }
-      if (near <= far) candidates.push({ key, tile, near });
+      if (near <= far && near < tMax) candidates.push({ key, tile, near });
     }
     candidates.sort((a, b) => a.near - b.near);
-    let best = Infinity;
-    let hit: { key: string; featureId: number } | null = null;
+    let best = tMax;
+    let hit: { key: string; tile: Tile; t: number; record: number } | null = null;
     for (const { key, tile, near } of candidates) {
       if (near >= best) break;
       const result = intersectTraceBlock(tile.block, o, d, best);
       if (!result) continue;
       best = result.t;
-      const block = tile.block;
-      hit = { key, featureId: result.record < block.buildingCount ? block.ids[result.record] : -1 };
+      hit = { key, tile, t: result.t, record: result.record };
     }
     return hit;
   }

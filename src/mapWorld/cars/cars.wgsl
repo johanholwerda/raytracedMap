@@ -91,7 +91,7 @@ struct ShadowMapData {
 @group(0) @binding(7) var<storage, read> tileBuffer : array<u32>;
 @group(0) @binding(8) var<storage, read> lightingBuffer : array<u32>;
 @group(0) @binding(9) var gBufferDepth : texture_depth_2d;
-// 3 per car: (x, z, heading x, heading z), (half length, half width, height, type), (ground, slope, 0, 0), see CarTraffic
+// 3 per car: (x, z, heading x, heading z), (half length, half width, height, type), (ground, slope, player, 0), see CarTraffic
 @group(0) @binding(10) var<storage, read> cars : array<vec4<f32>>;
 // the ground as the sun sees it (TerrainSunMap.ts): the hills, which the rays don't trace, see terrainSun.wgsl
 @group(0) @binding(13) var terrainSunMap : texture_2d<f32>;
@@ -109,6 +109,8 @@ const TYPE_CAR = 0u;
 // the paint of all cars and the windows, before they are squared like the palette of the gBuffer
 const PAINT = vec3(.78, .78, .79);
 const GLASS = vec3(.10, .12, .14);
+// the paint of the car of the drive mode (Car.player)
+const PLAYER_PAINT = vec3(.75, .08, .06);
 
 struct Car {
   center : vec2<f32>,
@@ -123,13 +125,15 @@ struct Car {
   // along it, its bottom on the line of the road
   ground : f32,
   slope : f32,
+  // 1 for the car of the drive mode (see CarTraffic.player): another paint
+  player : f32,
 };
 
 fn loadCar(i : u32) -> Car {
   let a = cars[i * 3u];
   let b = cars[i * 3u + 1u];
   let c = cars[i * 3u + 2u];
-  return Car(a.xy, a.zw, vec2(-a.w, a.z), b.x, b.y, b.z, u32(b.w), c.x, c.y);
+  return Car(a.xy, a.zw, vec2(-a.w, a.z), b.x, b.y, b.z, u32(b.w), c.x, c.y, c.z);
 }
 
 // --- Variance shadow map sampling, as in deferredShading.wgsl -----------------
@@ -474,7 +478,7 @@ fn vs_main(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) in
   output.normal = vec3(nxz.x, ns.y, nxz.y);
   // the sides of the cabin are the windows
   let glass = boxIndex == 1u && face < 4u;
-  output.albedo = select(PAINT, GLASS, glass);
+  output.albedo = select(select(PAINT, PLAYER_PAINT, car.player > .5), GLASS, glass);
   output.glass = select(0., 1., glass);
   output.height = carPos.y / max(car.height, 1e-9);
 #ifndef PER_PIXEL

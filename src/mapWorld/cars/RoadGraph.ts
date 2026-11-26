@@ -186,6 +186,34 @@ export default class RoadGraph {
     return null;
   }
 
+  /**
+   * The nearest point on a road within radius of x, z (world units) that accept takes, and the direction of its edge,
+   * null for none. The edges are found by the spawn cell of their middle: an edge longer than a cell may be missed
+   * near its ends.
+   */
+  public nearestPoint(x: number, z: number, radius: number, accept: (x: number, z: number) => boolean = () => true):
+    { x: number; z: number; dx: number; dz: number } | null {
+    const c = this.spawnCell;
+    const reach = radius + c;
+    const x0 = Math.floor((x - reach) / c), x1 = Math.floor((x + reach) / c);
+    const z0 = Math.floor((z - reach) / c), z1 = Math.floor((z + reach) / c);
+    const points: { x: number; z: number; dx: number; dz: number; d2: number }[] = [];
+    for (let ix = x0; ix <= x1; ix++) {
+      for (let iz = z0; iz <= z1; iz++) {
+        const cell = this.spawnGrid.get(cellKey(ix, iz));
+        if (!cell) continue;
+        for (const e of cell.edges) {
+          const t = Math.min(Math.max((x - e.a.x) * e.dx + (z - e.a.z) * e.dz, 0), e.length);
+          const px = e.a.x + e.dx * t, pz = e.a.z + e.dz * t;
+          const d2 = (px - x) ** 2 + (pz - z) ** 2;
+          if (d2 <= radius * radius) points.push({ x: px, z: pz, dx: e.dx, dz: e.dz, d2 });
+        }
+      }
+    }
+    points.sort((a, b) => a.d2 - b.d2);
+    return points.find(p => accept(p.x, p.z)) ?? null;
+  }
+
   //the node within radius of x, z, or a new one there
   private getNode(x: number, z: number, radius: number): RoadNode {
     const s = this.snapCell;
