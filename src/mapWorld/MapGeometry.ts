@@ -35,7 +35,8 @@ const SNOW_MATERIAL_LAYER = 'glacier';
 /** The building meshes to draw, with their picking slots (parallel), see WorldTileStreamer. */
 // tiles: per mesh the map tile of its wall atlas, x and y after each other (the uniform wallTile of the gBuffer).
 // quantization: per mesh the decoding of its unorm16 vertices, see setMeshQuantization
-export type CityMeshes = { meshes: Mesh[]; slots: number[]; tiles: number[]; quantization: number[] };
+// indexCounts: per mesh the indices to draw, without its trees when they are too small, see WorldTileStreamer.cullTrees
+export type CityMeshes = { meshes: Mesh[]; slots: number[]; tiles: number[]; quantization: number[]; indexCounts: number[] };
 
 export type DrawStats = { meshCount: number; vertexCount: number; culledCount: number };
 
@@ -340,7 +341,7 @@ export default class MapGeometry {
       setMeshQuantization(material, city.quantization, index);
       stats.meshCount++;
       stats.vertexCount += mesh.vertexCount;
-      this.renderer.draw(mesh, material);
+      this.renderer.draw(mesh, material, { indexCount: city.indexCounts[index] });
     }
   }
 
@@ -360,7 +361,7 @@ export default class MapGeometry {
         const bounds = this.meshBounds.get(mesh);
         if (bounds && !this.frustum.aaBoxInFrustum(bounds)) return;
         setMeshQuantization(this.overdrawCityMaterial, city.quantization, i);
-        this.renderer.draw(mesh, this.overdrawCityMaterial);
+        this.renderer.draw(mesh, this.overdrawCityMaterial, { indexCount: city.indexCounts[i] });
       });
     }
   }

@@ -53,6 +53,8 @@ export const defaultRendererOptions: RendererOptions = {
 
 export type DrawOptions = {
   instanceCount: number;
+  //of an indexed mesh: draws its first indexCount indices instead of all
+  indexCount: number;
 }
 
 export type DrawVerticesOptions = {
@@ -621,7 +623,7 @@ export default class Renderer {
     const pass = this.prepareDraw(material, mesh, mesh.indexBuffer, mesh.indexFormat);
     if (!pass) return;
     if (mesh.indexBuffer) {
-      pass.drawIndexed(mesh.indexCount, instanceCount);
+      pass.drawIndexed(options.indexCount ?? mesh.indexCount, instanceCount);
     } else {
       pass.draw(mesh.vertexCount, instanceCount, 0, 0);
     }
