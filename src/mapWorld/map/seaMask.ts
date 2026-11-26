@@ -1,6 +1,7 @@
 import type { VectorTileLayer } from '@mapbox/vector-tile';
 import { tileToLatLon } from '../osm/pdokDecodeCore';
 import type { TileCoord } from '../osm/PDOKTileService';
+import { FeatureRings, readRings } from './tileGeometry';
 
 /*
 The sea is flat: the points of the height grid of a map tile (see ElevationService.getTileGrid) in the sea of its
@@ -19,6 +20,10 @@ the edges) is 1 cell outside the tile, at z14 exactly on the edge of that buffer
 
 /** The ring of the grid is tested this many units of the vector tile's extent inside the tile. */
 const RING_INSET = .5;
+
+// the rings of a feature and the crossings of the rows, kept from feature to feature and from tile to tile
+const seaRings = new FeatureRings();
+let seaCrossings = new Float64Array(1024);
 
 /**
  * Sets the points of the height grid of a tile in the sea of its vector tile (its water layer) to seaLevel, in place.
@@ -54,32 +59,54 @@ export function flattenSea(water: VectorTileLayer | undefined, tile: TileCoord, 
   ys[0] += RING_INSET;
   ys[outer - 1] -= RING_INSET;
 
-  // per row the x where the rings of a feature cross it: inside between the 1st and 2nd, the 3rd and 4th, ...
-  const crossings: number[][] = [];
-  for (let r = 0; r < outer; r++) crossings.push([]);
+  // per row the x where the rings of a feature cross it: inside between the 1st and 2nd, the 3rd and 4th, ... In 1
+  // array for all rows, row r's from starts[r] to starts[r + 1], counted first. The rings are read flat (see
+  // tileGeometry.ts): with loadGeometry a point object per vertex, and an array per row made again for every feature
+  const rings = seaRings;
+  const starts = new Int32Array(outer + 1), fill = new Int32Array(outer);
   const sea = new Uint8Array(heights.length);
   let any = false;
   for (let f = 0; f < water.length; f++) {
     const feature = water.feature(f);
     if (feature.type !== 3 || feature.properties.class !== 'ocean') continue;
-    for (const list of crossings) list.length = 0;
-    for (const ring of feature.loadGeometry()) {
-      for (let e = 0; e < ring.length; e++) {
-        const p = ring[e], q = ring[(e + 1) % ring.length];
-        if (p.y === q.y) continue;
-        const yMin = Math.min(p.y, q.y), yMax = Math.max(p.y, q.y);
-        // the rows with yMin <= y < yMax: the edge crosses them (a vertex on a row counts once)
-        for (let r = firstAtLeast(ys, yMin); r < outer && ys[r] < yMax; r++) {
-          crossings[r].push(p.x + (ys[r] - p.y) * (q.x - p.x) / (q.y - p.y));
+    readRings(feature, rings);
+    starts.fill(0);
+    // pass 0 counts the crossings of each row, pass 1 puts them in their place
+    for (let pass = 0; pass < 2; pass++) {
+      const pts = rings.points;
+      for (let ring = 0; ring < rings.ringCount; ring++) {
+        const s = rings.starts[ring], n = rings.starts[ring + 1] - s;
+        for (let e = 0; e < n; e++) {
+          const a = (s + e) * 2, b = (s + (e + 1) % n) * 2;
+          const px = pts[a], py = pts[a + 1], qx = pts[b], qy = pts[b + 1];
+          if (py === qy) continue;
+          const yMin = Math.min(py, qy), yMax = Math.max(py, qy);
+          // the rows with yMin <= y < yMax: the edge crosses them (a vertex on a row counts once)
+          for (let r = firstAtLeast(ys, yMin); r < outer && ys[r] < yMax; r++) {
+            if (pass === 0) starts[r + 1]++;
+            else seaCrossings[fill[r]++] = px + (ys[r] - py) * (qx - px) / (qy - py);
+          }
         }
       }
+      if (pass === 0) {
+        for (let r = 0; r < outer; r++) starts[r + 1] += starts[r];
+        for (let r = 0; r < outer; r++) fill[r] = starts[r];
+        if (seaCrossings.length < starts[outer]) seaCrossings = new Float64Array(Math.max(starts[outer], seaCrossings.length * 2));
+      }
     }
+    const list = seaCrossings;
     for (let r = 0; r < outer; r++) {
-      const list = crossings[r];
-      if (list.length < 2) continue;
-      list.sort((a, b) => a - b);
+      const s = starts[r], e = starts[r + 1];
+      if (e - s < 2) continue;
+      // ascending, by insertion: a few per row
+      for (let k = s + 1; k < e; k++) {
+        const x = list[k];
+        let j = k - 1;
+        for (; j >= s && list[j] > x; j--) list[j + 1] = list[j];
+        list[j + 1] = x;
+      }
       const row = (outer - 1 - r) * outer;
-      for (let c = 0; c + 1 < list.length; c += 2) {
+      for (let c = s; c + 1 < e; c += 2) {
         for (let i = firstAtLeast(xs, list[c]); i < outer && xs[i] < list[c + 1]; i++) {
           sea[row + i] = 1;
           any = true;
