@@ -16,7 +16,8 @@ export const NICE_VIEWS: string[] = [
   'lat=43.637305&lng=-79.384320&dist=1812&pitch=-33.47&yaw=69.49&time=afternoon',
   'lat=38.897527&lng=-77.057341&dist=535&pitch=-26.20&yaw=83.70&time=sunset',
   'lat=37.589069&lng=126.974844&dist=961&pitch=-29.37&yaw=172.27&time=morning',
-  'lat=22.275807&lng=114.164348&dist=1406&pitch=-30.30&yaw=-11.80&time=noon'
+  'lat=22.275807&lng=114.164348&dist=1406&pitch=-30.30&yaw=-11.80&time=noon',
+  'lat=68.240545&lng=14.542637&dist=961&pitch=-17.13&yaw=-66.78&time=afternoon'
 ];
 
 export type NiceView = { lat: number; lng: number; dist: number; pitch: number; yaw: number; time?: string };
