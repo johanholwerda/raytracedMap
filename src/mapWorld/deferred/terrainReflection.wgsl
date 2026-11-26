@@ -21,8 +21,14 @@ const TERRAIN_FINE = 4;
 const TERRAIN_STEP_GROWTH = 0.04;
 // the steps and the skipped cells together
 const TERRAIN_MAX_STEPS = 96;
-// of a horizon: it goes on to the edge of the map over flat water, a coarse cell a step
-const TERRAIN_HORIZON_MAX_STEPS = 160;
+// A horizon is marched in steps of this many texels, at every distance: with the longer steps far away of traceTerrain
+// the samples miss the top of a ridge by a part of a step, another part when the camera moves, and the edge of the
+// reflection and the ground in it jump. It is 1 march per block of pixels, see waterTerrainHorizon.wgsl
+const TERRAIN_HORIZON_STEP = 1.0;
+// it goes on to the edge of the map over flat water, a coarse cell a step, and a texel a step over a slope
+const TERRAIN_HORIZON_MAX_STEPS = 512;
+// the halvings of the step in which the mirror ray hits the ground: to 1 / 64 of a texel
+const TERRAIN_HIT_REFINE_STEPS = 6;
 
 // the ground height at p (texel coordinates, the centers at .5), bilinear
 fn getTerrainHeight(p : vec2<f32>, size : vec2<i32>) -> f32 {
@@ -129,8 +135,9 @@ struct TerrainHorizon {
 // to the edge of the map. A ray from there along rd hits the ground where rd.y < horizon * length(rd.xz). As
 // traceTerrain, with the line to the highest ground so far for the ray: only the ground above it raises the horizon.
 // And the ground the mirror ray itself hits, which rises by mirrorTangent: the first ground above it, which is where
-// the horizon first goes above the ray. Where the ray passes over all the ground: the ground of the horizon, what the
-// rays the ripples tilt down hit about
+// the horizon first goes above the ray, found between the last sample below the ground and that one by bisection (a
+// hit at the sample itself moves a step when the samples do: with the camera). Where the ray passes over all the
+// ground: the ground of the horizon, what the rays the ripples tilt down hit about
 fn getTerrainHorizon(ro : vec3<f32>, direction : vec2<f32>, mirrorTangent : f32) -> TerrainHorizon {
   let size = vec2<i32>(textureDimensions(terrainHeights));
   let sizeF = vec2<f32>(size);
@@ -149,7 +156,10 @@ fn getTerrainHorizon(ro : vec3<f32>, direction : vec2<f32>, mirrorTangent : f32)
   let fineLast = vec2<i32>(textureDimensions(terrainMaxHeightsFine)) - 1;
   // the rise of the line per texel
   var rise = 0.0;
-  var s = 1.0;
+  var s = 0.5 * TERRAIN_HORIZON_STEP;
+  // the last place the mirror ray was above the ground, while it hasn't hit: the line of the horizon is below it until
+  // then, so the ground of a skipped cell is too
+  var above = 0.0;
   for (var i = 0; i < TERRAIN_HORIZON_MAX_STEPS; i++) {
     let p = ray.p + d * s;
     let y = y0 + s * rise;
@@ -158,24 +168,42 @@ fn getTerrainHorizon(ro : vec3<f32>, direction : vec2<f32>, mirrorTangent : f32)
     }
     let c = clamp(vec2<i32>(floor(p / f32(TERRAIN_COARSE))), vec2<i32>(0), coarseLast);
     if (textureLoad(terrainMaxHeights, c, 0).x <= y) {
+      above = s;
       s += getTerrainCellExit(p, d, c, TERRAIN_COARSE);
       continue;
     }
     let cf = clamp(vec2<i32>(floor(p / f32(TERRAIN_FINE))), vec2<i32>(0), fineLast);
     if (textureLoad(terrainMaxHeightsFine, cf, 0).x <= y) {
-      s += max(getTerrainCellExit(p, d, cf, TERRAIN_FINE), max(1.0, s * TERRAIN_STEP_GROWTH));
+      above = s;
+      s += max(getTerrainCellExit(p, d, cf, TERRAIN_FINE), TERRAIN_HORIZON_STEP);
       continue;
     }
     let h = getTerrainHeight(p, size);
     let slope = (h - y0) / s;
-    if (slope > rise) {
-      rise = slope;
-      if (!hit) {
-        mirrored = vec2<f32>(s, h);
-        hit = slope > mirrorRise;
+    if (!hit) {
+      if (slope > mirrorRise) {
+        hit = true;
+        // the ray goes into the ground between above and s
+        var lo = above;
+        var hi = s;
+        for (var k = 0; k < TERRAIN_HIT_REFINE_STEPS; k++) {
+          let mid = 0.5 * (lo + hi);
+          if (getTerrainHeight(ray.p + d * mid, size) > y0 + mid * mirrorRise) {
+            hi = mid;
+          } else {
+            lo = mid;
+          }
+        }
+        mirrored = vec2<f32>(hi, y0 + hi * mirrorRise);
+      } else {
+        above = s;
+        if (slope > rise) {
+          mirrored = vec2<f32>(s, h);
+        }
       }
     }
-    s += max(1.0, s * TERRAIN_STEP_GROWTH);
+    rise = max(rise, slope);
+    s += TERRAIN_HORIZON_STEP;
   }
   // per texel to per world unit
   return TerrainHorizon(rise * ray.speed, mirrored.x / ray.speed, mirrored.y);
