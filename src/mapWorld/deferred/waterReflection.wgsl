@@ -3,15 +3,26 @@
 // Needs uniforms.inverseProjection, resolution (of the gBuffer), cameraPosition and rippleTile, the bindings
 // rippleTexture and rippleSampler, and the override WATER_RIPPLES
 
-// the normal n of the water tilted by the ripples at world, d from the eye along view. Sampled at an explicit mip (the
-// branch of the water isn't uniform control flow): the footprint of the pixel on the water, the geometric mean of its
-// sides, the one along the view stretched by 1 / cos. The ripples smaller than a pixel average out to the flat water
+// The ripples are sampled over this many pixels, see getRippleNormal. Over 1 they change from pixel to pixel far away,
+// and what a mirror ray hits with them: the edge of a reflection is single pixels there, which flicker when the camera
+// moves (the TAA only averages them in a static view). Over 3 the ripples of a few pixels are left, the edge wobbles
+const RIPPLE_FOOTPRINT = 3.;
+
+// the normal n of the water tilted by the ripples at world, d from the eye along view. Sampled over the footprint of the
+// pixel on the water, with explicit gradients (the branch of the water isn't uniform control flow): its side across the
+// view, and the one along it, which is 1 / cos longer. Far away that is many times the other: the sampler is
+// anisotropic, it averages the ripples along the view and keeps them across. One mip for both (the geometric mean of the
+// sides, as this was) is too sharp along the view there: the ripples alias, the reflections flicker when the camera
+// moves. The ripples smaller than RIPPLE_FOOTPRINT pixels average out to the flat water
 fn getRippleNormal(n : vec3<f32>, world : vec3<f32>, view : vec3<f32>, d : f32) -> vec3<f32> {
   let pixelAngle = 2. * uniforms.inverseProjection[1][1] / uniforms.resolution.y;
-  let footprint = d * pixelAngle * inverseSqrt(max(abs(view.y), .02));
-  let texel = uniforms.rippleTile / f32(textureDimensions(rippleTexture).x);
-  let lod = log2(max(footprint / texel, 1.));
-  let g = textureSampleLevel(rippleTexture, rippleSampler, world.xz / uniforms.rippleTile, lod).xy;
+  // the size of a pixel at the water, in tiles
+  let pixel = RIPPLE_FOOTPRINT * d * pixelAngle / uniforms.rippleTile;
+  let across = length(view.xz);
+  // straight down: no direction along the view, and both sides the same
+  let along = select(vec2(1., 0.), view.xz / max(across, 1e-6), across > 1e-4);
+  let g = textureSampleGrad(rippleTexture, rippleSampler, world.xz / uniforms.rippleTile, vec2(-along.y, along.x) * pixel,
+    along * (pixel / max(abs(view.y), .02))).xy;
   //the normal of the height field y = h(x, z) is (-dh/dx, 1, -dh/dz)
   return normalize(n + vec3(-g.x, 0., -g.y));
 }
