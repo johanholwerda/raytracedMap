@@ -1,5 +1,7 @@
 import ElevationService from './ElevationService';
 import type { WorldBuildMessage, WorldBuildDone, WorldWorkerRequest } from './worldMapWorker';
+import { jobClock } from './jobTimes';
+import type { JobTimes } from './jobTimes';
 
 /**
  * The tile fetch Web Worker: gets what a map tile is made of, off the main thread, and hands it to the workers that
@@ -42,6 +44,8 @@ export type FetchWorkerEvent =
 export type FetchJobMessage =
   | { start: WorldWorkerRequest }
   | { cancel: number }
+  // the job, asked for ahead of the view (WorldWorkerRequest.margin), is in view now: built before those that are not
+  | { prioritize: number }
   | { limit: number };
 
 /**
@@ -87,7 +91,7 @@ function getHeights(job: WorldWorkerRequest): Promise<Float32Array> {
 
 // --- the jobs
 
-type Ready = { job: WorldWorkerRequest; pbf: ArrayBuffer; heights: Float32Array | null; fetchMs: number; ready: number };
+type Ready = { job: WorldWorkerRequest; pbf: ArrayBuffer; heights: Float32Array | null; fetchMs: number; ready: number; times: JobTimes };
 
 let jobsPort: MessagePort | null = null;
 const builders: { port: MessagePort; busy: boolean }[] = [];
@@ -96,10 +100,12 @@ let limit = Infinity;
 const fetching = new Map<number, AbortController>();
 // the jobs that wait for a build worker
 const ready: Ready[] = [];
+// the jobs of both, by id: for prioritize
+const pending = new Map<number, WorldWorkerRequest>();
 
 /** The vector tile, null when the server has none for it (open ocean at high zoom, ...). */
-async function fetchTile(url: string, signal: AbortSignal): Promise<ArrayBuffer | null> {
-  const response = await fetch(url, { signal });
+async function fetchTile(url: string, signal: AbortSignal, low: boolean): Promise<ArrayBuffer | null> {
+  const response = await fetch(url, { signal, priority: low ? 'low' : 'auto' });
   if (response.status === 204 || response.status === 404) return null;
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
   return response.arrayBuffer();
@@ -111,27 +117,38 @@ function report(event: FetchJobEvent): void {
 
 async function start(job: WorldWorkerRequest): Promise<void> {
   const began = performance.now();
+  const times: JobTimes = { received: jobClock(), pbf: 0, heights: 0, ready: 0, dispatched: 0, buildStart: 0, buildEnd: 0 };
   const abort = new AbortController();
   fetching.set(job.id, abort);
+  pending.set(job.id, job);
   try {
     // the heights of the ground, in parallel with the vector tile
-    const [pbf, heights] = await Promise.all([fetchTile(job.url, abort.signal), job.elevation ? getHeights(job) : null]);
+    const [pbf, heights] = await Promise.all([
+      fetchTile(job.url, abort.signal, job.margin).then((data) => (times.pbf = jobClock(), data)),
+      job.elevation ? getHeights(job).then((data) => (times.heights = jobClock(), data)) : null,
+    ]);
     // cancelled meanwhile: the pool has dropped it
     if (abort.signal.aborted) return;
     fetching.delete(job.id);
     // No data for this tile. On the terrain it still gets its ground.
-    if (!pbf && !heights) return void report({ id: job.id, empty: true });
+    if (!pbf && !heights) {
+      pending.delete(job.id);
+      return void report({ id: job.id, empty: true });
+    }
     const now = performance.now();
-    ready.push({ job, pbf: pbf ?? new ArrayBuffer(0), heights, fetchMs: now - began, ready: now });
+    times.ready = jobClock();
+    ready.push({ job, pbf: pbf ?? new ArrayBuffer(0), heights, fetchMs: now - began, ready: now, times });
     dispatch();
   } catch (err: any) {
     if (abort.signal.aborted) return;
     fetching.delete(job.id);
+    pending.delete(job.id);
     report({ id: job.id, error: String(err?.message ?? err) });
   }
 }
 
 function cancel(id: number): void {
+  pending.delete(id);
   const abort = fetching.get(id);
   if (abort) {
     fetching.delete(id);
@@ -143,17 +160,25 @@ function cancel(id: number): void {
   // else it is with a build worker (or done): its result is dropped by the pool
 }
 
-/** The ready jobs to the build workers that are free, the job that was asked for first (the lowest id) first. */
+/**
+ * The ready jobs to the build workers that are free: the jobs of the view before those ahead of it (margin), the job that
+ * was asked for first (the lowest id) first.
+ */
 function dispatch(): void {
   while (ready.length > 0) {
     const builder = builders.find((b, i) => i < limit && !b.busy);
     if (!builder) return;
     let first = 0;
-    for (let i = 1; i < ready.length; i++) if (ready[i].job.id < ready[first].job.id) first = i;
+    for (let i = 1; i < ready.length; i++) {
+      const a = ready[i].job, b = ready[first].job;
+      if (a.margin !== b.margin ? !a.margin : a.id < b.id) first = i;
+    }
     const [next] = ready.splice(first, 1);
+    pending.delete(next.job.id);
     builder.busy = true;
+    next.times.dispatched = jobClock();
     const message: WorldBuildMessage = {
-      job: next.job, pbf: next.pbf, heights: next.heights, fetchMs: next.fetchMs, waitMs: performance.now() - next.ready,
+      job: next.job, pbf: next.pbf, heights: next.heights, fetchMs: next.fetchMs, waitMs: performance.now() - next.ready, times: next.times,
     };
     builder.port.postMessage(message, next.heights ? [next.pbf, next.heights.buffer] : [next.pbf]);
   }
@@ -169,6 +194,10 @@ ctx.onmessage = (e: MessageEvent<FetchWorkerMessage>) => {
       const m = event.data;
       if ('start' in m) void start(m.start);
       else if ('cancel' in m) cancel(m.cancel);
+      else if ('prioritize' in m) {
+        const job = pending.get(m.prioritize);
+        if (job) job.margin = false;
+      }
       else {
         limit = m.limit;
         dispatch();

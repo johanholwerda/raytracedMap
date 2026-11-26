@@ -289,6 +289,8 @@ export default class MapWorld {
       // for setting params from the console between runs
       (window as any).__mapWorld = this;
     }
+    // for video/tileLatency.mjs, which reads the timings and moves the camera
+    if (urlParams.has('tileTimings')) (window as any).__mapWorld = this;
     if (urlParams.has('video')) this.video = this.createVideo();
     this.renderer.setClearColor(0, 0, 0, 1);
 
@@ -415,6 +417,8 @@ export default class MapWorld {
    */
   private async startTiles(urlParams: URLSearchParams, canvasParent: HTMLElement): Promise<{ urlCamera: UrlCamera | null; city?: City }> {
     // ?workers=4: the number of map workers, for timings (default: see WorldWorkerPool)
+    // ?jobsPerWorker=3: the jobs under way per worker, for timings (see WorldWorkerPool.capacity)
+    if (urlParams.has('jobsPerWorker')) WorldWorkerPool.JOBS_PER_WORKER = parseFloat(urlParams.get('jobsPerWorker')!);
     this.workerPool = new WorldWorkerPool(parseInt(urlParams.get('workers') ?? '') || undefined, this.elevation);
     // 1 of them until the map has drawn its first START_FRAMES frames (update lifts it): until then the GPU process
     // starts up and compiles the pipelines next to them. With all cores busy the WebGPU device took 2 s instead of 0.6 s
@@ -435,6 +439,10 @@ export default class MapWorld {
     });
     // on by default, see the elevation param
     this.tileStreamer.setElevation(this.elevation);
+    // ?prefetchMargin=1: no tiles asked for ahead of the view, for timings (see WorldTileStreamer.PREFETCH_MARGIN)
+    if (urlParams.has('prefetchMargin')) WorldTileStreamer.PREFETCH_MARGIN = parseFloat(urlParams.get('prefetchMargin')!);
+    // ?tileTimings: the way of each tile from wanted to drawn, for video/tileLatency.mjs
+    if (urlParams.has('tileTimings')) this.tileStreamer.timings = [];
 
     // Start on one of a few well-known cities (pickStartCity). The projection
     // is centered on it so vertex coordinates stay small (fp32 precision).
@@ -968,7 +976,8 @@ export default class MapWorld {
 
     const cameraMoving = this.camera.changed;
     this.updateUrl(cameraMoving);
-    if (!this.tileStreamer.isIdle()) {
+    // not the tiles ahead of the view: the image converges while they come
+    if (!this.tileStreamer.isViewIdle()) {
       this.loadingCooldown = 0.5;
     } else {
       this.loadingCooldown = Math.max(0, this.loadingCooldown - this.renderer.time.dt);
@@ -982,6 +991,7 @@ export default class MapWorld {
 
     this.updateSnow();
     this.draw(this.dirty, cameraMoving, tilesLoading, cityTilesChanged);
+    this.tileStreamer.frameSubmitted();
     this.dirty = false;
     // all map workers from here on, see startTiles
     if (this.startFrames > 0 && --this.startFrames === 0) this.workerPool.activeLimit = this.workerPool.size;

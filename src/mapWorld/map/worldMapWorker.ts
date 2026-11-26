@@ -1,5 +1,7 @@
 import { buildWorldTile } from './worldGeometryCore';
 import type { WorldTileResult } from './worldGeometryCore';
+import { jobClock } from './jobTimes';
+import type { JobTimes } from './jobTimes';
 import type { LatLngBounds } from '../osm/osmGeometryCore';
 import type { TileCoord } from '../osm/PDOKTileService';
 
@@ -23,6 +25,9 @@ export type WorldWorkerRequest = {
   wantTrees: boolean;
   // the ground has heights (m, see ElevationService.getTileGrid), relative to the ground at the center of bounds. False: flat
   elevation: boolean;
+  // asked for ahead of the view (WorldTileStreamer.PREFETCH_MARGIN): fetched at a low priority, built after the jobs of
+  // the view, until the pool says it is in view (FetchJobMessage prioritize)
+  margin: boolean;
 };
 
 /** From the main thread, once: the port to the fetch worker. */
@@ -38,6 +43,7 @@ export type WorldBuildMessage = {
   heights: Float32Array | null;
   fetchMs: number;
   waitMs: number;
+  times: JobTimes;
 };
 
 /** To the fetch worker: the job is built. */
@@ -52,6 +58,7 @@ export type WorldWorkerReply = {
   fetchMs: number;
   waitMs: number;
   buildMs: number;
+  times: JobTimes;
 };
 
 // Minimal worker-scope typing (see osm/mapWorker.ts for why).
@@ -63,8 +70,9 @@ type WorkerCtx = {
 const ctx = self as unknown as WorkerCtx;
 
 function build(msg: WorldBuildMessage, port: MessagePort): void {
-  const { job, heights } = msg;
+  const { job, heights, times } = msg;
   const start = performance.now();
+  times.buildStart = jobClock();
   try {
     const result: WorldTileResult = buildWorldTile(
       new Uint8Array(msg.pbf),
@@ -85,9 +93,11 @@ function build(msg: WorldBuildMessage, port: MessagePort): void {
       if (result.buildings.trace) transfers.push(result.buildings.trace.words.buffer, result.buildings.trace.ids.buffer);
     }
     if (heights) transfers.push(heights.buffer);
-    ctx.postMessage({ id: job.id, result, heights, fetchMs: msg.fetchMs, waitMs: msg.waitMs, buildMs: performance.now() - start }, transfers);
+    times.buildEnd = jobClock();
+    ctx.postMessage({ id: job.id, result, heights, fetchMs: msg.fetchMs, waitMs: msg.waitMs, buildMs: performance.now() - start, times }, transfers);
   } catch (err: any) {
-    ctx.postMessage({ id: job.id, error: String(err?.message ?? err), fetchMs: msg.fetchMs, waitMs: msg.waitMs, buildMs: performance.now() - start });
+    times.buildEnd = jobClock();
+    ctx.postMessage({ id: job.id, error: String(err?.message ?? err), fetchMs: msg.fetchMs, waitMs: msg.waitMs, buildMs: performance.now() - start, times });
   }
   const done: WorldBuildDone = { done: job.id };
   port.postMessage(done);
