@@ -1,7 +1,7 @@
 import Renderer from 'webGPU-framework/renderer/render/Renderer';
 import Vector3 from 'webGPU-framework/renderer/math/Vector3';
 import Matrix4x4 from 'webGPU-framework/renderer/math/Matrix4x4';
-import InformationOverlay from '../mapOSM/InformationOverlay';
+import InformationOverlay from './osm/InformationOverlay';
 import WorldTileStreamer from './map/WorldTileStreamer';
 import { fetchNominatimAddress } from './map/nominatimAddress';
 

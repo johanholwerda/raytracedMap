@@ -25,7 +25,8 @@ export default class WaterRippleTexture {
     this.sampler = renderer.device.createSampler({
       addressModeU: 'repeat', addressModeV: 'repeat',
       magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
-      maxAnisotropy: 8,
+      // far away a pixel is many times longer along the view than across, see getRippleNormal of waterReflection.wgsl
+      maxAnisotropy: 16,
     });
     this.wavelength = this._wavelength;
   }

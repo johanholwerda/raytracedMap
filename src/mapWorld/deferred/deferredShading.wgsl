@@ -1,5 +1,5 @@
 // The shading of MapWorld from its gBuffer (see MapGBuffer.ts), once per pixel: the forward shading of
-// mapOSM/shading.wgsl (sun with the VSM cascades, sky times the albedo, fog, dither, selection highlight) with the
+// osm/shading.wgsl (sun with the VSM cascades, sky times the albedo, fog, dither, selection highlight) with the
 // sky visibility lightmap in place of the sky term when it is enabled. The forward pass did the lightmap
 // gather for every fragment of the overdraw, which made it the most expensive pass.
 // The water reflects the buildings: a ray from a water pixel, mirrored on its normal, traced against the city
@@ -17,6 +17,8 @@ struct Uniforms {
   inverseProjection : mat4x4<f32>,
   inverseView : mat4x4<f32>,
   viewProjection : mat4x4<f32>,
+  // the sun's view of the ground for the ray traced shadows (SUN_SHADOWS 2 and 3), see terrainSun.wgsl
+  terrainSunViewProjection : mat4x4<f32>,
   cameraPosition : vec3<f32>,
   resolution : vec2<f32>,
   lightDirection : vec3<f32>,
@@ -81,6 +83,12 @@ struct Uniforms {
   skyReflection : f32,
   // how much brighter the glints of the sun get at grazing angles, by the same fresnel term: 0 the same at every angle
   sunFresnel : f32,
+  // how far a point goes off its surface before it is compared with terrainSunMap, see getTerrainSunShadow
+  terrainSunOffset : f32,
+  // the ground in the water reflections (REFLECT_BUILDINGS), see terrainHorizonLookup.wgsl: 0 skips it
+  reflectTerrainInWater : u32,
+  terrainReflectionTop : f32,
+  terrainReflectionBias : f32,
 };
 
 // the reflectance of water seen straight down (index of refraction 1.33)
@@ -163,6 +171,14 @@ struct ShadowMapData {
 // the reflection rays of the water at half resolution (REFLECTIONS_HALF_RES): x 0 no water, .5 the ray reaches the sky, 1
 // it hits a building, yzw the ray, see waterReflectionHalfRes.wgsl
 @group(0) @binding(24) var reflectionTexture : texture_2d<f32>;
+// the ground as the sun sees it (TerrainSunMap.ts): the hills for the ray traced sun shadows, see terrainSun.wgsl
+@group(0) @binding(25) var terrainSunMap : texture_2d<f32>;
+// the height map of the ground it is made from, for the ground in the water reflections, see TerrainSunMap.bindHeights
+@group(0) @binding(26) var terrainHeights : texture_2d<f32>;
+@group(0) @binding(27) var terrainMaxHeights : texture_2d<f32>;
+@group(0) @binding(28) var terrainMaxHeightsFine : texture_2d<f32>;
+// the horizon of the ground per block of pixels and the color of it, see WaterTerrainHorizon.ts
+@group(0) @binding(29) var terrainHorizon : texture_2d<f32>;
 
 // SSAO_SKY: the part of the sky the SSAO sees around the pixel, relative to an open point (1), like the composite
 // (reprojectedSSAOComposite.wgsl) applies it: faded in over its first samples, times its amount. No fog fade: the fog
@@ -218,15 +234,25 @@ fn shadowCascade(uv : vec2<f32>, i : u32, dist : f32) -> f32 {
   return smoothstep(uniforms.VSMBleedThreshold, 1.0, max(lit, s));
 }
 
+// how many texels of a cascade a point goes off its surface along its normal before the lookup: the ground at a low sun
+// spans many texels along the sun (tens of meters each in the far cascades), its own heights in them would shadow it
+const SHADOW_NORMAL_OFFSET = 1.5;
+
+// the size of a texel of cascade i in world units: its half-extent is 1 over the length of the first row of its matrix
+fn shadowTexelSize(i : u32) -> f32 {
+  let m = shadowMapData[i].shadowMapViewProjection;
+  return 2.0 / (f32(textureDimensions(shadowMaps).x) * length(vec3<f32>(m[0].x, m[1].x, m[2].x)));
+}
+
 // The cascades front to back, each taking its weight (1 inside, fading out over its edge) of what the ones before it
 // left. Each cascade is re-rendered around a center of its own, so the next one need not cover the edge of the one
 // before it: that point goes on to the first one that does. What no cascade covers is lit, so past the last cascade the
 // shadows fade out instead of ending at a hard edge.
-fn getShadowMap(p : vec3<f32>) -> f32 {
+fn getShadowMap(p : vec3<f32>, n : vec3<f32>) -> f32 {
   var shadow = 0.0;
   var remaining = 1.0;
   for (var i = 0u; i < 4u; i++) {
-    let u = shadowUVDepthStrength(p, i);
+    let u = shadowUVDepthStrength(p + n * (SHADOW_NORMAL_OFFSET * shadowTexelSize(i)), i);
     if (u.w > 0.0) {
       shadow += remaining * u.w * shadowCascade(u.xy, i, u.z);
       remaining *= 1.0 - u.w;
@@ -267,18 +293,19 @@ fn getRayTracedShadow(world : vec3<f32>, n : vec3<f32>, d : f32, coord : vec2<u3
 
 // the sun the point gets, 0 to 1, see SUN_SHADOWS. lightmapSun: with SUN_SHADOWS 2 and LIGHTMAP_ENABLED, the sun
 // visibility of the lightmap texels of the surface point and the paths it holds (zw of getLightmapLookup), lit where it
-// has none yet
+// has none yet. The rays trace only the buildings and the trees: the hills come from the sun's view of the ground
+// (getTerrainSunShadow). The cascades have the ground in them
 fn getSunShadow(world : vec3<f32>, n : vec3<f32>, d : f32, coord : vec2<u32>, lightmapSun : vec2<f32>) -> f32 {
   if (SUN_SHADOWS == 0u) {
     return 1.;
   }
   if (SUN_SHADOWS == 2u && LIGHTMAP_ENABLED) {
-    return select(1., lightmapSun.x, lightmapSun.y > 0.);
+    return select(1., lightmapSun.x, lightmapSun.y > 0.) * getTerrainSunShadow(world, n);
   }
   if (SUN_SHADOWS >= 2u) {
-    return getRayTracedShadow(world, n, d, coord);
+    return getRayTracedShadow(world, n, d, coord) * getTerrainSunShadow(world, n);
   }
-  return getShadowMap(world);
+  return getShadowMap(world, n);
 }
 
 fn cascadeDebugColor(p : vec3<f32>) -> vec3<f32> {
@@ -429,7 +456,7 @@ fn getHalfResReflection(coord : vec2<u32>, rd : vec3<f32>) -> f32 {
 // d is the horizontal (xz) distance to the camera, not the 3d one: the map is loaded in a radius around the camera in
 // xz, and a camera that goes up and looks down gets no more fog (the far plane reaches past it, see
 // MapWorld.applyViewDistanceMax).
-// The same in deferredShading.wgsl, cars.wgsl, reprojectedSSAOComposite.wgsl and mapOSM/shading.wgsl.
+// The same in deferredShading.wgsl, cars.wgsl, reprojectedSSAOComposite.wgsl and osm/shading.wgsl.
 fn getFog(d : f32) -> f32 {
   let end = select(1., 1. - smoothstep(.7 * uniforms.viewDistanceMax, uniforms.viewDistanceMax, d), uniforms.viewDistanceMax > 0.);
   return 1. - exp(-d * uniforms.distanceFog) * end;
@@ -544,7 +571,8 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
     c += albedo * ((n.y * .5 + .5) * getSSAO(coord)) * skyColor;
   }
 
-  // the water reflects a building: darker. The ray mirrored on the normal of the water goes up, it can only hit a building
+  // the water reflects a building or the ground: darker. The ray mirrored on the normal of the water goes up, it can only
+  // hit a building, or the ground where that is higher than the water (isTerrainOccluded)
   if (WATER_REFLECTIONS && ((uniforms.waterMaterials >> materialIndex) & 1u) != 0u) {
     let rd = getWaterReflectionRay(n, world, d);
     // the part of the reflection that hits a building: the ray of the pixel (0 or 1), or the rays of the half resolution
@@ -557,6 +585,16 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
         occluded = select(0., 1., isOccluded(world, rd));
       }
     }
+    // the ground in it, where no building is: the buildings and the trees are in front of the hills more often than
+    // behind them. Its color (terrainColor.a: how much of the mirror has one) goes in with the sky, below
+    var terrainColor = vec4<f32>(0.);
+    if (REFLECT_BUILDINGS) {
+      let terrain = getTerrainReflection(coord, world, rd);
+      if (terrain.occluded) {
+        terrainColor = vec4(terrain.color.rgb, 1.) * (terrain.color.a * (1. - occluded));
+        occluded = 1.;
+      }
+    }
     c *= 1. - uniforms.reflectionDarkening * occluded;
     // the fresnel term (Schlick) of the facet that mirrors the view into rd: its normal is halfway between rd and the
     // direction to the eye, the micro normal of the ripples with WATER_RIPPLES, which makes it vary per ripple
@@ -567,7 +605,9 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
     // the sky in the mirror where it misses the buildings: the water goes to the sky color at grazing angles. Linear,
     // like the shading (getSkyColor is gamma space)
     let sky = getSkyColor(rd, false);
-    c = mix(c, sky * sky, min(fresnel * uniforms.skyReflection, 1.) * (1. - occluded));
+    // and the ground: it is in the mirror in place of the sky, by the same fresnel term
+    let mirror = min(fresnel * uniforms.skyReflection, 1.);
+    c = c * (1. - mirror * (1. - occluded + terrainColor.a)) + (sky * sky * (1. - occluded) + terrainColor.rgb) * mirror;
     if (uniforms.sunReflection > 0. && occluded < 1.) {
       // the sun in the mirror where it sees the sky, in the shadows of the buildings like the sun light of the water.
       // Brighter at grazing angles: 1 straight down, 1 + sunFresnel at the horizon

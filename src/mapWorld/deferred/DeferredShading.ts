@@ -2,7 +2,7 @@ import Renderer from 'webGPU-framework/renderer/render/Renderer';
 import RenderTexture from 'webGPU-framework/renderer/texture/RenderTexture';
 import VertexFragmentShader from 'webGPU-framework/renderer/material/VertexFragmentShader';
 import Camera from 'webGPU-framework/renderer/camera/Camera';
-import cameraRay from '../../irradianceCache/includes/cameraRay.wgsl?raw';
+import cameraRay from '../cameraRay.wgsl?raw';
 import toneMap from 'webGPU-framework/shaders/toneMap.wgsl?raw';
 import r2 from 'webGPU-framework/shaders/r2.wgsl?raw';
 import Texture2D from 'webGPU-framework/renderer/texture/Texture2D';
@@ -13,11 +13,15 @@ import Vector2 from 'webGPU-framework/renderer/math/Vector2';
 import shader from './deferredShading.wgsl?raw';
 import skyVisibilityTrace from '../skyVisibilityLightmap/skyVisibilityTrace.wgsl?raw';
 import CityScene from '../city/CityScene';
-import WaterRippleTexture from '../../deferredRenderer/scene/waterRipples/WaterRippleTexture';
+import WaterRippleTexture from './waterRipples/WaterRippleTexture';
 import { ShadowMode } from '../MapWorldSettings';
 import ReprojectedSSAO, { SSAO_FADE_COUNT } from '../ssao/ReprojectedSSAO';
 import WaterReflectionHalfRes from './WaterReflectionHalfRes';
 import waterReflection from './waterReflection.wgsl?raw';
+import terrainSun from '../terrainSun.wgsl?raw';
+import terrainReflection from './terrainReflection.wgsl?raw';
+import terrainHorizonLookup from './terrainHorizonLookup.wgsl?raw';
+import WaterTerrainHorizon from './WaterTerrainHorizon';
 
 /**
  * Shades the gBuffer of MapWorld into the scene color, once per pixel: see deferredShading.wgsl. The materials take
@@ -40,8 +44,10 @@ export default class DeferredShading {
   constructor(renderer: Renderer) {
     this.renderer = renderer;
     this.material = new VertexFragmentShader(renderer, 'mapDeferredShading', shader, {
-      includes: [toneMap, r2, cameraRay, ...SkyVisibilityLightmap.resolveIncludes, waterReflection, skyVisibilityTrace],
+      includes: [toneMap, r2, cameraRay, ...SkyVisibilityLightmap.resolveIncludes, waterReflection, skyVisibilityTrace, terrainSun, terrainReflection, terrainHorizonLookup],
       defines: CityScene.traceDefines,
+      // about 600 ms to compile on a cold shader cache: the first frames are empty instead of stalled
+      asyncPipeline: true,
     });
     this.material.depthWriteEnabled = false;
     this.material.depthCompare = 'always';
@@ -111,6 +117,28 @@ export default class DeferredShading {
   /** ACES fitted tone mapping of the linear color, the override TONE_MAP of deferredShading.wgsl. */
   public set toneMap(value: boolean) {
     for (const m of this.materials) m.setConstant('TONE_MAP', value);
+  }
+
+  /** The horizons the ground in the water reflections is read from, see setTerrainReflection. */
+  public bindTerrainHorizon(horizon: WaterTerrainHorizon): void {
+    for (const m of this.materials) m.setTexture('terrainHorizon', horizon.target);
+  }
+
+  /**
+   * The ground in the water reflections that trace the buildings (reflectBuildings of setWaterReflections): their rays
+   * are compared with the horizon of the ground around the pixel (getTerrainReflection of terrainHorizonLookup.wgsl),
+   * which WaterTerrainHorizon has to draw before the shading then: where a ray hits the ground, the water mirrors its
+   * color. A pixel without one marches the height map of
+   * TerrainSunMap.bindHeights itself. enabled false skips it, where no ground is high enough above the water (most
+   * places). top: the highest ground, world y, a ray above it ends. bias: how far above the water the rays start, world
+   * units.
+   */
+  public setTerrainReflection(enabled: boolean, top: number, bias: number): void {
+    for (const m of this.materials) {
+      m.setFloat('reflectTerrainInWater', enabled ? 1 : 0);
+      m.setFloat('terrainReflectionTop', top);
+      m.setFloat('terrainReflectionBias', bias);
+    }
   }
 
   /**

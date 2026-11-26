@@ -1,6 +1,7 @@
 import Renderer from 'webGPU-framework/renderer/render/Renderer';
 import WebGPUPreLoader from 'webGPU-framework/renderer/core/WebGPUPreLoader';
 import LogGL from 'webGPU-framework/renderer/core/LogGL';
+import Matrix4x4 from 'webGPU-framework/renderer/math/Matrix4x4';
 import Vector3 from 'webGPU-framework/renderer/math/Vector3';
 import Vector2 from 'webGPU-framework/renderer/math/Vector2';
 import Color from 'webGPU-framework/renderer/math/Color';
@@ -13,19 +14,26 @@ import ParamsGui from 'webGPU-framework/utils/paramsGui/ParamsGui';
 import MapCamera from 'webGPU-framework/utils/camera/MapCamera';
 import RenderTexture from 'webGPU-framework/renderer/texture/RenderTexture';
 import { isMobile } from 'webGPU-framework/renderer/utils/Browser';
-import type { LatLngBounds } from '../mapOSM/osmGeometryCore';
-import { DEFAULT_BOUNDS } from '../mapOSM/layerDefs';
-import MapProjection from '../mapOSM/MapProjection';
+import { clamp } from 'webGPU-framework/renderer/utils/MathUtils';
+import type { LatLngBounds } from './osm/osmGeometryCore';
+import { DEFAULT_BOUNDS } from './osm/layerDefs';
+import MapProjection from './osm/MapProjection';
 import ReprojectedSSAO, { SSAOMode } from './ssao/ReprojectedSSAO';
 import TAA from './taa/TAA';
 import MapGBuffer from './deferred/MapGBuffer';
 import DeferredShading from './deferred/DeferredShading';
 import WaterReflectionHalfRes from './deferred/WaterReflectionHalfRes';
+import WaterTerrainHorizon from './deferred/WaterTerrainHorizon';
 import { NOTABLE_BUILDINGS } from './map/notableBuildings';
 import { describeCity, findCity, pickRandomCity, pickStartCity } from './map/worldCities';
+import type { City } from './map/worldCities';
+import { randomNiceView } from './map/niceViews';
 import OpenFreeMapTileService from './map/OpenFreeMapTileService';
 import WorldWorkerPool from './map/WorldWorkerPool';
-import WorldTileStreamer from './map/WorldTileStreamer';
+import WorldTileStreamer, { PreviewCamera } from './map/WorldTileStreamer';
+import ElevationClient from './map/ElevationClient';
+import { SNOW_SKIP_MARGIN_M, snowLineMeters, SnowParams } from './map/snowLine';
+import TerrainHeightField from './map/TerrainHeightField';
 import TiltShift from './tiltShift/TiltShift';
 import SkyVisibilityLightmap, { LightmapView } from './skyVisibilityLightmap/SkyVisibilityLightmap';
 import type { LightmapBlur } from './skyVisibilityLightmap/SkyVisibilityLightmap';
@@ -38,14 +46,14 @@ import {
 import MapGeometry, { CityMeshes } from './MapGeometry';
 import SunShadows from './SunShadows';
 import WallAtlasView from './city/WallAtlasView';
-import type { ShadowMapAhead } from '../mapOSM/shadowMap/ShadowMap';
+import type { ShadowMapAhead } from './osm/shadowMap/ShadowMap';
 import BuildingPicker from './BuildingPicker';
 import CarTraffic from './cars/CarTraffic';
 import MapWorldUI from './ui/MapWorldUI';
 import AirplaneController from './AirplaneController';
 import OrbitKeyRotation from './OrbitKeyRotation';
 import { TREE_CROWN_COLORS, TREE_TRUNK_COLOR } from './map/worldTrees';
-import WaterRippleTexture from '../deferredRenderer/scene/waterRipples/WaterRippleTexture';
+import WaterRippleTexture from './deferred/waterRipples/WaterRippleTexture';
 import KeyListener from 'webGPU-framework/utils/input/KeyListener';
 import { KEY_P } from 'webGPU-framework/utils/input/Key';
 import { saveCanvasToDisk } from 'webGPU-framework/utils/image/ImageUtils';
@@ -55,6 +63,50 @@ import { saveCanvasToDisk } from 'webGPU-framework/utils/image/ImageUtils';
 // qualities had amount 1, rayMarchSteps 6 (1 on low), randomStep on medium. Cost at 4K (3080): 0.55 ms with 6 steps,
 // 0.19 ms with 1 (only the contact occlusion), 0.20 ms with randomStep (~44% of the occlusion).
 const SSAO_ENABLED = false;
+// 1 / seconds: how fast the orbit pivot eases to the ground under it, and how close (m) it snaps onto it, see followGround
+const PIVOT_GROUND_RATE = 6;
+const PIVOT_GROUND_SNAP_M = .01;
+// the orbit camera: the pitch (eulerX, radians, always a bit down) and the distance to the pivot (world units)
+const CAMERA_PITCH_MIN = -1.4;
+const CAMERA_PITCH_MAX = -.2;
+const CAMERA_DISTANCE_MIN = .1;
+const CAMERA_DISTANCE_MAX = 2;
+// what it starts with: the pitch and the distance (the yaw is 0), and its lens
+const CAMERA_PITCH_START = -.7;
+const CAMERA_DISTANCE_START = 1;
+const CAMERA_FOV = 1;
+const CAMERA_NEAR = .01;
+// The water reflects the ground (MapWorld.updateTerrainReflection) only where the highest loaded ground is this much
+// above the lowest, m: below it no hill is high enough to show in the water, and the rays skip the height map
+const TERRAIN_REFLECTION_RELIEF_M = 20;
+// the rays start this far above the water, m: the water lies on the ground of the height map, see traceTerrain
+const TERRAIN_REFLECTION_BIAS_M = .5;
+// The frames the page draws with 1 map worker before the others join in, see MapWorld.startTiles: the first frames
+// compile the pipelines, which the GPU process does on the cores the workers would take
+const START_FRAMES = 4;
+// ms the orbit camera has to stand still before its view goes into the URL, see updateUrl
+const URL_CAMERA_DELAY_MS = 500;
+// ms after the last input (pointer, wheel, key) in which the camera moving counts as the user moving it: the zoom
+// easing and the rotation inertia run on after the input, a random city or a searched place loads a bit after the click
+const USER_INPUT_WINDOW_MS = 2000;
+
+/**
+ * The orbit camera in the URL: ?lat=&lng= the pivot (the ground point it orbits), dist= its distance to the pivot in
+ * meters, pitch= and yaw= in degrees (pitch < 0: looking down). The time of day preset goes in as ?time=, see TIMES_OF_DAY.
+ */
+type UrlCamera = { lat: number; lng: number; dist: number; pitch: number; yaw: number };
+
+/** The camera of the URL, or null without a (valid) lat and lng. The missing others are NaN. */
+function parseUrlCamera(params: URLSearchParams): UrlCamera | null {
+  const num = (key: string) => {
+    const value = params.get(key);
+    return value === null || value.trim() === '' ? NaN : Number(value);
+  };
+  const lat = num('lat');
+  const lng = num('lng');
+  if (!(Math.abs(lat) <= 85) || !(Math.abs(lng) <= 180)) return null;
+  return { lat, lng, dist: num('dist'), pitch: num('pitch'), yaw: num('yaw') };
+}
 
 /**
  * The sandbox page loads eruda (the mobile console, a cogwheel + wrench button) for every example on mobile. MapWorld
@@ -97,7 +149,14 @@ export default class MapWorld {
   private orbitKeys!: OrbitKeyRotation;
   private bounds: LatLngBounds = DEFAULT_BOUNDS;
   private workerPool!: WorldWorkerPool;
+  // the frames to draw before all map workers work, see startTiles
+  private startFrames: number = START_FRAMES;
   private tileService: OpenFreeMapTileService = new OpenFreeMapTileService();
+  // The heights of the ground: the tiles are built on it while the elevation param is on, see applyElevation
+  private elevation: ElevationClient = new ElevationClient();
+  private elevationParam!: ParamBool;
+  // the ground of the loaded tiles, for the cars, the camera pivot and the plane (empty with the elevation off: flat 0)
+  private heightField!: TerrainHeightField;
   private drawMode!: ParamSelect;
   private quality!: ParamSelect;
   private timeOfDay!: ParamSelect;
@@ -108,9 +167,22 @@ export default class MapWorld {
   private cap60!: ParamBool;
   // The rAF time of the last rendered frame, ms.
   private lastFrameTime: number = -Infinity;
+  // the user moved the camera or changed the time of day since the URL was last written, the time (performance.now) the
+  // camera last moved and of the last user input, see updateUrl
+  private urlPending: boolean = false;
+  private cameraStillSince: number = 0;
+  private lastInputTime: number = -Infinity;
+  // ?time=sunset: the time of day preset to start with, see init
+  private urlTimeOfDay?: TimeOfDay;
   // QualitySettings.forward of the quality param
   private forward: boolean = false;
   private drawBuildings!: ParamBool;
+  // the trees of a tile are left out of the gBuffer where the sphere around the largest is smaller than this many
+  // pixels, see WorldTileStreamer.cullTrees. The sphere is 23 m at most: 1 pixel is beyond the city tiles of the farthest
+  // camera. Measured (video/treeCullBench.mjs, the Veluwe at 1.8 km, 1264x649): 3 leaves out the trees of half the tiles,
+  // the gBuffer 0.60 -> 0.36 ms per frame (no trees: 0.22), the image differs 0.2 / 255 on average, at the horizon:
+  // their shadows and the sky visibility of the lightmap keep them
+  private treeCullPixels!: ParamFloat;
   private clearColor = Color.fromHex('#b8dbff');
   private logDrawInfo!: ParamBool;
   private distanceFog!: ParamFloat;
@@ -124,6 +196,11 @@ export default class MapWorld {
   private reflectionRays!: ParamSelect;
   // traces them when that is more than 1 pixel, before the shading
   private waterReflection!: WaterReflectionHalfRes;
+  // the ground in the reflections of the buildings, where it is in reach: see updateTerrainReflection. From its horizon
+  // over the water, per block of pixels
+  private terrainHorizon!: WaterTerrainHorizon;
+  private reflectTerrain!: ParamBool;
+  private reflectTerrainInWater = false;
   private reflectionDarkening!: ParamFloat;
   // the water mirrored on the ripples with the sun in it, also without waterReflections (the buildings)
   private waterRipples!: ParamBool;
@@ -142,6 +219,16 @@ export default class MapWorld {
   private sunReflectionPower!: ParamFloat;
   // the gBuffer materials of the water layers, a bit each
   private waterMaterials: number = 0;
+  // the snow on the ground above the snow line of the latitude of the pivot, see updateSnow
+  private snow!: ParamBool;
+  // added to the snow line of snowLine.ts, m
+  private snowLineOffset!: ParamFloat;
+  // how far (m) the noise moves the snow line up and down
+  private snowLineNoise!: ParamFloat;
+  private snowColor!: ParamColor;
+  // see updateSnow
+  private snowPipelineWasPending = false;
+  private snowParams: SnowParams = { enabled: false, line: 0, noise: 0, metersPerUnit: 1, color: new Vector3(1, 1, 1) };
   private projection: MapProjection = new MapProjection();
 
   private geometry!: MapGeometry;
@@ -196,6 +283,10 @@ export default class MapWorld {
     // router5 strips query params on start; bootstrap.ts keeps the original.
     const urlParams = new URLSearchParams(window.location.search || (window as any).__initialSearch || '');
 
+    // The tiles of the first view, before the GPU: asking for the WebGPU device takes half a second or more of waiting,
+    // in which the tiles are fetched and built already (see startTiles). The map draws them in its first frames.
+    const tilesStarted = this.startTiles(urlParams, canvasParent);
+
     this.renderer = new Renderer();
     // ?res=2160: the canvas this many pixels high, for timings at a fixed resolution
     // const res = parseFloat(urlParams.get('res') ?? '');
@@ -207,29 +298,31 @@ export default class MapWorld {
     // SkyVisibilityLightmap. CityScene stays at its 128 MiB whatever the limit
     const requiredLimits: Record<string, GPUSize64> = isMobile() ? {} : { maxStorageBufferBindingSize: 2 ** 32 };
     await this.renderer.init(canvasParent, { sampleCount: 1, pixelRatio: -1, requiredLimits });
-    if (!this.renderer.device) return false;
+    if (!this.renderer.device) {
+      this.workerPool.destroy();
+      return false;
+    }
     // await this.renderer.init(canvasParent, { sampleCount: 1, pixelRatio: 1});
     if (urlParams.has('bench')) {
       this.bench = new MapWorldBench(this.renderer, urlParams);
       // for setting params from the console between runs
       (window as any).__mapWorld = this;
     }
+    // for video/tileLatency.mjs, which reads the timings and moves the camera
+    if (urlParams.has('tileTimings')) (window as any).__mapWorld = this;
     if (urlParams.has('video')) this.video = this.createVideo();
     this.renderer.setClearColor(0, 0, 0, 1);
 
-    // Read the current OpenFreeMap tile URL (it changes with each planet build).
-    await this.tileService.init();
-
     this.camera = new MapCamera(this.renderer, {
-      fov: 1,
-      nearPlane: 0.01,
+      fov: CAMERA_FOV,
+      nearPlane: CAMERA_NEAR,
       farPlane: 10,
-      zPosition: 1,
+      zPosition: CAMERA_DISTANCE_START,
     });
-    this.camera.rotationController.eulerXY = new Vector2(-.7, 0);
+    this.camera.rotationController.eulerXY = new Vector2(CAMERA_PITCH_START, 0);
     // always look a bit down, never from under the map
-    this.camera.rotationController.rotationLimitX = new Vector2(-1.4, -.2);
-    this.camera.setDistanceLimit(.1, 2);
+    this.camera.rotationController.rotationLimitX = new Vector2(CAMERA_PITCH_MIN, CAMERA_PITCH_MAX);
+    this.camera.setDistanceLimit(CAMERA_DISTANCE_MIN, CAMERA_DISTANCE_MAX);
     // Geometry is projected relative to the bounds center (world origin).
     this.camera.pivot.position = new Vector3(0, 0, 0);
     this.airplane = new AirplaneController(this.renderer, this.camera);
@@ -274,11 +367,11 @@ export default class MapWorld {
     this.waterReflection = new WaterReflectionHalfRes(this.renderer);
     this.waterReflection.bindCity(this.skyLightmap.cityScene);
     this.waterReflection.bindWaterRipples(this.ripples);
+    this.terrainHorizon = new WaterTerrainHorizon(this.renderer, this.gBuffer);
+    this.deferred.bindTerrainHorizon(this.terrainHorizon);
     for (const layer of this.geometry.layers) {
       if (layer.def.key === 'water' || layer.def.key === 'waterways') this.waterMaterials |= 1 << this.gBuffer.materialIndex(layer.material);
     }
-    this.workerPool = new WorldWorkerPool();
-
     // Click-to-select buildings; the address comes from Nominatim.
     this.picker = new BuildingPicker(this.renderer, canvasParent, () => this.dirty = true);
 
@@ -287,6 +380,13 @@ export default class MapWorld {
     this.sun = new SunShadows(this.renderer);
     this.wallAtlasView = new WallAtlasView(this.renderer);
     for (const material of this.materials) this.sun.bindResources(material);
+    // the hills for the ray traced sun shadows, which trace only the buildings and the trees
+    for (const material of [...this.deferred.materials, ...this.traffic.materials, ...this.terrainHorizon.materials]) {
+      this.sun.terrainSun.bind(material);
+    }
+    // and its height map for the ground in the water reflections, with the materials of the ground for its color
+    for (const material of [...this.deferred.materials, ...this.terrainHorizon.materials]) this.sun.terrainSun.bindHeights(material);
+    for (const material of this.terrainHorizon.materials) this.sun.terrainSun.bindMaterials(material);
 
     this.ui = new MapWorldUI(canvasParent, {
       getViewBounds: () => this.currentViewBounds(),
@@ -300,31 +400,176 @@ export default class MapWorld {
       },
     });
 
-    this.tileStreamer = new WorldTileStreamer({
+    this.traffic.setHeightField(this.heightField);
+    this.airplane.ground = (x, z) => this.heightField.heightAt(x, z);
+    // where the tiles startTiles asked for go: the built ones wait for the first frame
+    this.tileStreamer.attach({
       renderer: this.renderer,
       camera: this.camera,
-      projection: this.projection,
       layers: this.geometry.layers,
       meshBounds: this.geometry.meshBounds,
-      workerPool: this.workerPool,
-      tileService: this.tileService,
-      onTileError: (msg) => this.ui.showTileError(msg),
       cityScene: this.skyLightmap.cityScene,
       roads: this.traffic,
+      ground: this.geometry.groundBuffer,
     });
+    // on by default, see the elevation param
+    this.geometry.elevation = true;
+
+    const { urlCamera, city, time } = await tilesStarted;
+    // not in a bench: its frames have to compare between runs
+    const timeIndex = TIMES_OF_DAY.indexOf(urlParams.get('time') ?? time ?? '');
+    if (!this.bench && timeIndex >= 0) this.urlTimeOfDay = timeIndex as TimeOfDay;
+    // the user's input, for telling their camera moves from the program's, see updateUrl
+    const markInput = () => this.lastInputTime = performance.now();
+    const inputOptions = { capture: true, passive: true };
+    window.addEventListener('pointerdown', markInput, inputOptions);
+    window.addEventListener('pointermove', (e) => { if (e.buttons) markInput(); }, inputOptions);
+    window.addEventListener('wheel', markInput, inputOptions);
+    window.addEventListener('keydown', markInput, inputOptions);
+    if (city) this.ui.showLocationTitle(city.name, city.landmark || undefined);
+    if (!this.video && !this.bench) this.ui.showControlsHint();
+
+    // the place is set and its tiles are asked for (startTiles): the rest of loadFromBounds
+    this.resetView();
+    if (urlCamera) this.applyUrlCamera(urlCamera);
+    return true;
+  }
+
+  /**
+   * What the tiles need, none of it the GPU, and the requests for the tiles of the view the map starts with: the
+   * workers, the tile service, the place (the projection centered on it) and the streamer, which asks for the tiles
+   * of a PreviewCamera with that view (WorldTileStreamer.prefetch). Returns the camera of the URL (null without) and
+   * the city the map starts on (undefined with a URL camera).
+   */
+  private async startTiles(urlParams: URLSearchParams, canvasParent: HTMLElement): Promise<{ urlCamera: UrlCamera | null; city?: City; time?: string }> {
+    // ?workers=4: the number of map workers, for timings (default: see WorldWorkerPool)
+    // ?jobsPerWorker=3: the jobs under way per worker, for timings (see WorldWorkerPool.capacity)
+    if (urlParams.has('jobsPerWorker')) WorldWorkerPool.JOBS_PER_WORKER = parseFloat(urlParams.get('jobsPerWorker')!);
+    this.workerPool = new WorldWorkerPool(parseInt(urlParams.get('workers') ?? '') || undefined, this.elevation);
+    // 1 of them until the map has drawn its first START_FRAMES frames (update lifts it): until then the GPU process
+    // starts up and compiles the pipelines next to them. With all cores busy the WebGPU device took 2 s instead of 0.6 s
+    // (and now and then over 4 s on a machine that was busy with other things, also with 2 workers), with 1 it comes
+    // about as without. And with all workers from the device on, the first tiles were on screen after 1.5 s instead of
+    // 1 s: the first frames took longer. ?earlyWorkers=2 for timings
+    const early = parseInt(urlParams.get('earlyWorkers') ?? '');
+    this.workerPool.activeLimit = Number.isFinite(early) ? early : 1;
+    // Reads the current OpenFreeMap tile URL (it changes with each planet build).
+    const tileService = this.tileService.init();
+    this.heightField = new TerrainHeightField(this.projection);
+    this.tileStreamer = new WorldTileStreamer({
+      projection: this.projection,
+      workerPool: this.workerPool,
+      tileService: this.tileService,
+      onTileError: (msg) => this.ui?.showTileError(msg),
+      heightField: this.heightField,
+    });
+    // on by default, see the elevation param
+    this.tileStreamer.setElevation(this.elevation);
+    // ?prefetchMargin=1: no tiles asked for ahead of the view, for timings (see WorldTileStreamer.PREFETCH_MARGIN)
+    if (urlParams.has('prefetchMargin')) WorldTileStreamer.PREFETCH_MARGIN = parseFloat(urlParams.get('prefetchMargin')!);
+    // ?tileTimings: the way of each tile from wanted to drawn, for video/tileLatency.mjs
+    if (urlParams.has('tileTimings')) this.tileStreamer.timings = [];
 
     // Start on one of a few well-known cities (pickStartCity). The projection
     // is centered on it so vertex coordinates stay small (fp32 precision).
-    // ?city=Paris: always the same city, for timings
-    const cityName = urlParams.get('city');
-    const city = (cityName ? await findCity(cityName) : undefined) ?? pickStartCity();
-    this.bounds = this.boundsAround(city.lat, city.lng);
-    LogGL.log(`[MapWorld] centering on ${describeCity(city)}`);
-    this.ui.showLocationTitle(city.name, city.landmark || undefined);
-    if (!this.video && !this.bench) this.ui.showControlsHint();
+    // ?lat=&lng=(&dist=&pitch=&yaw=): the camera of a shared link, see updateUrl. A bench starts its drags there. Not in
+    // a video, it moves the camera itself.
+    let urlCamera = urlParams.has('video') ? null : parseUrlCamera(urlParams);
+    let city: City | undefined;
+    // a plain page load: half the time one of the NICE_VIEWS (with its time of day) instead of a start city. Not in a
+    // bench, a video, a tile timing run or with ?city=: those want the same start every time
+    let time: string | undefined;
+    const plainLoad = !['video', 'bench', 'tileTimings', 'city'].some((key) => urlParams.has(key));
+    if (!urlCamera && plainLoad && Math.random() < 0.5) {
+      const niceView = randomNiceView();
+      urlCamera = niceView;
+      time = niceView.time;
+    }
+    if (urlCamera) {
+      this.setPlace(this.boundsAround(urlCamera.lat, urlCamera.lng));
+      LogGL.log(`[MapWorld] centering on the URL camera (${urlCamera.lat}, ${urlCamera.lng})`);
+    } else {
+      // ?city=Paris: always the same city, for timings
+      const cityName = urlParams.get('city');
+      city = (cityName ? await findCity(cityName) : undefined) ?? pickStartCity();
+      this.setPlace(this.boundsAround(city.lat, city.lng));
+      LogGL.log(`[MapWorld] centering on ${describeCity(city)}`);
+    }
+    await tileService;
 
-    await this.loadFromBounds(this.bounds);
-    return true;
+    // The view of the first frame: the camera of start() with the camera of the URL (applyUrlCamera), the view distance
+    // of the quality init starts with (the far plane as updateFarPlane has it), the canvas as wide as its parent
+    const view = this.startView(urlCamera);
+    const viewDistance = qualitySettings[this.startQuality].viewDistanceMax;
+    const height = Math.max(view.distance * Math.sin(-view.pitch), 0);
+    const size = canvasParent.getBoundingClientRect();
+    const preview = new PreviewCamera(CAMERA_FOV, CAMERA_NEAR, Math.hypot(viewDistance, height), view.distance, view.pitch, view.yaw,
+      size.width / Math.max(size.height, 1) || 1);
+    this.tileStreamer.setViewDistanceMax(viewDistance);
+    this.tileStreamer.setTerrainStreamingEnabled(true);
+    this.tileStreamer.setCityStreamingEnabled(true);
+    this.tileStreamer.prefetch(preview);
+    return { urlCamera, city, time };
+  }
+
+  /** The quality the map starts with, see the quality param. */
+  private get startQuality(): Quality {
+    return isMobile() ? Quality.Medium : Quality.High;
+  }
+
+  /** The pitch, the yaw and the distance the orbit camera starts with: the ones of the URL where it has them. */
+  private startView(urlCamera: UrlCamera | null): { pitch: number; yaw: number; distance: number } {
+    const toRad = Math.PI / 180;
+    const pitch = urlCamera && Number.isFinite(urlCamera.pitch) ? clamp(urlCamera.pitch * toRad, CAMERA_PITCH_MIN, CAMERA_PITCH_MAX) : CAMERA_PITCH_START;
+    const yaw = urlCamera && Number.isFinite(urlCamera.yaw) ? urlCamera.yaw * toRad : 0;
+    const distance = urlCamera && Number.isFinite(urlCamera.dist)
+      ? clamp(urlCamera.dist * this.projection.metersToNorm, CAMERA_DISTANCE_MIN, CAMERA_DISTANCE_MAX) : CAMERA_DISTANCE_START;
+    return { pitch, yaw, distance };
+  }
+
+  /** The pitch, yaw and distance of the URL (the pivot is at its lat/lng already, setPlace centered there). */
+  private applyUrlCamera(urlCamera: UrlCamera): void {
+    const view = this.startView(urlCamera);
+    this.camera.rotationController.eulerXY = new Vector2(view.pitch, view.yaw);
+    this.camera.distance = view.distance;
+  }
+
+  /**
+   * Writes the orbit camera (lat, lng, dist, pitch, yaw, see UrlCamera) and the time of day to the URL once the camera
+   * has stood still for URL_CAMERA_DELAY_MS, with replaceState: no history entry per view. Only after the user moved
+   * the camera (within USER_INPUT_WINDOW_MS of their input) or changed the time of day: a fresh load, the pivot easing
+   * onto the loaded ground, keep the URL as it is. Not while flying (the plane never stands still), in a bench or a video.
+   */
+  private updateUrl(moving: boolean): void {
+    if (this.bench || this.video || this.airplane.active) return;
+    const now = performance.now();
+    if (moving) {
+      if (now - this.lastInputTime < USER_INPUT_WINDOW_MS) this.urlPending = true;
+      this.cameraStillSince = now;
+      return;
+    }
+    if (!this.urlPending || now - this.cameraStillSince < URL_CAMERA_DELAY_MS) return;
+    this.urlPending = false;
+
+    const pivot = this.camera.pivot.position;
+    const { lat, lng } = this.projection.worldToLatLng(pivot.x, pivot.z);
+    const euler = this.camera.rotationController.eulerXY;
+    // the yaw adds up over the turns: into -180..180
+    const yaw = euler.y - Math.PI * 2 * Math.round(euler.y / (Math.PI * 2));
+    const toDeg = 180 / Math.PI;
+    const params = new URLSearchParams(window.location.search);
+    // the camera's lat / lng win over it on load
+    params.delete('city');
+    params.set('lat', lat.toFixed(6));
+    params.set('lng', lng.toFixed(6));
+    params.set('dist', (this.camera.distance / this.projection.metersToNorm).toFixed(0));
+    params.set('pitch', (euler.x * toDeg).toFixed(2));
+    params.set('yaw', (yaw * toDeg).toFixed(2));
+    params.set('time', TIMES_OF_DAY[this.timeOfDay.value]);
+    const url = `${window.location.pathname}?${params}${window.location.hash}`;
+    if (url !== window.location.pathname + window.location.search + window.location.hash) {
+      window.history.replaceState(window.history.state, '', url);
+    }
   }
 
   /** Bounds centered on the camera pivot, keeping the current span. */
@@ -423,8 +668,22 @@ export default class MapWorld {
     this.tileStreamer.clearAllCityTiles();
     this.picker.clearSelection();
 
+    this.setPlace(bounds);
+    this.resetView();
+  }
+
+  /** The projection centered on a region, for the tiles asked for from now on. */
+  private setPlace(bounds: LatLngBounds): void {
     this.projection.setBounds(bounds);
     this.bounds = bounds;
+    // the ground at the center is at y 0
+    this.elevation.setOrigin(this.projection.latMid, this.projection.lngMid);
+    // the elevation of the tiles around it, while the map tiles are still to be asked for
+    if (this.elevationParam?.value !== false) this.elevation.preload(this.projection.latMid, this.projection.lngMid);
+  }
+
+  /** After setPlace: the camera on the center of the new projection, all that was of the old one gone, the tiles streaming. */
+  private resetView(): void {
     // the sun stands elsewhere at another latitude (before init, applyTimeOfDay does it)
     if (this.timeOfDay) this.applySunAngles();
     // Another projection center: everything the lightmap holds is somewhere else now.
@@ -446,10 +705,14 @@ export default class MapWorld {
   public init(): void {
     const paramGroup = new ParamGroup('controls');
     this.drawMode = paramGroup.addParamSelect('drawMode', DrawMode.Full, DRAW_MODES, { callback: () => this.applyDrawMode() });
-    this.quality = paramGroup.addParamSelect('quality', isMobile() ? Quality.Medium : Quality.High, QUALITIES, { callback: () => this.applyQuality() });
-    // a random one on every load, except in a bench: its frames have to compare between runs
-    const timeOfDay = this.bench ? TimeOfDay.Afternoon : randomTimeOfDay();
-    this.timeOfDay = paramGroup.addParamSelect('timeOfDay', timeOfDay, TIMES_OF_DAY, { callback: () => this.applyTimeOfDay() });
+    this.quality = paramGroup.addParamSelect('quality', this.startQuality, QUALITIES, { callback: () => this.applyQuality() });
+    // the one of the URL, else a random one on every load, except in a bench: its frames have to compare between runs
+    const timeOfDay = this.bench ? TimeOfDay.Afternoon : this.urlTimeOfDay ?? randomTimeOfDay();
+    this.timeOfDay = paramGroup.addParamSelect('timeOfDay', timeOfDay, TIMES_OF_DAY, { callback: () => {
+      this.applyTimeOfDay();
+      // the GUI or a random city changed it: into the URL (once the camera stands still)
+      this.urlPending = true;
+    } });
     this.cap60 = paramGroup.addParamBool('cap60fps', isMobile());
     this.logDrawInfo = paramGroup.addParamBool('logDrawInfo', false);
     const setDirty = () => this.dirty = true;
@@ -477,6 +740,10 @@ export default class MapWorld {
       this.tileStreamer.setTreesEnabled(trees.value);
     } });
     this.tileStreamer.setTreesEnabled(trees.value);
+    this.treeCullPixels = layersGroup.addParamFloat('treeCullPixels', 3, 0, 8, { callback: setDirty });
+    // the heights of the ground (ElevationService), off: the flat ground at 0. The tiles load again
+    this.elevationParam = layersGroup.addParamBool('elevation', true, { callback: () => this.applyElevation() });
+    if (this.elevationParam.value !== this.geometry.elevation) this.applyElevation();
 
     // the albedos of the map (as the params, not squared), in the gBuffer palette and the forward materials
     const pgColors = paramGroup.addGroup('Map colors');
@@ -490,6 +757,8 @@ export default class MapWorld {
     colorParam('buildings', new Vector3(1, 1, 1), (v) => this.geometry.setBuildingColor(v));
     colorParam('ground', new Vector3(.5, .5, .5), (v) => this.geometry.setGroundColor(v));
     this.geometry.layers.forEach((layer, i) => {
+      // the glaciers take the snowColor param
+      if (layer.def.key === 'glacier') return;
       colorParam(layer.def.label, toVector3(layer.def.color), (v) => this.geometry.setLayerColor(i, v));
     });
     colorParam('treeTrunks', toVector3(TREE_TRUNK_COLOR), (v) => this.geometry.setTreeTrunkColor(v));
@@ -497,13 +766,32 @@ export default class MapWorld {
     colorParam('treeCrowns', crownAverage.multiplyScalar(1 / TREE_CROWN_COLORS.length), (v) => this.geometry.setTreeCrownColor(v));
 
     const pgShading = paramGroup.addGroup('Shading');
-    const params = { materials: this.materials, callback: setDirty };
-    this.backgroundColor = pgShading.addParamColor('backgroundColor', this.clearColor.vector3, { ...params, callback: (v) => {
+
+    const sunAndSky = pgShading.addGroup('Sun and Sky');
+
+
+    // the snow above the snow line (see map/snowLine.ts), on the ground and the layers of MapGeometry's SNOW_LAYERS
+    const pgSnow = pgShading.addGroup('Snow');
+    this.snow = pgSnow.addParamBool('snow', true, { callback: setDirty });
+    this.snowLineOffset = pgSnow.addParamFloat('snowLineOffset', 0, -2000, 2000, { callback: setDirty });
+    this.snowLineNoise = pgSnow.addParamFloat('snowLineNoise', 150, 0, 500, { callback: setDirty });
+    // also the albedo of the glaciers (the layer of the landcover class ice)
+    const glacier = this.geometry.layers.findIndex((layer) => layer.def.key === 'glacier');
+    this.snowColor = pgSnow.addParamColor('snowColor', Color.fromHex('#eef2f7').vector3, { callback: (v) => {
+        this.geometry.setLayerColor(glacier, v);
+        this.dirty = true;
+      } });
+    this.geometry.setLayerColor(glacier, this.snowColor.value);
+    pgSnow.collapsed = true;
+
+    const params = { materials: this.shadingMaterials, callback: setDirty };
+    this.backgroundColor = sunAndSky.addParamColor('backgroundColor', this.clearColor.vector3, { ...params, callback: (v) => {
       this.clearColor.setValues(v.x, v.y, v.z, 1);
       this.dirty = true;
     } });
-    this.skyColor = pgShading.addParamColor('skyColor', Color.fromHex('#96a3b0').vector3, params);
-    this.sunColor = pgShading.addParamColor('sunColor', Color.fromHex('#b0a7a0').vector3, params);
+    this.skyColor = sunAndSky.addParamColor('skyColor', Color.fromHex('#96a3b0').vector3, params);
+    this.sunColor = sunAndSky.addParamColor('sunColor', Color.fromHex('#b0a7a0').vector3, params);
+
     this.distanceFog = pgShading.addParamFloat('distanceFog', .25, 0, 1, params);
     this.viewDistanceMax = pgShading.addParamFloat('viewDistanceMax', 8, 3, 12, { ...params, callback: () => {
       this.applyViewDistanceMax();
@@ -517,11 +805,15 @@ export default class MapWorld {
     } });
     this.deferred.toneMap = toneMap.value;
     pgShading.addParamFloat('exposure', 1.5, 0, 4, params);
+
+    const waterGroup = pgShading.addGroup('Water');
+
     // Only with the sky visibility lightmap: it keeps the BVH of the buildings up to date
-    this.waterReflections = pgShading.addParamBool('waterReflections', false, { callback: setDirty });
-    this.reflectionRays = pgShading.addParamSelect('reflectionRays', ReflectionRays.PerPixel, REFLECTION_RAYS, { callback: setDirty });
-    this.reflectionDarkening = pgShading.addParamFloat('reflectionDarkening', .35, 0, 1, { callback: setDirty });
-    this.waterRipples = pgShading.addParamBool('waterRipples', true, { callback: setDirty });
+    this.waterReflections = waterGroup.addParamBool('waterReflections', false, { callback: setDirty });
+    this.reflectTerrain = waterGroup.addParamBool('reflectTerrain', true, { callback: setDirty });
+    this.reflectionRays = waterGroup.addParamSelect('reflectionRays', ReflectionRays.PerPixel, REFLECTION_RAYS, { callback: setDirty });
+    this.reflectionDarkening = waterGroup.addParamFloat('reflectionDarkening', .35, 0, 1, { callback: setDirty });
+    this.waterRipples = waterGroup.addParamBool('waterRipples', true, { callback: setDirty });
     const updateRipples = () => {
       // the bake scales the gradient by the height, which makes the slope of the ripples independent of their wavelength
       this.ripples.material.setFloat('rippleStrength', this.rippleSlope.value * this.ripples.wavelength);
@@ -529,23 +821,26 @@ export default class MapWorld {
       this.ripplesDirty = true;
       this.dirty = true;
     };
-    this.rippleSlope = pgShading.addParamFloat('rippleSlope', .05, 0, .5, { callback: updateRipples });
-    pgShading.addParamFloat('rippleWavelength', this.ripples.wavelength, 1, 50, { callback: (v) => {
+    this.rippleSlope = waterGroup.addParamFloat('rippleSlope', .05, 0, .5, { callback: updateRipples });
+    waterGroup.addParamFloat('rippleWavelength', this.ripples.wavelength, 1, 50, { callback: (v) => {
       this.ripples.wavelength = v;
       updateRipples();
     } });
-    this.rippleSpeed = pgShading.addParamFloat('rippleSpeed', .5, 0, 2, { callback: updateRipples });
-    this.animateWater = pgShading.addParamBool('animateWater', true, { callback: setDirty });
+    this.rippleSpeed = waterGroup.addParamFloat('rippleSpeed', .5, 0, 2, { callback: updateRipples });
+    this.animateWater = waterGroup.addParamBool('animateWater', true, { callback: setDirty });
     updateRipples();
-    this.sunReflection = pgShading.addParamFloat('sunReflection', 8, 0, 16, { callback: setDirty });
-    this.sunReflectionPower = pgShading.addParamFloat('sunReflectionPower', 200, 10, 1000, { callback: setDirty });
+    this.sunReflection = waterGroup.addParamFloat('sunReflection', 8, 0, 16, { callback: setDirty });
+    this.sunReflectionPower = waterGroup.addParamFloat('sunReflectionPower', 200, 10, 1000, { callback: setDirty });
+
     // the fresnel term of the water: the sky it mirrors (scales the fresnel weight) and the glints at grazing angles
-    pgShading.addParamFloat('skyReflection', 1, 0, 4, params);
-    pgShading.addParamFloat('sunFresnel', 4, 0, 16, params);
+    waterGroup.addParamFloat('skyReflection', 1, 0, 4, params);
+    waterGroup.addParamFloat('sunFresnel', 4, 0, 16, params);
+    waterGroup.collapsed = true;
+
     // the sun in the sky (deferred only, the forward pass clears to the background color)
-    pgShading.addParamFloat('sunSize', .02, 0, .1, params);
-    pgShading.addParamFloat('sunGlow', .4, 0, 1, params);
-    this.sun.initParams(pgShading, this.materials, setDirty);
+    sunAndSky.addParamFloat('sunSize', .02, 0, .1, params);
+    sunAndSky.addParamFloat('sunGlow', .4, 0, 1, params);
+    this.sun.initParams(pgShading, this.shadingMaterials, setDirty);
     this.applyTimeOfDay();
 
     this.applyDrawMode();
@@ -576,7 +871,7 @@ export default class MapWorld {
     this.skyLightmap.view = SKY_VISIBILITY_VIEWS[mode] ?? LightmapView.Shaded;
     const shadowView = SHADOW_VIEWS[mode] ?? 0;
     this.deferred.shadowView = shadowView;
-    // the forward shading (mapOSM/shading.wgsl) only has the cascades view
+    // the forward shading (osm/shading.wgsl) only has the cascades view
     for (const m of this.geometry.forwardMaterials) m.setFloat('shadowDebug', mode === DrawMode.ShadowMapCascades ? 1 : 0);
     this.dirty = true;
   }
@@ -610,6 +905,36 @@ export default class MapWorld {
     this.skyColor.setValue(Color.fromHex(settings.skyColor).vector3);
     this.sunColor.setValue(Color.fromHex(settings.sunColor).vector3);
     this.backgroundColor.setValue(Color.fromHex(settings.backgroundColor).vector3);
+    this.dirty = true;
+  }
+
+  /**
+   * The orbit pivot eases to the height of the ground under it, so the camera orbits a point on the terrain and rides
+   * over the hills while panning. Snaps when close: a still camera stops changing, so the map converges.
+   */
+  private followGround(): void {
+    const pivot = this.camera.pivot.position;
+    const ground = this.heightField.heightAt(pivot.x, pivot.z) ?? (this.elevationParam?.value === false ? 0 : null);
+    if (ground === null || ground === pivot.y) return;
+    let y = pivot.y + (ground - pivot.y) * (1 - Math.exp(-PIVOT_GROUND_RATE * Math.min(this.renderer.time.dt, .1)));
+    if (Math.abs(ground - y) < PIVOT_GROUND_SNAP_M * this.projection.metersToNorm) y = ground;
+    this.camera.pivot.setPositionValues(pivot.x, y, pivot.z);
+  }
+
+  /** The elevation param to the tiles (they load again) and the ground (meshes or the flat quad). */
+  private applyElevation(): void {
+    const on = this.elevationParam.value;
+    this.geometry.elevation = on;
+    this.tileStreamer.setElevation(on ? this.elevation : null);
+    this.tileStreamer.clearAllTerrainTiles();
+    this.tileStreamer.clearAllCityTiles();
+    this.picker.clearSelection();
+    // the ground and the buildings move: what the lightmap and the histories hold is somewhere else now
+    this.skyLightmap.reset();
+    this.sun?.shadowMap.reset();
+    this.taa.invalidate();
+    this.ssao?.reset();
+    this.tileStreamer.resetStreamingPosition();
     this.dirty = true;
   }
 
@@ -662,11 +987,17 @@ export default class MapWorld {
     return [...this.deferred.materials, ...this.geometry.forwardMaterials, ...this.traffic.materials];
   }
 
+  // the materials the sun and sky params go to by their names: with the one that shades the ground in the water
+  // reflections
+  private get shadingMaterials() {
+    return [...this.materials, ...this.terrainHorizon.materials];
+  }
+
   /** The building meshes to draw, null while the buildings are hidden. */
   private get visibleCity(): CityMeshes | null {
     if (!this.drawBuildings.value) return null;
     const s = this.tileStreamer;
-    return { meshes: s.cityMeshes, slots: s.cityMeshSlots, tiles: s.cityMeshTiles, quantization: s.cityMeshQuantization };
+    return { meshes: s.cityMeshes, slots: s.cityMeshSlots, tiles: s.cityMeshTiles, quantization: s.cityMeshQuantization, indexCounts: s.cityMeshIndexCounts };
   }
 
   public update(time: number = 0): void {
@@ -685,6 +1016,8 @@ export default class MapWorld {
     if (this.airplane.active) this.airplane.update(this.projection.metersToNorm, this.video?.stick ?? this.ui?.joystickValue);
     else {
       if (!this.video && !this.bench) this.orbitKeys.update(this.ui?.joystickValue);
+      // before the update, which sees whether the camera changed
+      this.followGround();
       this.camera.update();
       // eases out the bank left over from airplane mode
       this.airplane.settle();
@@ -697,7 +1030,9 @@ export default class MapWorld {
     this.geometry.updateFrustum(this.camera);
 
     const cameraMoving = this.camera.changed;
-    if (!this.tileStreamer.isIdle()) {
+    this.updateUrl(cameraMoving);
+    // not the tiles ahead of the view: the image converges while they come
+    if (!this.tileStreamer.isViewIdle()) {
       this.loadingCooldown = 0.5;
     } else {
       this.loadingCooldown = Math.max(0, this.loadingCooldown - this.renderer.time.dt);
@@ -709,8 +1044,13 @@ export default class MapWorld {
       this.traffic.update(this.renderer.time.dt, this.camera, this.renderer.canvas.height);
     }
 
+    this.updateSnow();
+    this.updateTerrainReflection();
     this.draw(this.dirty, cameraMoving, tilesLoading, cityTilesChanged);
+    this.tileStreamer.frameSubmitted();
     this.dirty = false;
+    // all map workers from here on, see startTiles
+    if (this.startFrames > 0 && --this.startFrames === 0) this.workerPool.activeLimit = this.workerPool.size;
     if (this.screenshotRequested) {
       this.screenshotRequested = false;
       const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
@@ -729,13 +1069,43 @@ export default class MapWorld {
   }
 
   /**
+   * The snow line at the latitude of the pivot (snowLineMeters, it hardly changes across the view) into the shading, in
+   * world y: relative to the ground at the projection center. Without elevation the ground is flat at 0: no snow. Dirty
+   * when the line moved, e.g. when the height of the center came in.
+   */
+  private updateSnow(): void {
+    const p = this.snowParams;
+    const metersToNorm = this.projection.metersToNorm;
+    const { lat } = this.projection.worldToLatLng(this.camera.pivot.position.x, this.camera.pivot.position.z);
+    const lineM = snowLineMeters(lat) + this.snowLineOffset.value - this.elevation.originHeight;
+    // off while even the highest loaded ground, at the top of the noise, is below the line: no snow in view, the shading
+    // skips it (most cities)
+    const reachable = this.heightField.maxHeightM + this.snowLineNoise.value > lineM - SNOW_SKIP_MARGIN_M;
+    const enabled = this.snow.value && this.geometry.elevation && reachable;
+    const line = lineM * metersToNorm;
+    if (enabled !== p.enabled || Math.abs(line - p.line) > .5 * metersToNorm) this.dirty = true;
+    p.enabled = enabled;
+    p.line = line;
+    p.noise = this.snowLineNoise.value;
+    p.metersPerUnit = 1 / metersToNorm;
+    p.color = this.snowColor.value;
+    this.geometry.setSnow(p);
+    this.terrainHorizon.setSnow(p, this.geometry.snowMaterial);
+    // a still view draws again when the pipeline of the snow switched on or off is there (the frames before used the old
+    // one): while it is made, and once after
+    const pending = this.geometry.snowPipelinePending;
+    if (pending || this.snowPipelineWasPending) this.dirty = true;
+    this.snowPipelineWasPending = pending;
+  }
+
+  /**
    * In airplane mode the shadow cascades go in front of the plane: it can't look back, so around the pivot most of
    * each cascade would lie behind it, never seen.
    */
   private shadowsAhead(): ShadowMapAhead | null {
     if (!this.airplane.active) return null;
     const origin = this.camera.worldPosition.clone();
-    origin.y = 0;
+    origin.y = this.camera.pivot.worldPosition.y;
     const forward = Vector3.subtract(this.camera.pivot.worldPosition, origin);
     forward.y = 0;
     // the pivot: where the view ray of the screen center hits the ground, the tilt-shift is sharp there
@@ -745,8 +1115,34 @@ export default class MapWorld {
     return { origin, forward, focus };
   }
 
+  /**
+   * Whether the water reflections can have ground in them, into their shaders (reflectTerrainInWater): the rays of the
+   * water march the height map of the ground only where the loaded ground has relief, which most cities on the water
+   * don't. With the highest ground, above which a ray ends. Dirty when it switches.
+   */
+  private updateTerrainReflection(): void {
+    const field = this.heightField;
+    const enabled = this.reflectTerrain.value && this.waterReflections.value && this.skyLightmap.active && this.geometry.elevation &&
+      field.reliefM > TERRAIN_REFLECTION_RELIEF_M;
+    if (enabled !== this.reflectTerrainInWater) this.dirty = true;
+    this.reflectTerrainInWater = enabled;
+    const metersToNorm = this.projection.metersToNorm;
+    const top = enabled ? field.maxHeightM * metersToNorm : 0;
+    const bias = TERRAIN_REFLECTION_BIAS_M * metersToNorm;
+    this.deferred.setTerrainReflection(enabled, top, bias);
+    this.terrainHorizon.setTerrain(top, bias);
+  }
+
   private draw(dirty: boolean, cameraMoving: boolean, tilesLoading: boolean, cityTilesChanged: boolean) {
     let shadowsSettled = true;
+    // the pixels per radian at the center of the screen: the trees too small to see are left out of the gBuffer (not
+    // out of the shadow map: there they cost next to nothing, and a change of the cut would draw all cascades again)
+    const pixelsPerRadian = this.renderer.canvas.height / (2 * Math.tan(this.camera.projection.FOV * 0.5));
+    this.tileStreamer.cullTrees(this.camera.worldPosition, pixelsPerRadian, this.treeCullPixels.value);
+    // the ground casts shadows too, with elevation (without it the flat ground is at 0, what an empty texel means)
+    const ground = this.geometry.elevation ? this.geometry.groundBuffer : null;
+    const groundChanged = this.tileStreamer.consumeGroundChanged();
+    if (groundChanged) this.sun.terrainSun.setDirty();
     // only the shadowMap mode and the debug views of the shadow map need it
     const mode = this.drawMode.value as DrawMode;
     const shadowMapNeeded = this.shadowMode === ShadowMode.ShadowMap || mode === DrawMode.ShadowMap || mode === DrawMode.ShadowMapCascades;
@@ -754,10 +1150,22 @@ export default class MapWorld {
       // the casters may have changed while it was skipped
       if (this.shadowMapSkipped) this.sun.shadowMap.reset();
       this.shadowMapSkipped = false;
-      shadowsSettled = this.sun.update(this.camera, cityTilesChanged,
-        { meshes: this.tileStreamer.cityMeshes, quantization: this.tileStreamer.cityMeshQuantization }, this.shadowsAhead());
+      shadowsSettled = this.sun.update(this.camera, cityTilesChanged || groundChanged,
+        { meshes: this.tileStreamer.cityMeshes, quantization: this.tileStreamer.cityMeshQuantization }, ground, this.shadowsAhead());
     } else {
       this.shadowMapSkipped = true;
+    }
+    // the rays of the ray traced sun shadows don't trace the ground: the hills come from the sun's view of it
+    const rayTracedSun = this.shadowMode === ShadowMode.LightmapRaytrace || this.shadowMode === ShadowMode.Raytrace;
+    // the water reflections march the height map it is made from
+    if (!this.showOverdraw && (rayTracedSun || this.reflectTerrainInWater)){
+      // with the materials of the ground, for its color in the water
+      const field = this.heightField;
+      const metersToNorm = this.projection.metersToNorm;
+      const materials = this.reflectTerrainInWater
+        ? { draw: (viewProjection: Matrix4x4) => this.geometry.drawMaterialMap(viewProjection), top: field.maxHeightM * metersToNorm, bottom: field.minHeightM * metersToNorm }
+        : null;
+      this.sun.updateTerrainSun(this.camera, this.viewDistanceMax.value, ground, materials);
     }
 
     if (this.drawMode.value === DrawMode.ShadowMap) {
@@ -938,12 +1346,15 @@ export default class MapWorld {
       lightmap.setResolveUniforms(this.camera, blur, metersToNorm, this.taa.enabled.value);
       const rippleTile = rippling ? this.ripples.tileSize * metersToNorm : 0;
       // The rays of the buildings in the water: 1 per block of pixels, traced here for the shading to blend, or a ray per
-      // water pixel in the shading. The traced pixel of the blocks rotates for the TAA to average.
+      // water pixel in the shading. The traced pixel of the blocks rotates for the TAA to average, in a static view only:
+      // while the water or the camera moves the TAA blends its history like motion, and the rotation shows as jitter.
       const [blockX, blockY] = REFLECTION_BLOCKS[this.reflectionRays.value];
       const reflectionPass = reflections && reflectBuildings && blockX * blockY > 1 ? this.waterReflection : null;
+      // the ground in them: its horizon over the water, which the rays are compared with
+      if (reflections && reflectBuildings && this.reflectTerrainInWater) this.terrainHorizon.draw(this.camera, this.gBuffer, this.waterMaterials);
       if (reflectionPass) {
         reflectionPass.setBlock(blockX, blockY);
-        reflectionPass.draw(this.camera, this.gBuffer, this.waterMaterials, rippleTile, this.taa.enabled.value);
+        reflectionPass.draw(this.camera, this.gBuffer, this.waterMaterials, rippleTile, this.taa.enabled.value && isStatic);
       }
       this.deferred.setWaterReflections(reflections ? this.waterMaterials : 0, reflectBuildings, this.reflectionDarkening.value, rippleTile,
         this.sunReflection.value, this.sunReflectionPower.value, reflectionPass);
@@ -999,6 +1410,7 @@ export default class MapWorld {
     this.picker?.destruct();
     this.tileStreamer.destruct();
     this.workerPool?.destroy();
+    this.elevation.destroy();
     this.geometry?.destruct();
     this.ssao?.destruct();
     this.traffic?.destruct();
@@ -1007,6 +1419,7 @@ export default class MapWorld {
     this.deferred?.destruct();
     this.ripples?.texture.destruct();
     this.waterReflection?.destruct();
+    this.terrainHorizon?.destruct();
     this.skyLightmap?.destruct();
     this.tiltShift?.destruct();
     this.sun?.destruct();

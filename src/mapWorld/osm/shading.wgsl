@@ -23,6 +23,10 @@ struct VertexOutput {
   // the palette index of a tree vertex, 0xFFFFFFFF for baseColor
   @location(2) @interpolate(flat) treeMaterial : u32,
 #endif
+#ifdef TERRAIN_NORMALS
+  // mapWorld's ground: the smooth normal in .w, see mapWorld/map/terrainNormal.wgsl (included with the define)
+  @location(3) normal : vec3<f32>,
+#endif
 };
 
 struct Uniforms {
@@ -50,6 +54,12 @@ struct Uniforms {
   // QUANTIZED: the decoding of the vertices
   positionScale : vec4<f32>,
   positionOffset : vec4<f32>,
+  // SNOW: the snow on the ground of mapWorld, see mapWorld/snow.wgsl (included with the define) and setSnow of
+  // MapGeometry
+  snowLine : f32,
+  snowNoise : f32,
+  snowMetersPerUnit : f32,
+  snowColor : vec3<f32>,
 };
 
 struct ShadowMapData {
@@ -80,7 +90,16 @@ fn vs_main(input : VertexInput) -> VertexOutput {
   let world = vertex.xyz;
 
   output.position = uniforms.viewProjection * vec4<f32>(world, 1.0);
+#ifdef DEPTH_CLAMP
+  // the sun's orthographic views (SunShadows, TerrainSunMap): a caster in front of the near plane is put on it instead of
+  // clipped ("pancaking"), so a hill far toward a low sun still shadows. What they store is the world height, which this
+  // doesn't change
+  output.position.z = max(output.position.z, 0.0);
+#endif
   output.world = world;
+#ifdef TERRAIN_NORMALS
+  output.normal = decodeTerrainNormal(vertex.w);
+#endif
 #ifdef FEATURE_IDS
   // `.w` is the tile-local feature id, or negative (NO_FEATURE_ID) for untagged
   // geometry. Map "no id" to 0xFFFFFFFF so the index map writes 0 (empty) and it
@@ -136,15 +155,25 @@ fn shadowCascade(uv : vec2<f32>, i : u32, dist : f32) -> f32 {
 	return smoothstep(uniforms.VSMBleedThreshold, 1.0, max(lit, s));
 }
 
+// how many texels of a cascade a point goes off its surface along its normal before the lookup: the ground at a low sun
+// spans many texels along the sun (tens of meters each in the far cascades), its own heights in them would shadow it
+const SHADOW_NORMAL_OFFSET = 1.5;
+
+// the size of a texel of cascade i in world units: its half-extent is 1 over the length of the first row of its matrix
+fn shadowTexelSize(i : u32) -> f32 {
+	let m = shadowMapData[i].shadowMapViewProjection;
+	return 2.0 / (f32(textureDimensions(shadowMaps).x) * length(vec3<f32>(m[0].x, m[1].x, m[2].x)));
+}
+
 // The cascades front to back, each taking its weight (1 inside, fading out over its edge) of what the ones before it
 // left. Each cascade is re-rendered around a center of its own, so the next one need not cover the edge of the one
 // before it: that point goes on to the first one that does. What no cascade covers is lit, so past the last cascade the
 // shadows fade out instead of ending at a hard edge.
-fn getShadowMap(p : vec3<f32>) -> f32 {
+fn getShadowMap(p : vec3<f32>, n : vec3<f32>) -> f32 {
 	var shadow = 0.0;
 	var remaining = 1.0;
 	for (var i = 0u; i < 4u; i++) {
-		let u = shadowUVDepthStrength(p, i);
+		let u = shadowUVDepthStrength(p + n * (SHADOW_NORMAL_OFFSET * shadowTexelSize(i)), i);
 		if (u.w > 0.0) {
 			shadow += remaining * u.w * shadowCascade(u.xy, i, u.z);
 			remaining *= 1.0 - u.w;
@@ -178,7 +207,7 @@ fn cascadeDebugColor(p : vec3<f32>) -> vec3<f32> {
 // d is the horizontal (xz) distance to the camera, not the 3d one: the map is loaded in a radius around the camera in
 // xz, and a camera that goes up and looks down gets no more fog (the far plane reaches past it, see
 // MapWorld.applyViewDistanceMax).
-// The same in deferredShading.wgsl, cars.wgsl, reprojectedSSAOComposite.wgsl and mapOSM/shading.wgsl.
+// The same in deferredShading.wgsl, cars.wgsl, reprojectedSSAOComposite.wgsl and osm/shading.wgsl.
 fn getFog(d : f32) -> f32 {
 	let end = select(1., 1. - smoothstep(.7 * uniforms.viewDistanceMax, uniforms.viewDistanceMax, d), uniforms.viewDistanceMax > 0.);
 	return 1. - exp(-d * uniforms.distanceFog) * end;
@@ -198,9 +227,19 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
   }
 #endif
  var n = normalize(cross(dpdy(input.world), dpdx(input.world)));
+#ifdef TERRAIN_NORMALS
+  n = normalize(input.normal);
+#endif
 
   if (DRAW_DEPTH) {
+#ifdef SUN_DEPTH
+    // TerrainSunMap: how far toward the sun (lightDirection) the surface is. Unlike the height it doesn't change across
+    // the sun: a point compared with the texels next to its own isn't a texel higher or lower than them, which at a low
+    // sun is many texels along it (the stripes of a slope shadowing itself)
+    let d = dot(input.world, uniforms.lightDirection);
+#else
     let d = -input.world.y * 1.;
+#endif
     return vec4<f32>(d, d * d, 0.0, 1.0);
   }
 
@@ -220,9 +259,24 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
 		baseColor = materialPalette[input.treeMaterial].rgb;
 	}
 #endif
+#ifdef SNOW
+	// The hard edge of the snow, antialiased over the change of its field to the next pixels: the field at the point and
+	// normal one pixel over, from their derivatives. Those are taken here, in uniform control flow, so the field is only
+	// evaluated where the snow can reach (isSnowPossible), which fwidth of the field couldn't be in, and at the neighbours
+	// only near the edge (getSnowCoverAt)
+	let dWorldX = dpdx(input.world);
+	let dWorldY = dpdy(input.world);
+	let dNormalX = dpdx(n);
+	let dNormalY = dpdy(n);
+	if (isSnowPossible(input.world.y, uniforms.snowLine, uniforms.snowNoise, uniforms.snowMetersPerUnit)) {
+		let cover = getSnowCoverAt(input.world, n, dWorldX, dNormalX, dWorldY, dNormalY, uniforms.snowLine, uniforms.snowNoise,
+			uniforms.snowMetersPerUnit);
+		baseColor = mix(baseColor, uniforms.snowColor, cover);
+	}
+#endif
 	let albedo = baseColor * baseColor;
 
-	let shadow = mix(1.0, getShadowMap(input.world), uniforms.shadowStrength);
+	let shadow = mix(1.0, getShadowMap(input.world, n), uniforms.shadowStrength);
 
 //	var c = albedo * mix(nDotL * shadow, 1., uniforms.ambient) * (vec3(1.) - skyColor);
 	var c = albedo * sunColor * (nDotL * shadow);

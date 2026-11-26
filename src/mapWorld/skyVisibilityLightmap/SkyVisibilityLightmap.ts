@@ -15,7 +15,7 @@ import BlueNoiseTexture2D16Bits from 'webGPU-framework/utils/texture/BlueNoiseTe
 import { isMobile } from 'webGPU-framework/renderer/utils/Browser';
 import hash from 'webGPU-framework/shaders/hash.wgsl?raw';
 import r2 from 'webGPU-framework/shaders/r2.wgsl?raw';
-import cameraRay from '../../irradianceCache/includes/cameraRay.wgsl?raw';
+import cameraRay from '../cameraRay.wgsl?raw';
 import cityLightmapSurface from '../city/cityLightmapSurface.wgsl?raw';
 import gBufferPacking from '../deferred/mapGBufferPacking.wgsl?raw';
 import cityLightmap from '../city/cityLightmap.wgsl?raw';
@@ -212,10 +212,13 @@ export default class SkyVisibilityLightmap {
 
     const includes = [hash, r2, cameraRay, cityLightmapSurface, gBufferPacking, cityLightmap, skyVisibilityTexel, skyVisibilityTrace];
     const source = updateSkyVisibilityLightmap;
-    this.claimShader = new ComputeShader(renderer, 'claimSkyVisibilityLightmap', source, { includes, defines: CityScene.traceDefines, kernel: 'claim_main' });
-    this.selectShader = new ComputeShader(renderer, 'selectSkyVisibilityLightmap', source, { includes, defines: CityScene.traceDefines, kernel: 'select_main' });
-    this.traceShader = new ComputeShader(renderer, 'traceSkyVisibilityLightmap', source, { includes, defines: CityScene.traceDefines, kernel: 'trace_main' });
-    this.clearSunShader = new ComputeShader(renderer, 'clearSunSkyVisibilityLightmap', source, { includes, defines: CityScene.traceDefines, kernel: 'clear_sun_main' });
+    // compiled without blocking the frames (claim and trace take about 300 ms each on a cold shader cache), update waits
+    // for all of them
+    const options = { includes, defines: CityScene.traceDefines, asyncPipeline: true };
+    this.claimShader = new ComputeShader(renderer, 'claimSkyVisibilityLightmap', source, { ...options, kernel: 'claim_main' });
+    this.selectShader = new ComputeShader(renderer, 'selectSkyVisibilityLightmap', source, { ...options, kernel: 'select_main' });
+    this.traceShader = new ComputeShader(renderer, 'traceSkyVisibilityLightmap', source, { ...options, kernel: 'trace_main' });
+    this.clearSunShader = new ComputeShader(renderer, 'clearSunSkyVisibilityLightmap', source, { ...options, kernel: 'clear_sun_main' });
     this.updateShaders = [this.claimShader, this.selectShader, this.traceShader, this.clearSunShader];
     for (const s of this.updateShaders) {
       s.setConstant('WORK_GROUP_SIZE_X', this.workGroupSizeX);
@@ -545,9 +548,23 @@ export default class SkyVisibilityLightmap {
     const { camera, metersToNorm } = frame;
     if (frame.changed) this.markChanged();
 
+    // the buffers right away: the resolve compiles its LIGHTMAP_ENABLED variant once, not again when they come
     const size = this.getFittingSize(LIGHTMAP_SIZE_OPTIONS[this.sizeParam.value]);
     if (size !== this.size) this.createLightmapBuffers(size);
     this.cityScene.enable();
+    const gBuffer = frame.gBuffer.target;
+    //by the area of the screen, not its height: a portrait screen would get aspect² fewer cells (3.2x at 9:16)
+    const cellSize = Math.max(1, Math.round(this.referenceCellSize.value * this.getPixelScale(gBuffer.width, gBuffer.height)));
+    if (cellSize !== this.cellSize) {
+      this.cellSize = cellSize;
+      for (const s of this.updateShaders) s.setConstant('CELL_SIZE', cellSize);
+    }
+    // nothing more until the pipelines of all the shaders are compiled (see ComputeShader.asyncPipeline), before
+    // anything else changes: the shaders work together, a claim without its trace would leave the claimed texels. After
+    // the constants, a constant that changes after this check would make its pipeline sync
+    let ready = true;
+    for (const s of this.updateShaders) ready = s.ready && ready;
+    if (!ready) return;
     if (this.resetPending) {
       this.renderer.clearBuffer(this.tileBuffer!);
       this.renderer.clearBuffer(this.tileTimeBuffer!);
@@ -577,16 +594,9 @@ export default class SkyVisibilityLightmap {
       this.markChanged();
     }
 
-    const gBuffer = frame.gBuffer.target;
     this.gBufferWidth = gBuffer.width;
     this.gBufferHeight = gBuffer.height;
 
-    //by the area of the screen, not its height: a portrait screen would get aspect² fewer cells (3.2x at 9:16)
-    const cellSize = Math.max(1, Math.round(this.referenceCellSize.value * this.getPixelScale(gBuffer.width, gBuffer.height)));
-    if (cellSize !== this.cellSize) {
-      this.cellSize = cellSize;
-      for (const s of this.updateShaders) s.setConstant('CELL_SIZE', cellSize);
-    }
     const countX = Math.ceil(gBuffer.width / (this.workGroupSizeX * this.cellSize));
     const countY = Math.ceil(gBuffer.height / (this.workGroupSizeY * this.cellSize));
     const cellCount = countX * this.workGroupSizeX * countY * this.workGroupSizeY;

@@ -102,7 +102,7 @@ export type QualitySettings = {
 
 export const qualitySettings: Record<Quality, QualitySettings> = {
   [Quality.VeryHigh]: { viewDistanceMax: 8, forward: false, skyVisibility: true, TAAEnabled: true, tiltShiftEnabled: true, tiltShiftHalfRes: true, lightMapSize: 6144, texelsPerPixel: 1, traceSamplesMax: 4096, sampleCount: 32, referenceCellSize: 1.5, searchCount: 16,lightmapResolution: LightmapResolution.Full, waterReflections: true, reflectionRays: ReflectionRays.PerPixel, waterRipples: true, animateWater: false, pixelRatioMax: -1, carsMSAA: true, carsPerPixelLighting: true, shadowMode: ShadowMode.LightmapRaytrace },
-  [Quality.High]: { viewDistanceMax: 8, forward: false, skyVisibility: true, TAAEnabled: true, tiltShiftEnabled: true, tiltShiftHalfRes: true, lightMapSize: 4096, texelsPerPixel: .6, traceSamplesMax: 1536, sampleCount: 16, referenceCellSize: 2, searchCount: 8,lightmapResolution: LightmapResolution.Full, waterReflections: true, reflectionRays: ReflectionRays.PerPixel, waterRipples: true, animateWater: false, pixelRatioMax: -1, carsMSAA: true, carsPerPixelLighting: true, shadowMode: ShadowMode.LightmapRaytrace },
+  [Quality.High]: { viewDistanceMax: 8, forward: false, skyVisibility: true, TAAEnabled: true, tiltShiftEnabled: true, tiltShiftHalfRes: true, lightMapSize: 4096, texelsPerPixel: .6, traceSamplesMax: 1536, sampleCount: 16, referenceCellSize: 2, searchCount: 8,lightmapResolution: LightmapResolution.Full, waterReflections: true, reflectionRays: ReflectionRays.Half, waterRipples: true, animateWater: false, pixelRatioMax: -1, carsMSAA: true, carsPerPixelLighting: true, shadowMode: ShadowMode.LightmapRaytrace },
   [Quality.Medium]: { viewDistanceMax: 6, forward: false, skyVisibility: true, TAAEnabled: true, tiltShiftEnabled: true, tiltShiftHalfRes: true, lightMapSize: 3072, texelsPerPixel: .3, traceSamplesMax: 256, sampleCount: 8, referenceCellSize: 4, searchCount: 8,lightmapResolution: LightmapResolution.Half, waterReflections: false, reflectionRays: ReflectionRays.Quarter, waterRipples: true, animateWater: false, pixelRatioMax: 2, carsMSAA: false, carsPerPixelLighting: false, shadowMode: ShadowMode.LightmapRaytrace },
   [Quality.Low]: { viewDistanceMax: 4, forward: false, skyVisibility: true, TAAEnabled: true, tiltShiftEnabled: true, tiltShiftHalfRes: true, lightMapSize: 2048, texelsPerPixel: .15, traceSamplesMax: 256, sampleCount: 8, referenceCellSize: 4, searchCount: 8,lightmapResolution: LightmapResolution.HalfBilinear, waterReflections: false, reflectionRays: ReflectionRays.Quarter, waterRipples: false, animateWater: false, pixelRatioMax: 1, carsMSAA: false, carsPerPixelLighting: false, shadowMode: ShadowMode.ShadowMap },
   // the lightmap settings only count when skyVisibility is turned on by hand
@@ -188,9 +188,9 @@ export type TimeOfDaySettings = {
 };
 
 export const timeOfDaySettings: Record<TimeOfDay, TimeOfDaySettings> = {
-  [TimeOfDay.Sunrise]: { sunElevation: .12, sunSide: -1, skyColor: '#4f5663', sunColor: '#ffa866', backgroundColor: '#c9b8b0' },
+  [TimeOfDay.Sunrise]: { sunElevation: .12, sunSide: -1, skyColor: '#4f5663', sunColor: '#ff9466', backgroundColor: '#c9b8b0' },
   [TimeOfDay.Morning]: { sunElevation: .55, sunSide: -1, skyColor: '#657995', sunColor: '#d8b794', backgroundColor: '#bcd4ec' },
-  [TimeOfDay.Noon]: { sunElevation: 1., sunSide: 0, skyColor: '#c7ced6', sunColor: '#60503d', backgroundColor: '#95a5b3' },
+  [TimeOfDay.Noon]: { sunElevation: 1., sunSide: 0, skyColor: '#8998a9', sunColor: '#9b703b', backgroundColor: '#a9bbcc' },
   [TimeOfDay.Afternoon]: { sunElevation: .3, sunSide: 1, skyColor: '#596b80', sunColor: '#dfba9f', backgroundColor: '#b8dbff' },
   [TimeOfDay.Sunset]: { sunElevation: .1, sunSide: 1, skyColor: '#697398', sunColor: '#ff7e33', backgroundColor: '#d4a088' },
 };

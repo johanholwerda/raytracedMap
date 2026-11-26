@@ -16,6 +16,18 @@ function getVertexBufferLayoutId(layout: GPUVertexBufferLayout): number {
   return id;
 }
 
+export type VertexFragmentShaderOptions = ShaderBaseOptions & {
+  /*
+  make a missing pipeline with createRenderPipelineAsync. The driver compiles the shader without blocking the frames: a
+  sync pipeline that is slow to compile stalls the whole GPU process (seconds for a big shader on a cold shader cache).
+  Until it is ready the material draws with the pipeline it used last for the same render target and vertex layout (the
+  old state, like the old value of a constant), or, the first time, the draws are skipped (the pipeline getter returns
+  null). Only for draws that can be missing or a bit off for a few frames, like the scene geometry. Not for one time
+  draws, like a bake, whose result would be lost
+   */
+  asyncPipeline?: boolean;
+}
+
 export default class VertexFragmentShader extends ShaderBase {
   //per material. the shared blit material gets one per render target format, sample count and depth stencil format
   private static readonly MAX_PIPELINES = 64;
@@ -27,12 +39,20 @@ export default class VertexFragmentShader extends ShaderBase {
   //incremented on every pipeline state change so cached render bundles (which bake in the
   //pipeline) can be invalidated. see Renderer.drawCachedBundle
   private _version: number = 0;
-  //by render target, vertex buffer layout and pipeline state (see getID), so switching back to a state reuses its pipeline
+  //by render target, vertex buffer layout and pipeline state (see getTargetKey), so switching back to a state reuses its pipeline
   private pipelines: Map<string, GPURenderPipeline> = new Map();
   //the part of the id for the pipeline state, rebuilt when it changed
   private stateKey: string = '';
   private warnedAboutEviction: boolean = false;
-  private _pipeline!: GPURenderPipeline;
+  //see VertexFragmentShaderOptions.asyncPipeline
+  public asyncPipeline: boolean;
+  //the ids of the pipelines that are being made by createRenderPipelineAsync
+  private pendingPipelines: Set<string> = new Set();
+  //by render target and vertex buffer layout (the id without the state), the pipeline used last. Stands in while the
+  //pipeline of a new state (a constant, the blending) is made async: valid, as it has the same layout and targets
+  private lastPipelines: Map<string, GPURenderPipeline> = new Map();
+  //null: the pipeline of the current id is still being made (asyncPipeline)
+  private _pipeline: GPURenderPipeline | null = null;
   //what _pipeline was looked up for, so the pipeline getter can skip building the id when nothing changed
   private pipelineRenderTarget: RenderTexture | null = null;
   private pipelineMipLevel: number = -1;
@@ -60,9 +80,10 @@ export default class VertexFragmentShader extends ShaderBase {
     renderer: Renderer,
     name: string,
     shaderCode: string,
-    options: ShaderBaseOptions = {},
+    options: VertexFragmentShaderOptions = {},
   ) {
     super(renderer, name, shaderCode, options);
+    this.asyncPipeline = options.asyncPipeline ?? false;
 
     this.constants = new PipelineConstants(this.shaderCode, true);
 
@@ -80,6 +101,12 @@ export default class VertexFragmentShader extends ShaderBase {
 
   public get version(): number {
     return this._version;
+  }
+
+  //whether a pipeline of it is being made async (asyncPipeline): the draws use the one before until it is there, so a
+  //host that only draws when something changed draws again once this is false
+  public get pipelinePending(): boolean {
+    return this.pendingPipelines.size > 0;
   }
 
   private markDirty() {
@@ -263,7 +290,7 @@ export default class VertexFragmentShader extends ShaderBase {
     this.markDirty();
   }
 
-  private createPipeline(renderTarget: RenderTexture, mipLevel:number): GPURenderPipeline {
+  private createPipelineDescriptor(renderTarget: RenderTexture, mipLevel:number): GPURenderPipelineDescriptor {
     const vertexState: GPUVertexState = {
       module:     this.shaderModule,
       entryPoint: 'vs_main',
@@ -336,9 +363,47 @@ export default class VertexFragmentShader extends ShaderBase {
 
       descriptor.depthStencil = depthStencil;
     }
+    return descriptor;
+  }
+
+  private createPipeline(renderTarget: RenderTexture, mipLevel:number): GPURenderPipeline {
+    const descriptor = this.createPipelineDescriptor(renderTarget, mipLevel);
     const pipeline = this.renderer.device.createRenderPipeline(descriptor);
     LogGL.log('created pipeline', this.name, this.pipelines.size + 1, descriptor);
     return pipeline;
+  }
+
+  //starts making the pipeline of id, it is in pipelines when done. Draws skip the material until then
+  private createPipelineAsync(id: string, renderTarget: RenderTexture, mipLevel: number) {
+    const descriptor = this.createPipelineDescriptor(renderTarget, mipLevel);
+    this.pendingPipelines.add(id);
+    const pending = this.pendingPipelines;
+    this.renderer.device.createRenderPipelineAsync(descriptor).then(
+      (pipeline) => {
+        //destructed in the meantime
+        if (pending !== this.pendingPipelines || !pending.delete(id)) return;
+        LogGL.log('created pipeline async', this.name, this.pipelines.size + 1, descriptor);
+        this.storePipeline(id, pipeline);
+      },
+      (error) => {
+        if (pending !== this.pendingPipelines || !pending.delete(id)) return;
+        //a sync one reports the validation error the usual way (an uncaptured error)
+        LogGL.warn('VertexFragmentShader: createRenderPipelineAsync failed, creating it sync', this.name, error);
+        this.storePipeline(id, this.renderer.device.createRenderPipeline(descriptor));
+      },
+    );
+  }
+
+  private storePipeline(id: string, pipeline: GPURenderPipeline) {
+    //a state that keeps changing (an animated depth bias or constant) would otherwise grow the cache without end
+    if (this.pipelines.size >= VertexFragmentShader.MAX_PIPELINES) {
+      this.pipelines.delete(this.pipelines.keys().next().value!);
+      if (!this.warnedAboutEviction) {
+        this.warnedAboutEviction = true;
+        LogGL.warn('VertexFragmentShader: more than', VertexFragmentShader.MAX_PIPELINES, 'pipelines in use, the least recently used ones are created again when needed', this.name);
+      }
+    }
+    this.pipelines.set(id, pipeline);
   }
 
   //everything createPipeline reads apart from the render target and the vertex buffer layout
@@ -352,20 +417,22 @@ export default class VertexFragmentShader extends ShaderBase {
     ].join('_');
   }
 
-  private getID(renderTarget: RenderTexture, mipLevel:number):string{
+  //the id without the pipeline state
+  private getTargetKey(renderTarget: RenderTexture, mipLevel:number):string{
     let id = renderTarget.getSampleCount(mipLevel) + '_' + renderTarget.formats.join('_');
     //the mip level only matters for msaa and the depth stencil attachment, which are only used at mip level 0
     if (renderTarget.depthStencilAttachment && mipLevel == 0) {
       //whether depth and stencil are enabled changes the depth stencil state
       id += '_' + renderTarget.depthStencilAttachment.format + '_' + renderTarget.depthEnabled + '_' + renderTarget.stencilEnabled;
     }
-    return id + '_' + this.vertexBufferLayoutKey + '|' + this.stateKey;
+    return id + '_' + this.vertexBufferLayoutKey;
   }
 
-  public get pipeline(): GPURenderPipeline {
+  //null: made async (asyncPipeline) and not ready yet, skip the draw
+  public get pipeline(): GPURenderPipeline | null {
     const renderTarget = this.renderer.renderTarget;
     const mipLevel =  this.renderer.currentRenderTextureMipLevel;
-    if (!this._dirty && renderTarget === this.pipelineRenderTarget && mipLevel === this.pipelineMipLevel && this.vertexBufferLayoutKey === this.pipelineVertexBufferLayoutKey) {
+    if (this._pipeline && !this._dirty && renderTarget === this.pipelineRenderTarget && mipLevel === this.pipelineMipLevel && this.vertexBufferLayoutKey === this.pipelineVertexBufferLayoutKey) {
       return this._pipeline;
     }
     this.pipelineRenderTarget = renderTarget;
@@ -379,23 +446,23 @@ export default class VertexFragmentShader extends ShaderBase {
 
     //compare on the id, not on the RenderTexture instance: two RenderTextures can share a pipeline
     //and one RenderTexture can need different pipelines per mip level
-    const id = this.getID(renderTarget, mipLevel);
+    const targetKey = this.getTargetKey(renderTarget, mipLevel);
+    const id = targetKey + '|' + this.stateKey;
     let pipeline = this.pipelines.get(id);
     if (pipeline) {
       //to the end: a Map iterates in insertion order, so the first entry is the least recently used one
       this.pipelines.delete(id);
+      this.pipelines.set(id, pipeline);
+    } else if (this.asyncPipeline) {
+      if (!this.pendingPipelines.has(id)) this.createPipelineAsync(id, renderTarget, mipLevel);
+      //not cached in _pipeline: looked up again until the new one is there
+      this._pipeline = null;
+      return this.lastPipelines.get(targetKey) ?? null;
     } else {
-      //a state that keeps changing (an animated depth bias or constant) would otherwise grow the cache without end
-      if (this.pipelines.size >= VertexFragmentShader.MAX_PIPELINES) {
-        this.pipelines.delete(this.pipelines.keys().next().value!);
-        if (!this.warnedAboutEviction) {
-          this.warnedAboutEviction = true;
-          LogGL.warn('VertexFragmentShader: more than', VertexFragmentShader.MAX_PIPELINES, 'pipelines in use, the least recently used ones are created again when needed', this.name);
-        }
-      }
       pipeline = this.createPipeline(renderTarget, mipLevel);
+      this.storePipeline(id, pipeline);
     }
-    this.pipelines.set(id, pipeline);
+    if (this.asyncPipeline) this.lastPipelines.set(targetKey, pipeline);
     this._pipeline = pipeline;
     return this._pipeline;
   }
@@ -403,6 +470,10 @@ export default class VertexFragmentShader extends ShaderBase {
   public destruct(): void {
     super.destruct();
     this.pipelines.clear();
+    //the async pipelines still being made are dropped when they are done
+    this.pendingPipelines = new Set();
+    this.lastPipelines.clear();
     this.pipelineRenderTarget = null;
+    this._pipeline = null;
   }
 }

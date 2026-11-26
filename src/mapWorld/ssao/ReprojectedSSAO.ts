@@ -10,7 +10,7 @@ import ParamFloat from 'webGPU-framework/utils/params/ParamFloat';
 import ParamInt from 'webGPU-framework/utils/params/ParamInt';
 import {isMobile} from 'webGPU-framework/renderer/utils/Browser';
 import r2 from 'webGPU-framework/shaders/r2.wgsl?raw';
-import blueNoiseUrl from '../../shared/img/blueNoise.png';
+import blueNoiseUrl from './blueNoise.png';
 import gBufferPacking from '../deferred/mapGBufferPacking.wgsl?raw';
 import ssaoShader from './reprojectedSSAO.wgsl?raw';
 import compositeShader from './reprojectedSSAOComposite.wgsl?raw';

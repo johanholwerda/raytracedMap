@@ -110,19 +110,26 @@ export default class Mesh {
     return null;
   }
 
-  //a Uint32Array (from a worker) is uploaded as it is, and only copied into indices with keepCPUData
-  public setIndices(indices: number[] | Uint32Array): void {
+  //a typed array (from a worker) is only copied into indices with keepCPUData. a Uint16Array is uploaded as 16 bit
+  //indices as it is. format: the one the indices need, when the caller knows it (a worker picked it): saves the scan
+  //for the largest index, and a Uint32Array of 32 bit indices is uploaded as it is
+  public setIndices(indices: number[] | Uint32Array | Uint16Array, format?: GPUIndexFormat): void {
     this.indices = Array.isArray(indices) ? indices : this.keepCPUData ? Array.from(indices) : [];
     this.indexCount = indices.length;
-    //by the indices themselves, so it doesn't matter whether the attributes are set before or after them
-    let maxIndex = 0;
-    for (let i = 0; i < indices.length; i++) {
-      if (indices[i] > maxIndex) maxIndex = indices[i];
+    let use32BitIndices = format == 'uint32';
+    if (!format && !(indices instanceof Uint16Array)) {
+      //by the indices themselves, so it doesn't matter whether the attributes are set before or after them
+      let maxIndex = 0;
+      for (let i = 0; i < indices.length; i++) {
+        if (indices[i] > maxIndex) maxIndex = indices[i];
+      }
+      use32BitIndices = maxIndex > 65535;
     }
-    const use32BitIndices = maxIndex > 65535;
     let data: Uint16Array | Uint32Array;
     if (use32BitIndices) {
-      data = new Uint32Array(indices);
+      data = indices instanceof Uint32Array ? indices : new Uint32Array(indices);
+    } else if (indices instanceof Uint16Array && indices.byteLength % 4 == 0) {
+      data = indices;
     } else {
       //a buffer size has to be a multiple of 4 bytes, so an odd number of 16 bit indices gets one of padding
       data = new Uint16Array(indices.length + (indices.length & 1));
@@ -217,6 +224,18 @@ export default class Mesh {
       //the index buffer was uploaded in setIndices
       this.indices = [];
     }
+  }
+
+  /**
+   * A vertex buffer the caller made and writes itself (like one that parts are written into over time), laid out like
+   * the attributes set before: their data isn't uploaded. The mesh owns it from now on (destruct destroys it).
+   */
+  public setVertexBuffer(buffer: GPUBuffer, vertexCount: number): void {
+    if (this._vertexBuffer && this._vertexBuffer !== buffer) this.renderer.destroyAfterSubmit(this._vertexBuffer);
+    this._vertexBuffer = buffer;
+    this.vertexStride = this.getVertexLayout().arrayStride;
+    this.vertexCount = vertexCount;
+    this.interleaveDirty = false;
   }
 
   public get vertexBuffer(): GPUBuffer {

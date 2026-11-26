@@ -8,7 +8,9 @@ import Matrix4x4 from 'webGPU-framework/renderer/math/Matrix4x4';
 import Camera from 'webGPU-framework/renderer/camera/Camera';
 import cityLightmapSurface from '../city/cityLightmapSurface.wgsl?raw';
 import packing from './mapGBufferPacking.wgsl?raw';
+import terrainNormal from '../map/terrainNormal.wgsl?raw';
 import shader from './mapGBuffer.wgsl?raw';
+import snow from '../snow.wgsl?raw';
 import { GBUFFER_ATLAS_STEP_M } from '../city/cityLayout';
 
 // the materials the 5 bits of the gBuffer can tell apart, see mapGBufferPacking.wgsl
@@ -87,13 +89,16 @@ export default class MapGBuffer {
 
   /**
    * A material that draws into the gBuffer. walls: the buildings, with the lightmap attribute and the selection
-   * highlight. cullMode: 'back' for closed meshes, 'none' for the ground quad, whose winding doesn't matter.
+   * highlight. cullMode: 'back' for closed meshes, 'none' for the ground quad, whose winding doesn't matter. snowy: the
+   * snow lies on it (the define SNOW of mapGBuffer.wgsl, its uniforms set by MapGeometry.setSnow)
    */
-  public createMaterial(baseColor: Vector3, walls: boolean, cullMode: GPUCullMode = 'back'): VertexFragmentShader {
+  public createMaterial(baseColor: Vector3, walls: boolean, cullMode: GPUCullMode = 'back', snowy = false): VertexFragmentShader {
     const index = this.addPaletteColors([[baseColor.x, baseColor.y, baseColor.z]]);
     const material = new VertexFragmentShader(this.renderer, 'mapGBuffer', shader, {
-      includes: [cityLightmapSurface, packing],
-      defines: walls ? { WALLS: true } : {},
+      includes: snowy ? [cityLightmapSurface, packing, terrainNormal, snow] : [cityLightmapSurface, packing, terrainNormal],
+      defines: walls ? { WALLS: true } : snowy ? { SNOW: true } : {},
+      // the scene is drawn every frame, so it can be missing for the frames that its pipeline compiles in
+      asyncPipeline: true,
     });
     material.cullMode = cullMode;
     // the reversed depth: nearer is larger
@@ -103,6 +108,8 @@ export default class MapGBuffer {
     material.setFloat('tileID', 0);
     material.setVector2('wallTile', new Vector2(0, 0));
     material.setFloat('treeMaterial', 0);
+    // no snow until MapGeometry.setSnow: the line out of reach
+    if (snowy) material.setFloat('snowLine', 1e9);
     this.materials.push(material);
     this.materialIndices.set(material, index);
     return material;

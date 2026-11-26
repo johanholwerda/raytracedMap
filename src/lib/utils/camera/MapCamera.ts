@@ -33,6 +33,11 @@ export default class MapCamera extends PivotCamera {
   private panThresholdPassed: boolean = false;
   //prevent moving when clicking
   private readonly panDeadZone: number = 0.002;
+  // Max ground movement per screen movement (NDC units), in camera distances. Looking straight
+  // down a drag moves the ground ~0.5-1 distance per NDC unit; near the horizon keeping the
+  // grabbed point under the cursor would move it far more, so the drag speed is capped there.
+  private readonly panMaxSpeed: number = 1;
+  private panPrevScreen: Vector2 = new Vector2();
 
   // Ctrl state
   private ctrlDown: boolean = false;
@@ -80,6 +85,7 @@ export default class MapCamera extends PivotCamera {
     const hit = this.groundPoint(screenPosition);
     this.panAnchorValid = hit !== null;
     if (hit) this.panAnchor.copy(hit);
+    this.panPrevScreen.copy(screenPosition);
   }
 
   private pan(screenPosition: Vector2): void {
@@ -91,7 +97,21 @@ export default class MapCamera extends PivotCamera {
     const hit = this.groundPoint(screenPosition);
     if (!hit) return;
     // moving the camera by the offset puts the anchor back under the cursor
-    this.pivot.translate(new Vector3(this.panAnchor.x - hit.x, 0, this.panAnchor.z - hit.z));
+    let dx = this.panAnchor.x - hit.x;
+    let dz = this.panAnchor.z - hit.z;
+    const screenMove = Vector2.distance(screenPosition, this.panPrevScreen);
+    this.panPrevScreen.copy(screenPosition);
+    const maxMove = this.panMaxSpeed * this.distance * screenMove;
+    const move = Math.hypot(dx, dz);
+    if (move > maxMove) {
+      const s = maxMove / move;
+      dx *= s;
+      dz *= s;
+      // the anchor slips: grab the ground that is under the cursor after this move,
+      // so the map doesn't keep catching up after the cursor stops
+      this.panAnchor.copy(new Vector3(hit.x + dx, this.panPlaneY, hit.z + dz));
+    }
+    this.pivot.translate(new Vector3(dx, 0, dz));
   }
 
   public update(): void {

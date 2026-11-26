@@ -1,53 +1,112 @@
 import { buildWorldTile } from './worldGeometryCore';
 import type { WorldTileResult } from './worldGeometryCore';
-import type { LatLngBounds } from '../../mapOSM/osmGeometryCore';
-import type { TileCoord } from '../../mapOSM/PDOKTileService';
+import { jobClock } from './jobTimes';
+import type { JobTimes } from './jobTimes';
+import type { LatLngBounds } from '../osm/osmGeometryCore';
+import type { TileCoord } from '../osm/PDOKTileService';
 
 /**
- * World map Web Worker: decodes one OpenMapTiles vector tile (.pbf, fetched on
- * the main thread and transferred in) and builds its ground layers and/or
- * extruded buildings off the main thread. Result buffers are transferred back.
+ * World map Web Worker: decodes one OpenMapTiles vector tile (.pbf) and builds its ground layers and/or extruded
+ * buildings off the main thread. The tile and the heights of the ground under it come from the tile fetch worker
+ * (tileFetchWorker.ts) over a port, transferred in. The result buffers are transferred to the main thread, the heights
+ * with them (for TerrainHeightField), and the fetch worker is told this worker is free for the next tile.
  */
 
+/** A tile to make: what WorldWorkerPool asks the fetch worker for. */
 export type WorldWorkerRequest = {
   id: number;
-  pbf: ArrayBuffer;
+  // the vector tile, see OpenFreeMapTileService.tileUrl
+  url: string;
   tile: TileCoord;
   bounds: LatLngBounds;
   wantTerrain: boolean;
   wantBuildings: boolean;
   // the trees of the wood areas, with the buildings, see worldTrees.ts
   wantTrees: boolean;
+  // the ground has heights (m, see ElevationService.getTileGrid), relative to the ground at the center of bounds. False: flat
+  elevation: boolean;
+  // asked for ahead of the view (WorldTileStreamer.PREFETCH_MARGIN): fetched at a low priority, built after the jobs of
+  // the view, until the pool says it is in view (FetchJobMessage prioritize)
+  margin: boolean;
 };
 
-// Minimal worker-scope typing (see mapOSM/mapWorker.ts for why).
+/** From the main thread, once: the port to the fetch worker. */
+export type WorldWorkerSetup = { port: MessagePort };
+
+/**
+ * From the fetch worker: a job with its data. pbf: empty when the server has no tile. heights: null without elevation.
+ * For profiling: the ms the data took and the ms the job then waited for this worker.
+ */
+export type WorldBuildMessage = {
+  job: WorldWorkerRequest;
+  pbf: ArrayBuffer;
+  heights: Float32Array | null;
+  // the height of the sea in heights (m, relative to the same origin), see seaMask.ts
+  seaLevel: number;
+  fetchMs: number;
+  waitMs: number;
+  times: JobTimes;
+};
+
+/** To the fetch worker: the job is built. */
+export type WorldBuildDone = { done: number };
+
+/** To the main thread. heights: the ones the tile is built on. For profiling: fetchMs, waitMs and the ms of the build. */
+export type WorldWorkerReply = {
+  id: number;
+  result?: WorldTileResult;
+  heights?: Float32Array | null;
+  error?: string;
+  fetchMs: number;
+  waitMs: number;
+  buildMs: number;
+  times: JobTimes;
+};
+
+// Minimal worker-scope typing (see osm/mapWorker.ts for why).
 type WorkerCtx = {
-  onmessage: ((e: MessageEvent<WorldWorkerRequest>) => void) | null;
-  postMessage(message: any, transfer?: Transferable[]): void;
+  onmessage: ((e: MessageEvent<WorldWorkerSetup>) => void) | null;
+  postMessage(message: WorldWorkerReply, transfer?: Transferable[]): void;
 };
 
 const ctx = self as unknown as WorkerCtx;
 
-ctx.onmessage = (e: MessageEvent<WorldWorkerRequest>) => {
-  const msg = e.data;
+function build(msg: WorldBuildMessage, port: MessagePort): void {
+  const { job, heights, times } = msg;
+  const start = performance.now();
+  times.buildStart = jobClock();
   try {
     const result: WorldTileResult = buildWorldTile(
       new Uint8Array(msg.pbf),
-      msg.tile,
-      msg.bounds,
-      msg.wantTerrain,
-      msg.wantBuildings,
-      msg.wantTrees,
+      job.tile,
+      job.bounds,
+      job.wantTerrain,
+      job.wantBuildings,
+      job.wantTrees,
+      heights,
+      msg.seaLevel,
     );
     const transfers: Transferable[] = [];
     if (result.terrain) for (const l of Object.values(result.terrain)) transfers.push(l.vertices.buffer, l.indices.buffer);
+    if (result.ground) transfers.push(result.ground.vertices.buffer, result.ground.indices.buffer);
     if (result.roads) transfers.push(result.roads.buffer);
     if (result.buildings) {
-      transfers.push(result.buildings.vertices.buffer, result.buildings.lightmap.buffer, result.buildings.indices.buffer);
+      const b = result.buildings;
+      transfers.push(b.interleaved, b.indices.buffer);
       if (result.buildings.trace) transfers.push(result.buildings.trace.words.buffer, result.buildings.trace.ids.buffer);
     }
-    ctx.postMessage({ id: msg.id, result }, transfers);
+    if (heights) transfers.push(heights.buffer);
+    times.buildEnd = jobClock();
+    ctx.postMessage({ id: job.id, result, heights, fetchMs: msg.fetchMs, waitMs: msg.waitMs, buildMs: performance.now() - start, times }, transfers);
   } catch (err: any) {
-    ctx.postMessage({ id: msg.id, error: String(err?.message ?? err) });
+    times.buildEnd = jobClock();
+    ctx.postMessage({ id: job.id, error: String(err?.message ?? err), fetchMs: msg.fetchMs, waitMs: msg.waitMs, buildMs: performance.now() - start, times });
   }
+  const done: WorldBuildDone = { done: job.id };
+  port.postMessage(done);
+}
+
+ctx.onmessage = (e: MessageEvent<WorldWorkerSetup>) => {
+  const port = e.data.port;
+  port.onmessage = (message: MessageEvent<WorldBuildMessage>) => build(message.data, port);
 };

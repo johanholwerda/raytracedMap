@@ -10,33 +10,48 @@ import ParamBool from 'webGPU-framework/utils/params/ParamBool';
 import MapCamera from 'webGPU-framework/utils/camera/MapCamera';
 import Frustum from 'webGPU-framework/utils/camera/Frustum';
 import hash from 'webGPU-framework/shaders/hash.wgsl?raw';
-import overdraw from '../mapOSM/overdraw.wgsl?raw';
-import forwardShading from '../mapOSM/shading.wgsl?raw';
-import { LayerRuntime } from '../mapOSM/layerDefs';
-import TerrainLayerBuffer from '../mapOSM/TerrainLayerBuffer';
-import BoundingBoxViewer, { BBoxEntry } from '../mapOSM/BoundingBoxViewer';
-import MapProjection from '../mapOSM/MapProjection';
-import GroundQuad from '../mapOSM/GroundQuad';
+import overdraw from './osm/overdraw.wgsl?raw';
+import terrainNormal from './map/terrainNormal.wgsl?raw';
+import forwardShading from './osm/shading.wgsl?raw';
+import { LayerRuntime } from './osm/layerDefs';
+import TerrainLayerBuffer from './osm/TerrainLayerBuffer';
+import BoundingBoxViewer, { BBoxEntry } from './osm/BoundingBoxViewer';
+import MapProjection from './osm/MapProjection';
+import GroundQuad from './osm/GroundQuad';
 import MapGBuffer from './deferred/MapGBuffer';
 import { WORLD_LAYERS } from './map/worldGeometryCore';
 import { setMeshQuantization } from './city/meshQuantization';
 import { TREE_COLORS, TREE_CROWN_COLORS, TREE_TRUNK_COLOR } from './map/worldTrees';
+import snow from './snow.wgsl?raw';
+import terrainMaterialMap from './terrainMaterialMap.wgsl?raw';
+import type { SnowParams } from './map/snowLine';
+
+// the ground layers the snow lies on (and the ground under them), see snow.wgsl. Not the water, the roads (cleared) or
+// the railways, nor the urban areas
+const SNOW_LAYERS = new Set(['farmland', 'sand', 'green', 'forest', 'paths']);
+// the layer whose material the snow takes in the gBuffer: the glaciers, in the snow color
+const SNOW_MATERIAL_LAYER = 'glacier';
 
 /** The building meshes to draw, with their picking slots (parallel), see WorldTileStreamer. */
 // tiles: per mesh the map tile of its wall atlas, x and y after each other (the uniform wallTile of the gBuffer).
 // quantization: per mesh the decoding of its unorm16 vertices, see setMeshQuantization
-export type CityMeshes = { meshes: Mesh[]; slots: number[]; tiles: number[]; quantization: number[] };
+// indexCounts: per mesh the indices to draw, without its trees when they are too small, see WorldTileStreamer.cullTrees
+export type CityMeshes = { meshes: Mesh[]; slots: number[]; tiles: number[]; quantization: number[]; indexCounts: number[] };
 
 export type DrawStats = { meshCount: number; vertexCount: number; culledCount: number };
 
 /**
  * The geometry of the map and how it is drawn: the ground layers (one packed buffer + gBuffer material each), the
  * ground quad under them and the buildings (meshes of the WorldTileStreamer, frustum culled with meshBounds). Draws
- * them into the gBuffer, forward shaded (mapOSM/shading.wgsl: sun with shadows and the sky term, see forwardMaterials),
+ * them into the gBuffer, forward shaded (osm/shading.wgsl: sun with shadows and the sky term, see forwardMaterials),
  * or as debug views (overdraw, bounding boxes).
  */
 export default class MapGeometry {
   public readonly layers: LayerRuntime[] = [];
+  // The ground meshes of the tiles with heights (see ElevationService), filled by the WorldTileStreamer. Drawn instead of
+  // the ground quad while elevation is on
+  public readonly groundBuffer: TerrainLayerBuffer;
+  public elevation = false;
   // The bounds of the building meshes, filled by the WorldTileStreamer.
   public readonly meshBounds: Map<Mesh, AABox> = new Map();
   public stats: DrawStats = { meshCount: 0, vertexCount: 0, culledCount: 0 };
@@ -55,6 +70,9 @@ export default class MapGeometry {
   private overdrawMaterial: VertexFragmentShader;
   // the building meshes, with their unorm16 vertices
   private overdrawCityMaterial: VertexFragmentShader;
+  // the materials of drawMaterialMap: per layer (parallel to layers), and the ground
+  private materialMapLayerMaterials: VertexFragmentShader[] = [];
+  private materialMapGroundMaterial: VertexFragmentShader;
   private boundingBoxViewer: BoundingBoxViewer;
   // the first palette entry of TREE_COLORS (the trunk, then the crowns)
   private treeMaterial: number;
@@ -64,13 +82,14 @@ export default class MapGeometry {
     this.groundQuad = new GroundQuad(renderer, projection, 0);
     // under the camera, as far as the view reaches, see setViewDistanceMax
     this.groundQuad.centerOnCamera = true;
-    this.groundGBufferMaterial = gBuffer.createMaterial(new Vector3(.5, .5, .5), false, 'none');
+    this.groundBuffer = new TerrainLayerBuffer(renderer);
+    this.groundGBufferMaterial = gBuffer.createMaterial(new Vector3(.5, .5, .5), false, 'none', true);
     this.cityGBufferMaterial = gBuffer.createMaterial(new Vector3(1, 1, 1), true);
 
     // One gBuffer material (with the albedo of the layer) + packed buffer per ground layer (one draw call each).
     for (const def of WORLD_LAYERS) {
       const color = Color.fromHex(def.color);
-      const material = gBuffer.createMaterial(color.vector3, false);
+      const material = gBuffer.createMaterial(color.vector3, false, 'back', SNOW_LAYERS.has(def.key));
       this.layers.push({
         def: { key: def.key, label: def.label, color: [color.r, color.g, color.b], defaultOn: def.defaultOn },
         material,
@@ -84,11 +103,14 @@ export default class MapGeometry {
     const treeMaterial = this.treeMaterial = gBuffer.addPaletteColors(TREE_COLORS);
     this.cityGBufferMaterial.setFloat('treeMaterial', treeMaterial);
 
-    const createForwardMaterial = (color: Vector3, cullMode: GPUCullMode, city = false) => {
+    const createForwardMaterial = (color: Vector3, cullMode: GPUCullMode, city = false, snowy = false) => {
       const material = new VertexFragmentShader(renderer, 'osm', forwardShading, {
-        includes: [hash],
-        // SKY_ALBEDO: the sky term with the albedo, like the deferred shading. TREE_COLORS: the albedos of the trees
-        defines: city ? { FEATURE_IDS: true, SKY_ALBEDO: true, TREE_COLORS: true, QUANTIZED: true } : { SKY_ALBEDO: true },
+        includes: city ? [hash] : snowy ? [hash, terrainNormal, snow] : [hash, terrainNormal],
+        // SKY_ALBEDO: the sky term with the albedo, like the deferred shading. TREE_COLORS: the albedos of the trees.
+        // TERRAIN_NORMALS: the ground's smooth normal from .w, the buildings keep the flat one of the triangle. SNOW: the
+        // snow above the snow line, see setSnow
+        defines: city ? { FEATURE_IDS: true, SKY_ALBEDO: true, TREE_COLORS: true, QUANTIZED: true }
+          : snowy ? { SKY_ALBEDO: true, TERRAIN_NORMALS: true, SNOW: true } : { SKY_ALBEDO: true, TERRAIN_NORMALS: true },
       });
       if (city) {
         material.setBuffer('materialPalette', gBuffer.paletteBuffer);
@@ -99,9 +121,9 @@ export default class MapGeometry {
       return material;
     };
     for (const def of WORLD_LAYERS) {
-      this.forwardLayerMaterials.push(createForwardMaterial(Color.fromHex(def.color).vector3, 'back'));
+      this.forwardLayerMaterials.push(createForwardMaterial(Color.fromHex(def.color).vector3, 'back', false, SNOW_LAYERS.has(def.key)));
     }
-    this.forwardGroundMaterial = createForwardMaterial(new Vector3(.5, .5, .5), 'none');
+    this.forwardGroundMaterial = createForwardMaterial(new Vector3(.5, .5, .5), 'none', false, true);
     this.forwardCityMaterial = createForwardMaterial(new Vector3(1, 1, 1), 'back', true);
     this.forwardCityMaterial.setFloat('selectedID', -1);
     this.forwardCityMaterial.setFloat('tileID', 0);
@@ -115,7 +137,40 @@ export default class MapGeometry {
       material.depthCompare = 'always';
     }
 
+    // what drawMaterialMap writes: the palette index of the gBuffer material + 1, and TERRAIN_MATERIAL_SNOW (256) where
+    // the snow lies on it, see waterTerrainHorizon.wgsl
+    const createMaterialMapMaterial = (gBufferMaterial: VertexFragmentShader, snowy: boolean) => {
+      const material = new VertexFragmentShader(renderer, 'terrainMaterialMap', terrainMaterialMap);
+      // seen from above, with a mirrored viewProjection
+      material.cullMode = 'none';
+      material.setFloat('material', gBuffer.materialIndex(gBufferMaterial) + 1 + (snowy ? 256 : 0));
+      return material;
+    };
+    this.materialMapLayerMaterials = this.layers.map(layer => createMaterialMapMaterial(layer.material, SNOW_LAYERS.has(layer.def.key)));
+    this.materialMapGroundMaterial = createMaterialMapMaterial(this.groundGBufferMaterial, true);
+
     this.boundingBoxViewer = new BoundingBoxViewer(renderer);
+  }
+
+  /**
+   * The ground and its layers with their materials into the current pass, for a map of the materials of the ground top
+   * down (TerrainSunMap.update, its viewProjection): the highest wins the depth test. Only with elevation.
+   */
+  public drawMaterialMap(viewProjection: Matrix4x4): void {
+    if (!this.elevation) return;
+    this.layers.forEach((layer, i) => {
+      if (!layer.enabled.value || layer.buffer.vertexCount === 0) return;
+      this.materialMapLayerMaterials[i].setMatrix('viewProjection', viewProjection);
+      layer.buffer.draw(this.materialMapLayerMaterials[i]);
+    });
+    if (this.groundBuffer.vertexCount === 0) return;
+    this.materialMapGroundMaterial.setMatrix('viewProjection', viewProjection);
+    this.groundBuffer.draw(this.materialMapGroundMaterial);
+  }
+
+  /** The palette index of the snow, for what shades the ground itself (WaterTerrainHorizon.setSnow). */
+  public get snowMaterial(): number {
+    return this.gBuffer.materialIndex(this.layers.find(layer => layer.def.key === SNOW_MATERIAL_LAYER)!.material);
   }
 
   /** The albedo of a ground layer (index into layers), in the gBuffer and the forward shading. */
@@ -162,6 +217,41 @@ export default class MapGeometry {
     forwardMaterial.setVector3('baseColor', color);
   }
 
+  /**
+   * The snow above the snow line on the ground and SNOW_LAYERS, which have the define SNOW: in the gBuffer their pixels
+   * in the snow take the material of the glaciers (a hard edge, the TAA antialiases it), the forward shading mixes in
+   * params.color over an antialiased edge. Off: the line out of reach, and the gBuffer pipelines without the snow
+   * (the override SNOW_IN_SCENE of mapGBuffer.wgsl, see snowPipelinePending).
+   */
+  public setSnow(params: SnowParams): void {
+    const line = params.enabled ? params.line : 1e9;
+    const snowMaterial = this.gBuffer.materialIndex(this.layers.find(layer => layer.def.key === SNOW_MATERIAL_LAYER)!.material);
+    const gBufferMaterials = this.snowGBufferMaterials;
+    for (const m of gBufferMaterials) {
+      m.setConstant('SNOW_IN_SCENE', params.enabled);
+      m.setFloat('snowMaterial', snowMaterial);
+    }
+    for (const m of [...gBufferMaterials, ...this.forwardMaterials]) {
+      m.setFloat('snowLine', line);
+      m.setFloat('snowNoise', params.noise);
+      m.setFloat('snowMetersPerUnit', params.metersPerUnit);
+    }
+    for (const m of this.forwardMaterials) m.setVector3('snowColor', params.color);
+  }
+
+  /**
+   * Whether the gBuffer pipeline of SNOW_IN_SCENE that setSnow switched to is still being made (async): the frames draw
+   * with the one before (with or without the snow) until it is there.
+   */
+  public get snowPipelinePending(): boolean {
+    return this.snowGBufferMaterials.some(m => m.pipelinePending);
+  }
+
+  // the gBuffer materials with SNOW: the ground and SNOW_LAYERS
+  private get snowGBufferMaterials(): VertexFragmentShader[] {
+    return [this.groundGBufferMaterial, ...this.layers.filter(layer => SNOW_LAYERS.has(layer.def.key)).map(layer => layer.material)];
+  }
+
   /** The materials of drawForward: they take the shading params (sky, sun, fog, shadows) by name, like the deferred shading. */
   public get forwardMaterials(): VertexFragmentShader[] {
     return [...this.forwardLayerMaterials, this.forwardGroundMaterial, this.forwardCityMaterial];
@@ -197,7 +287,7 @@ export default class MapGeometry {
     this.drawGround(camera, this.forwardLayerMaterials, this.forwardGroundMaterial);
   }
 
-  /** The layers top first (layerMaterials parallel to layers), the ground quad under them last. */
+  /** The layers top first (layerMaterials parallel to layers), the ground (quad or meshes) under them last. */
   private drawGround(camera: MapCamera, layerMaterials: VertexFragmentShader[], groundMaterial: VertexFragmentShader): void {
     const stats = this.stats;
     for (let j = this.layers.length - 1; j >= 0; j--) {
@@ -206,6 +296,13 @@ export default class MapGeometry {
       layer.buffer.draw(layerMaterials[j]);
       stats.meshCount++;
       stats.vertexCount += layer.buffer.vertexCount;
+    }
+    if (this.elevation) {
+      if (this.groundBuffer.vertexCount === 0) return;
+      this.groundBuffer.draw(groundMaterial);
+      stats.meshCount++;
+      stats.vertexCount += this.groundBuffer.vertexCount;
+      return;
     }
     this.groundQuad.drawGBuffer(camera, groundMaterial);
     stats.meshCount++;
@@ -244,7 +341,7 @@ export default class MapGeometry {
       setMeshQuantization(material, city.quantization, index);
       stats.meshCount++;
       stats.vertexCount += mesh.vertexCount;
-      this.renderer.draw(mesh, material);
+      this.renderer.draw(mesh, material, { indexCount: city.indexCounts[index] });
     }
   }
 
@@ -253,7 +350,8 @@ export default class MapGeometry {
     this.overdrawMaterial.setMatrix('viewProjection', camera.viewProjection);
     this.overdrawCityMaterial.setMatrix('viewProjection', camera.viewProjection);
     this.renderer.startRenderPass();
-    this.groundQuad.draw(camera, this.overdrawMaterial);
+    if (this.elevation) this.groundBuffer.draw(this.overdrawMaterial);
+    else this.groundQuad.draw(camera, this.overdrawMaterial);
     for (const layer of this.layers) {
       if (!layer.enabled.value || layer.buffer.vertexCount === 0) continue;
       layer.buffer.draw(this.overdrawMaterial);
@@ -263,7 +361,7 @@ export default class MapGeometry {
         const bounds = this.meshBounds.get(mesh);
         if (bounds && !this.frustum.aaBoxInFrustum(bounds)) return;
         setMeshQuantization(this.overdrawCityMaterial, city.quantization, i);
-        this.renderer.draw(mesh, this.overdrawCityMaterial);
+        this.renderer.draw(mesh, this.overdrawCityMaterial, { indexCount: city.indexCounts[i] });
       });
     }
   }
@@ -283,6 +381,7 @@ export default class MapGeometry {
 
   destruct(): void {
     this.groundQuad.destruct();
+    this.groundBuffer.destruct();
     for (const layer of this.layers) layer.buffer.destruct();
     this.boundingBoxViewer.destruct();
   }

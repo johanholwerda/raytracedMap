@@ -16,7 +16,7 @@ const KEYS = {
  * between a min and max height, A/D (or left/right) banks and turns.
  *
  * It keeps driving the pivot camera instead of replacing it: the camera looks down at a slant and the pivot is where
- * that view ray hits the ground (y = 0). The tile streaming, the sun shadows and the cars, which all work around the
+ * that view ray hits the ground (see ground). The height of the plane is over the ground under it. The tile streaming, the sun shadows and the cars, which all work around the
  * pivot at the camera distance, keep working as in orbit mode.
  */
 export default class AirplaneController {
@@ -39,11 +39,22 @@ export default class AirplaneController {
   // 1 / seconds: how fast a height outside min..max (entering from a high or low orbit) eases into it
   private readonly heightSettleRate = 0.8;
 
+  /** The height of the ground at world x, z (world units), null where it isn't known: then the last one is kept. */
+  public ground: (x: number, z: number) => number | null = () => null;
+  // 1 / seconds: how fast the ground under the plane and under the pivot follow the terrain
+  private readonly groundRate = 1.5;
+  private readonly pivotGroundRate = 4;
+  // the least height of the camera over the ground at the pivot, m: on a slope up ahead the view ray reaches it early
+  private readonly pivotClearance = 20;
+
   private _active = false;
-  // camera position in world units
+  // camera position in world units, the height over planeGround
   private x = 0;
   private z = 0;
   private height = 0;
+  // the ground under the plane and under the pivot, eased (world units)
+  private planeGround = 0;
+  private pivotGround = 0;
   private yaw = 0;
   private pitch = this.cruisePitch;
   private roll = 0;
@@ -86,7 +97,9 @@ export default class AirplaneController {
     this.z = pivot.z + Math.cos(this.yaw) * horizontal;
     // the pitch has to look down for the view ray to hit the ground (the orbit limit keeps it below -0.2)
     this.pitch = Math.min(euler.x, -0.05);
-    this.height = pivot.y - d * Math.sin(this.pitch);
+    this.planeGround = this.ground(this.x, this.z) ?? pivot.y;
+    this.pivotGround = pivot.y;
+    this.height = pivot.y - d * Math.sin(this.pitch) - this.planeGround;
     this.roll = this.exitRoll;
     this.exitRoll = 0;
     this.throttle = 0;
@@ -107,13 +120,15 @@ export default class AirplaneController {
   }
 
   /**
-   * Puts the flying plane somewhere, level and at full speed: x, z and height in world units, yaw in radians (0 flies
-   * north, positive turns left). For the video mode of MapWorld, which starts every shot in flight.
+   * Puts the flying plane somewhere, level and at full speed: x, z and height (over the ground) in world units, yaw in
+   * radians (0 flies north, positive turns left). For the video mode of MapWorld, which starts every shot in flight.
    */
   public place(x: number, z: number, height: number, yaw: number): void {
     this.x = x;
     this.z = z;
     this.height = height;
+    this.planeGround = this.ground(x, z) ?? 0;
+    this.pivotGround = this.planeGround;
     this.yaw = yaw;
     this.pitch = this.cruisePitch;
     this.roll = 0;
@@ -196,11 +211,29 @@ export default class AirplaneController {
     this.x -= Math.sin(this.yaw) * step;
     this.z -= Math.cos(this.yaw) * step;
 
-    // the pivot is where the view ray hits the ground
-    const d = this.height / Math.sin(-this.pitch);
-    const horizontal = d * Math.cos(this.pitch);
+    // the plane follows the terrain under it, eased so it flies over a hill instead of along every bump
+    const planeTarget = this.ground(this.x, this.z);
+    if (planeTarget !== null) this.planeGround += (planeTarget - this.planeGround) * (1 - Math.exp(-this.groundRate * dt));
+    const y = this.planeGround + this.height;
+
+    // the pivot is where the view ray hits the ground: the ground under the point of the ray at the height of the last
+    // one, a few times. The camera stays where it is, the pivot only moves along the ray
+    const sin = Math.sin(-this.pitch), cos = Math.cos(this.pitch);
+    const pivotAt = (groundY: number) => {
+      const horizontal = (y - groundY) / sin * cos;
+      return [this.x - Math.sin(this.yaw) * horizontal, this.z - Math.cos(this.yaw) * horizontal];
+    };
+    let target = this.pivotGround;
+    for (let i = 0; i < 3; i++) {
+      const [px, pz] = pivotAt(target);
+      target = this.ground(px, pz) ?? target;
+    }
+    this.pivotGround += (target - this.pivotGround) * (1 - Math.exp(-this.pivotGroundRate * dt));
+    this.pivotGround = Math.min(this.pivotGround, y - this.pivotClearance * metersToNorm);
+    const d = (y - this.pivotGround) / sin;
+    const [px, pz] = pivotAt(this.pivotGround);
     const pivot = this.camera.pivot;
-    pivot.setPositionValues(this.x - Math.sin(this.yaw) * horizontal, 0, this.z - Math.cos(this.yaw) * horizontal);
+    pivot.setPositionValues(px, this.pivotGround, pz);
     // yaw, pitch, then the roll around the view axis
     pivot.euler = new Vector3(this.pitch, this.yaw, this.roll);
     this.camera.distance = d;

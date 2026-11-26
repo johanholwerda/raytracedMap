@@ -24,10 +24,12 @@ struct Uniforms {
   viewProjection : mat4x4<f32>,
   // of the camera the gBuffer was drawn with, for getGBufferDistance
   inverseProjection : mat4x4<f32>,
+  // the sun's view of the ground for the rays (SUN_SHADOWS 2), see terrainSun.wgsl
+  terrainSunViewProjection : mat4x4<f32>,
   cameraPosition : vec3<f32>,
   resolution : vec2<f32>,
   depthParams : vec2<f32>,
-  // the height of the bottom of the cars and of the shadow quads
+  // the height of the bottom of the cars and of the shadow quads over the ground under them (Car.ground)
   groundY : f32,
   shadowY : f32,
   // the margin of the contact occlusion around a car, and how dark it is
@@ -65,6 +67,8 @@ struct Uniforms {
   levelBlend : f32,
   atlasStep : f32,
   lightmapHalfRes : u32,
+  // how far a point goes off its surface before it is compared with terrainSunMap, see getTerrainSunShadow
+  terrainSunOffset : f32,
 #ifdef PER_PIXEL
   // the city of the rays, see CityScene.bind
   cityTileCount : u32,
@@ -87,8 +91,10 @@ struct ShadowMapData {
 @group(0) @binding(7) var<storage, read> tileBuffer : array<u32>;
 @group(0) @binding(8) var<storage, read> lightingBuffer : array<u32>;
 @group(0) @binding(9) var gBufferDepth : texture_depth_2d;
-// 2 per car: (x, z, heading x, heading z), (half length, half width, height, type), see CarTraffic
+// 3 per car: (x, z, heading x, heading z), (half length, half width, height, type), (ground, slope, 0, 0), see CarTraffic
 @group(0) @binding(10) var<storage, read> cars : array<vec4<f32>>;
+// the ground as the sun sees it (TerrainSunMap.ts): the hills, which the rays don't trace, see terrainSun.wgsl
+@group(0) @binding(13) var terrainSunMap : texture_2d<f32>;
 #ifdef PER_PIXEL
 // the buildings and trees of the rays, see CityScene and skyVisibilityTrace.wgsl
 @group(0) @binding(11) var<storage, read> cityBuffer : array<vec4<f32>>;
@@ -113,12 +119,17 @@ struct Car {
   halfWidth : f32,
   height : f32,
   kind : u32,
+  // the height of the ground under the center (world units) and its rise per world unit along u: the car is sheared
+  // along it, its bottom on the line of the road
+  ground : f32,
+  slope : f32,
 };
 
 fn loadCar(i : u32) -> Car {
-  let a = cars[i * 2u];
-  let b = cars[i * 2u + 1u];
-  return Car(a.xy, a.zw, vec2(-a.w, a.z), b.x, b.y, b.z, u32(b.w));
+  let a = cars[i * 3u];
+  let b = cars[i * 3u + 1u];
+  let c = cars[i * 3u + 2u];
+  return Car(a.xy, a.zw, vec2(-a.w, a.z), b.x, b.y, b.z, u32(b.w), c.x, c.y);
 }
 
 // --- Variance shadow map sampling, as in deferredShading.wgsl -----------------
@@ -147,15 +158,25 @@ fn shadowCascade(uv : vec2<f32>, i : u32, dist : f32) -> f32 {
   return smoothstep(uniforms.VSMBleedThreshold, 1.0, max(lit, s));
 }
 
+// how many texels of a cascade a point goes off its surface along its normal before the lookup: the ground at a low sun
+// spans many texels along the sun (tens of meters each in the far cascades), its own heights in them would shadow it
+const SHADOW_NORMAL_OFFSET = 1.5;
+
+// the size of a texel of cascade i in world units: its half-extent is 1 over the length of the first row of its matrix
+fn shadowTexelSize(i : u32) -> f32 {
+  let m = shadowMapData[i].shadowMapViewProjection;
+  return 2.0 / (f32(textureDimensions(shadowMaps).x) * length(vec3<f32>(m[0].x, m[1].x, m[2].x)));
+}
+
 // The cascades front to back, each taking its weight (1 inside, fading out over its edge) of what the ones before it
 // left. Each cascade is re-rendered around a center of its own, so the next one need not cover the edge of the one
 // before it: that point goes on to the first one that does. What no cascade covers is lit, so past the last cascade the
 // shadows fade out instead of ending at a hard edge.
-fn getShadowMap(p : vec3<f32>) -> f32 {
+fn getShadowMap(p : vec3<f32>, n : vec3<f32>) -> f32 {
   var shadow = 0.0;
   var remaining = 1.0;
   for (var i = 0u; i < 4u; i++) {
-    let u = shadowUVDepthStrength(p, i);
+    let u = shadowUVDepthStrength(p + n * (SHADOW_NORMAL_OFFSET * shadowTexelSize(i)), i);
     if (u.w > 0.0) {
       shadow += remaining * u.w * shadowCascade(u.xy, i, u.z);
       remaining *= 1.0 - u.w;
@@ -178,23 +199,23 @@ fn getSunShadow(p : vec3<f32>, n : vec3<f32>, d : f32, raySun : f32) -> f32 {
   }
   if (SUN_SHADOWS == 2u) {
 #ifdef PER_PIXEL
-    return select(1., 0., isOccluded(p + n * (d * 1e-4), uniforms.lightDirection));
+    return select(1., 0., isOccluded(p + n * (d * 1e-4), uniforms.lightDirection)) * getTerrainSunShadow(p, n);
 #else
-    return raySun;
+    return raySun * getTerrainSunShadow(p, n);
 #endif
   }
-  return getShadowMap(p);
+  return getShadowMap(p, n);
 }
 
 #ifdef PER_PIXEL
 
-// The sky visibility of the ground at p (its xz), as the deferred shading lights the ground there.
+// The sky visibility of the ground at p (its xz) at the height groundY, as the deferred shading lights the ground there.
 // Without the lightmap or a texel there: an open sky, as the sky term of the shading
-fn getGroundSky(p : vec3<f32>) -> f32 {
+fn getGroundSky(p : vec3<f32>, groundY : f32) -> f32 {
   if (uniforms.lightmapEnabled == 0u) {
     return 1.;
   }
-  let g = vec3(p.x, uniforms.groundY, p.z);
+  let g = vec3(p.x, groundY, p.z);
   let l = getLightmapLighting(getGroundSurface(g), getLevel(g, vec3(0., 1., 0.)));
   return select(1., l.x, l.w > 0.);
 }
@@ -235,7 +256,7 @@ fn isHidden(position : vec4<f32>, d : f32) -> bool {
 // d is the horizontal (xz) distance to the camera, not the 3d one: the map is loaded in a radius around the camera in
 // xz, and a camera that goes up and looks down gets no more fog (the far plane reaches past it, see
 // MapWorld.applyViewDistanceMax).
-// The same in deferredShading.wgsl, cars.wgsl, reprojectedSSAOComposite.wgsl and mapOSM/shading.wgsl.
+// The same in deferredShading.wgsl, cars.wgsl, reprojectedSSAOComposite.wgsl and osm/shading.wgsl.
 fn getFog(d : f32) -> f32 {
   let end = select(1., 1. - smoothstep(.7 * uniforms.viewDistanceMax, uniforms.viewDistanceMax, d), uniforms.viewDistanceMax > 0.);
   return 1. - exp(-d * uniforms.distanceFog) * end;
@@ -293,7 +314,7 @@ fn vs_main(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) in
   let q = mix(lo, hi, quadCorner(vertexIndex));
   let xz = car.center + car.u * q.x + car.v * q.y;
   var output : VertexOutput;
-  output.world = vec3(xz.x, uniforms.shadowY, xz.y);
+  output.world = vec3(xz.x, car.ground + q.x * car.slope + uniforms.shadowY, xz.y);
   output.position = uniforms.viewProjection * vec4(output.world, 1.);
   output.car = instance;
 #ifndef PER_PIXEL
@@ -350,7 +371,7 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
   // the occlusion takes away, as a part of the light there
 #ifdef PER_PIXEL
   let raySun = 1.;
-  let sky = getGroundSky(p);
+  let sky = getGroundSky(p, p.y - (uniforms.shadowY - uniforms.groundY));
 #else
   let raySun = input.sun;
   let sky = input.sky;
@@ -382,6 +403,8 @@ struct VertexOutput {
   @location(3) height : f32,
   // 1 on the windows
   @location(4) @interpolate(flat) glass : f32,
+  // the height of the ground under the vertex
+  @location(7) ground : f32,
 #ifndef PER_PIXEL
   // the sun of the corners of the roof at the vertex and the sky of the ground under the car, see loadCarLight
   @location(5) sun : f32,
@@ -442,10 +465,13 @@ fn vs_main(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) in
   let xz = car.center + car.u * carPos.x + car.v * carPos.z;
 
   var output : VertexOutput;
-  output.world = vec3(xz.x, uniforms.groundY + carPos.y, xz.y);
+  // sheared along the slope: the vertical faces stay vertical, the normal of the shear is (n.x - slope * n.y, n.y, n.z)
+  output.ground = car.ground + carPos.x * car.slope + uniforms.groundY;
+  output.world = vec3(xz.x, output.ground + carPos.y, xz.y);
   output.position = uniforms.viewProjection * vec4(output.world, 1.);
-  let nxz = car.u * n.x + car.v * n.z;
-  output.normal = vec3(nxz.x, n.y, nxz.y);
+  let ns = normalize(vec3(n.x - car.slope * n.y, n.y, n.z));
+  let nxz = car.u * ns.x + car.v * ns.z;
+  output.normal = vec3(nxz.x, ns.y, nxz.y);
   // the sides of the cabin are the windows
   let glass = boxIndex == 1u && face < 4u;
   output.albedo = select(PAINT, GLASS, glass);
@@ -474,7 +500,7 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
   let albedo = input.albedo * input.albedo;
 #ifdef PER_PIXEL
   let raySun = 1.;
-  let groundSky = getGroundSky(p);
+  let groundSky = getGroundSky(p, input.ground);
 #else
   let raySun = input.sun;
   let groundSky = input.sky;

@@ -12,14 +12,16 @@ import ParamGroup from 'webGPU-framework/utils/params/ParamGroup';
 import ParamBool from 'webGPU-framework/utils/params/ParamBool';
 import ParamFloat from 'webGPU-framework/utils/params/ParamFloat';
 import { isMobile } from 'webGPU-framework/renderer/utils/Browser';
-import MapProjection from '../../mapOSM/MapProjection';
+import MapProjection from '../osm/MapProjection';
 import SkyVisibilityLightmap from '../skyVisibilityLightmap/SkyVisibilityLightmap';
 import MapGBuffer from '../deferred/MapGBuffer';
 import type { RoadTileSink } from '../map/WorldTileStreamer';
 import RoadGraph, { RoadEdge } from './RoadGraph';
 import { GROUND_TOP_Y, LAYER_GAP } from '../map/worldGeometryCore';
 import skyVisibilityTrace from '../skyVisibilityLightmap/skyVisibilityTrace.wgsl?raw';
+import terrainSun from '../terrainSun.wgsl?raw';
 import CityScene from '../city/CityScene';
+import type TerrainHeightField from '../map/TerrainHeightField';
 import carsShader from './cars.wgsl?raw';
 import carLightingShader from './carLighting.wgsl?raw';
 import compositeShader from './carLayerComposite.wgsl?raw';
@@ -29,7 +31,7 @@ const TYPE_CAR = 0;
 const TYPE_VAN = 1;
 const TYPE_BUS = 2;
 // floats per car in the instance buffer, see loadCar in cars.wgsl
-const CAR_FLOATS = 8;
+const CAR_FLOATS = 12;
 // bytes per car of the light the cars are drawn with, see carLighting.wgsl
 const CAR_LIGHT_BYTES = 8;
 // the workgroup size of carLighting.wgsl, and its threads per car (a ray each)
@@ -53,8 +55,8 @@ const SPAWN_PER_FRAME = 64;
 const KEEP_RADIUS = 1.3;
 // the width of a lane in meters, for the lane count of a road
 const LANE_WIDTH_M = 3.3;
-// world units: the bottom of the cars, on the top ground layer (the paths), and the plane of their shadows, a layer gap
-// above it, see LAYER_GAP of worldGeometryCore.ts
+// world units over the ground under a car (Car.ground): its bottom, on the top ground layer (the paths), and the plane of
+// its shadow, a layer gap above it, see LAYER_GAP of worldGeometryCore.ts
 const GROUND_Y = GROUND_TOP_Y;
 const SHADOW_Y = GROUND_TOP_Y + LAYER_GAP;
 // the margin of the contact occlusion around a car, meters
@@ -88,6 +90,10 @@ type Car = {
   z: number;
   hx: number;
   hz: number;
+  // the ground under the car (world units): the height at its center and the rise per world unit along the heading,
+  // see setHeightField
+  ground: number;
+  slope: number;
   placed: boolean;
   // 0 to 1: grows in when it spawns, shrinks when dying
   grow: number;
@@ -114,6 +120,7 @@ export default class CarTraffic implements RoadTileSink {
   private renderer: Renderer;
   private projection: MapProjection;
   private readonly graph = new RoadGraph();
+  private heightField: TerrainHeightField | null = null;
   private cars: Car[] = [];
   private instanceData = new Float32Array(0);
   private instanceBuffer: GPUBuffer | null = null;
@@ -175,7 +182,7 @@ export default class CarTraffic implements RoadTileSink {
       kernel: 'main',
     });
     this.lightingShader.setBuffer('cityBuffer', this.dummyCityBuffer);
-    this.compositeMaterial = new VertexFragmentShader(renderer, 'carLayerComposite', compositeShader);
+    this.compositeMaterial = new VertexFragmentShader(renderer, 'carLayerComposite', compositeShader, { asyncPipeline: true });
     this.compositeMaterial.setPremultipliedAlphaBlending();
     this.compositeMaterial.depthWriteEnabled = false;
     this.compositeMaterial.depthCompare = 'always';
@@ -185,8 +192,11 @@ export default class CarTraffic implements RoadTileSink {
   private createMaterials(suffix: string, perPixel: boolean): CarMaterials {
     const create = (name: string, shadow: boolean) => new VertexFragmentShader(this.renderer, name + suffix, carsShader, {
       // getGBufferDistance (mapGBufferPacking.wgsl is one of them); per car the lightmap lookup is in lightingShader
-      includes: perPixel ? [...SkyVisibilityLightmap.resolveIncludes, skyVisibilityTrace] : SkyVisibilityLightmap.resolveIncludes,
+      // terrainSun.wgsl: the hills in the way of the sun, which the rays don't trace
+      includes: perPixel ? [...SkyVisibilityLightmap.resolveIncludes, skyVisibilityTrace, terrainSun] : [...SkyVisibilityLightmap.resolveIncludes, terrainSun],
       defines: { SHADOW: shadow, PER_PIXEL: perPixel, ...(perPixel ? CityScene.traceDefines : {}) },
+      // drawn every frame: the cars are missing for the frames that the pipeline compiles in, instead of stalling them
+      asyncPipeline: true,
     });
     const car = create('cars', false);
     car.cullMode = 'back';
@@ -369,6 +379,7 @@ export default class CarTraffic implements RoadTileSink {
       height,
       type,
       x: 0, z: 0, hx: 1, hz: 0,
+      ground: 0, slope: 0,
       placed: false,
       grow: 0,
       dying: false,
@@ -403,6 +414,7 @@ export default class CarTraffic implements RoadTileSink {
     if (!car.placed) {
       car.placed = true;
       car.x = tx; car.z = tz; car.hx = dx; car.hz = dz;
+      this.placeOnGround(car);
       return true;
     }
     const a = 1 - Math.exp(-dt * POSITION_RATE);
@@ -419,7 +431,32 @@ export default class CarTraffic implements RoadTileSink {
       hx /= l; hz /= l;
     }
     car.hx = hx; car.hz = hz;
+    this.placeOnGround(car);
     return true;
+  }
+
+  /**
+   * The ground under the car from the height field: the slope from the ground under its front and back, its bottom on
+   * the line between them, not under the ground at its center (on a crest the ends float a bit instead). Flat at 0 where
+   * there are no heights (the elevation off).
+   */
+  private placeOnGround(car: Car): void {
+    const field = this.heightField;
+    if (!field) {
+      car.ground = car.slope = 0;
+      return;
+    }
+    const ox = car.hx * car.halfLength, oz = car.hz * car.halfLength;
+    const center = field.heightAt(car.x, car.z) ?? 0;
+    const front = field.heightAt(car.x + ox, car.z + oz) ?? center;
+    const back = field.heightAt(car.x - ox, car.z - oz) ?? center;
+    car.slope = car.halfLength > 0 ? (front - back) / (2 * car.halfLength) : 0;
+    car.ground = Math.max(center, (front + back) * .5);
+  }
+
+  /** The heights of the ground the cars drive on, null: flat at 0. */
+  public setHeightField(field: TerrainHeightField | null): void {
+    this.heightField = field;
   }
 
   //the distance of the lane of the car right of the center line: on a two way road in the right half
@@ -544,6 +581,8 @@ export default class CarTraffic implements RoadTileSink {
       data[o + 5] = car.halfWidth * g;
       data[o + 6] = car.height * g;
       data[o + 7] = car.type;
+      data[o + 8] = car.ground;
+      data[o + 9] = car.slope;
     }
     this.renderer.writeBuffer(this.instanceBuffer!, data.subarray(0, cars.length * CAR_FLOATS));
     return cars.length;

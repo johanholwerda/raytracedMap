@@ -17,7 +17,7 @@ struct Uniforms {
   cameraPosition : vec3<f32>,
   // toward the sun
   lightDirection : vec3<f32>,
-  // the height of the bottom of the cars
+  // the height of the bottom of the cars over the ground under them
   groundY : f32,
   carCount : u32,
   // the sky visibility lightmap, see SkyVisibilityLightmap.setResolveUniforms. Not all are used here
@@ -48,7 +48,7 @@ override SUN_SHADOWS : u32 = 1u;
 @group(0) @binding(0) var<uniform> uniforms : Uniforms;
 @group(0) @binding(1) var<storage, read> tileBuffer : array<u32>;
 @group(0) @binding(2) var<storage, read> lightingBuffer : array<u32>;
-// 2 per car, see loadCar in cars.wgsl
+// 3 per car, see loadCar in cars.wgsl
 @group(0) @binding(3) var<storage, read> cars : array<vec4<f32>>;
 // the buildings and trees of the rays, see CityScene and skyVisibilityTrace.wgsl
 @group(0) @binding(4) var<storage, read> cityBuffer : array<vec4<f32>>;
@@ -71,12 +71,16 @@ fn main(@builtin(global_invocation_id) id : vec3<u32>, @builtin(local_invocation
   var lit = false;
   var sun = 1.;
   var center = vec2<f32>(0.);
+  // the bottom of the car at its center
+  var bottom = 0.;
   if (i < uniforms.carCount) {
-    let a = cars[i * 2u];
-    let b = cars[i * 2u + 1u];
+    let a = cars[i * 3u];
+    let b = cars[i * 3u + 1u];
+    let c = cars[i * 3u + 2u];
     center = a.xy;
+    bottom = c.x + uniforms.groundY;
     let height = b.z;
-    let clip = uniforms.viewProjection * vec4(center.x, uniforms.groundY + height, center.y, 1.);
+    let clip = uniforms.viewProjection * vec4(center.x, bottom + height, center.y, 1.);
     lit = clip.w > 0. && all(abs(clip.xy) <= vec2(clip.w * VIEW_MARGIN));
     if (lit && SUN_SHADOWS == 2u) {
       // along the length and along the width
@@ -85,7 +89,8 @@ fn main(@builtin(global_invocation_id) id : vec3<u32>, @builtin(local_invocation
       let along = select(-1., 1., (corner & 1u) != 0u) * b.x;
       let across = select(-1., 1., (corner & 2u) != 0u) * b.y;
       let xz = center + u * along + v * across;
-      let p = vec3(xz.x, uniforms.groundY + height, xz.y);
+      // sheared along the slope (c.y), see cars.wgsl
+      let p = vec3(xz.x, bottom + along * c.y + height, xz.y);
       // off the roof by a part of the distance, as the rays of the deferred shading
       let d = distance(p, uniforms.cameraPosition);
       sun = select(1., 0., isOccluded(p + vec3(0., 1., 0.) * (d * 1e-4), uniforms.lightDirection));
@@ -98,7 +103,7 @@ fn main(@builtin(global_invocation_id) id : vec3<u32>, @builtin(local_invocation
   }
   var sky = 1.;
   if (lit && uniforms.lightmapEnabled != 0u) {
-    let g = vec3(center.x, uniforms.groundY, center.y);
+    let g = vec3(center.x, bottom, center.y);
     let l = getLightmapLighting(getGroundSurface(g), getLevel(g, vec3(0., 1., 0.)));
     sky = select(1., l.x, l.w > 0.);
   }

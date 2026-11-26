@@ -8,23 +8,30 @@ import ParamFloat from 'webGPU-framework/utils/params/ParamFloat';
 import ParamSelect from 'webGPU-framework/utils/params/ParamSelect';
 import MapCamera from 'webGPU-framework/utils/camera/MapCamera';
 import hash from 'webGPU-framework/shaders/hash.wgsl?raw';
-import shaderSource from '../mapOSM/shading.wgsl?raw';
-import ShadowMap, { ShadowMapAhead } from '../mapOSM/shadowMap/ShadowMap';
+import shaderSource from './osm/shading.wgsl?raw';
+import ShadowMap, { ShadowMapAhead } from './osm/shadowMap/ShadowMap';
 import viewShaderSource from './shadowMapView.wgsl?raw';
 import { SHADOW_MODES, ShadowMode } from './MapWorldSettings';
 import { setMeshQuantization } from './city/meshQuantization';
+import TerrainLayerBuffer from './osm/TerrainLayerBuffer';
+import TerrainSunMap, { TerrainMaterials } from './TerrainSunMap';
 
 /**
- * The sun: its direction (sunAngleX/Y params) and its cascaded VSM shadow map, with the buildings as the only casters.
- * The shadowMode param picks where the sun shadows come from (see ShadowMode): this shadow map, or rays against the city
- * of the lightmap (CityScene), per pixel or per lightmap texel, see DeferredShading.setSunShadows. MapWorld skips update
- * when the shadow map isn't used.
+ * The sun: its direction (sunAngleX/Y params) and its cascaded VSM shadow map, with the buildings, the trees and the
+ * ground (with elevation) as the casters. The shadowMode param picks where the sun shadows come from (see ShadowMode):
+ * this shadow map, or rays against the city of the lightmap (CityScene), per pixel or per lightmap texel, see
+ * DeferredShading.setSunShadows. The rays don't trace the ground: terrainSun adds the hills to them. MapWorld skips
+ * update when the shadow map isn't used, and updateTerrainSun when the rays aren't.
  */
 export default class SunShadows {
   public readonly shadowMap: ShadowMap;
   public lightDir: Vector3 = new Vector3(0, -1, 0);
   // Depth-only variant writing VSM moments.
   private depthMaterial: VertexFragmentShader;
+  // the same for the ground meshes (MapGeometry.groundBuffer): float vertices, both sides
+  private terrainDepthMaterial: VertexFragmentShader;
+  // the ground as the sun sees it, for the ray traced shadows, see updateTerrainSun
+  public readonly terrainSun: TerrainSunMap;
   private sampler: GPUSampler;
   private sunAngleX!: ParamFloat;
   private sunAngleY!: ParamFloat;
@@ -41,9 +48,13 @@ export default class SunShadows {
 
   constructor(private renderer: Renderer) {
     this.shadowMap = new ShadowMap(renderer);
-    // the casters are the building meshes, with their unorm16 vertices
-    this.depthMaterial = new VertexFragmentShader(renderer, 'osm', shaderSource, { includes: [hash], defines: { QUANTIZED: true } });
+    // the casters are the building meshes, with their unorm16 vertices, and the ground. DEPTH_CLAMP: a hill toward a low
+    // sun in front of the near plane of a cascade still shadows
+    this.depthMaterial = new VertexFragmentShader(renderer, 'osm', shaderSource, { includes: [hash], defines: { QUANTIZED: true, DEPTH_CLAMP: true } });
     this.depthMaterial.setConstant('DRAW_DEPTH', true);
+    this.terrainDepthMaterial = new VertexFragmentShader(renderer, 'osm', shaderSource, { includes: [hash], defines: { DEPTH_CLAMP: true } });
+    this.terrainDepthMaterial.setConstant('DRAW_DEPTH', true);
+    this.terrainDepthMaterial.cullMode = 'none';
     this.sampler = renderer.device.createSampler({
       addressModeU: 'clamp-to-edge',
       addressModeV: 'clamp-to-edge',
@@ -51,6 +62,13 @@ export default class SunShadows {
       minFilter: 'linear',
     });
     this.bindResources(this.depthMaterial);
+    this.bindResources(this.terrainDepthMaterial);
+    // the ground top down for the terrain sun map: -height, as the cascades, see TerrainSunMap
+    const heightMaterial = new VertexFragmentShader(renderer, 'osm', shaderSource, { includes: [hash], defines: { DEPTH_CLAMP: true } });
+    heightMaterial.setConstant('DRAW_DEPTH', true);
+    heightMaterial.cullMode = 'none';
+    this.bindResources(heightMaterial);
+    this.terrainSun = new TerrainSunMap(renderer, heightMaterial);
 
     this.viewMaterial = new VertexFragmentShader(renderer, 'shadowMapView', viewShaderSource);
     this.viewMaterial.depthWriteEnabled = false;
@@ -110,8 +128,10 @@ export default class SunShadows {
    * Renders the cascades that need it, returns whether they settled. With ahead the cascades go in front of the camera
    * instead of around its pivot, see ShadowMap.update.
    */
-  // casters: the building meshes and the decoding of their vertices, see setMeshQuantization
-  public update(camera: MapCamera, castersChanged: boolean, casters: { meshes: Mesh[]; quantization: number[] }, ahead: ShadowMapAhead | null = null): boolean {
+  // casters: the building meshes and the decoding of their vertices, see setMeshQuantization. ground: the ground meshes,
+  // null without elevation (the flat ground at 0 is what an empty texel means already)
+  public update(camera: MapCamera, castersChanged: boolean, casters: { meshes: Mesh[]; quantization: number[] }, ground: TerrainLayerBuffer | null,
+    ahead: ShadowMapAhead | null = null): boolean {
     return this.shadowMap.update(
       this.lightDir,
       camera.pivot.worldPosition,
@@ -123,9 +143,24 @@ export default class SunShadows {
           setMeshQuantization(this.depthMaterial, casters.quantization, i);
           this.renderer.draw(mesh, this.depthMaterial);
         });
+        if (ground) {
+          this.terrainDepthMaterial.setMatrix('viewProjection', cam.viewProjection);
+          ground.draw(this.terrainDepthMaterial);
+        }
       },
       ahead,
     );
+  }
+
+  /**
+   * The ground in the way of the sun for the ray traced shadows (TerrainSunMap), rendered again when stale: under the
+   * camera, as far as viewDistance (world units). ground null: no elevation, nothing in the way. materials: the
+   * materials of the ground on the same map, see TerrainSunMap.update.
+   */
+  public updateTerrainSun(camera: MapCamera, viewDistance: number, ground: TerrainLayerBuffer | null, materials: TerrainMaterials | null = null): void {
+    const p = camera.worldPosition;
+    const center = new Vector3(p.x, camera.pivot.worldPosition.y, p.z);
+    this.terrainSun.update(this.lightDir, center, viewDistance, this.sunRadius.value, ground, materials);
   }
 
   /** The 4 cascades as a 2 x 2 grid on the screen, letterboxed to a square (the shadowMap drawMode). */
@@ -140,5 +175,6 @@ export default class SunShadows {
 
   destruct(): void {
     this.shadowMap.destruct();
+    this.terrainSun.destruct();
   }
 }
