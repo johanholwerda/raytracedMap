@@ -22,6 +22,7 @@ import TAA from './taa/TAA';
 import MapGBuffer from './deferred/MapGBuffer';
 import DeferredShading from './deferred/DeferredShading';
 import WaterReflectionHalfRes from './deferred/WaterReflectionHalfRes';
+import WaterTerrainHorizon from './deferred/WaterTerrainHorizon';
 import { NOTABLE_BUILDINGS } from './map/notableBuildings';
 import { describeCity, findCity, pickRandomCity, pickStartCity } from './map/worldCities';
 import type { City } from './map/worldCities';
@@ -187,7 +188,9 @@ export default class MapWorld {
   private reflectionRays!: ParamSelect;
   // traces them when that is more than 1 pixel, before the shading
   private waterReflection!: WaterReflectionHalfRes;
-  // the ground in the reflections of the buildings, where it is in reach: see updateTerrainReflection
+  // the ground in the reflections of the buildings, where it is in reach: see updateTerrainReflection. From its horizon
+  // over the water, per block of pixels
+  private terrainHorizon!: WaterTerrainHorizon;
   private reflectTerrain!: ParamBool;
   private reflectTerrainInWater = false;
   private reflectionDarkening!: ParamFloat;
@@ -356,6 +359,9 @@ export default class MapWorld {
     this.waterReflection = new WaterReflectionHalfRes(this.renderer);
     this.waterReflection.bindCity(this.skyLightmap.cityScene);
     this.waterReflection.bindWaterRipples(this.ripples);
+    this.terrainHorizon = new WaterTerrainHorizon(this.renderer);
+    this.deferred.bindTerrainHorizon(this.terrainHorizon);
+    this.waterReflection.bindTerrainHorizon(this.terrainHorizon);
     for (const layer of this.geometry.layers) {
       if (layer.def.key === 'water' || layer.def.key === 'waterways') this.waterMaterials |= 1 << this.gBuffer.materialIndex(layer.material);
     }
@@ -370,7 +376,9 @@ export default class MapWorld {
     // the hills for the ray traced sun shadows, which trace only the buildings and the trees
     for (const material of [...this.deferred.materials, ...this.traffic.materials]) this.sun.terrainSun.bind(material);
     // and its height map for the ground in the water reflections
-    for (const material of [...this.deferred.materials, ...this.waterReflection.materials]) this.sun.terrainSun.bindHeights(material);
+    for (const material of [...this.deferred.materials, ...this.waterReflection.materials, ...this.terrainHorizon.materials]) {
+      this.sun.terrainSun.bindHeights(material);
+    }
 
     this.ui = new MapWorldUI(canvasParent, {
       getViewBounds: () => this.currentViewBounds(),
@@ -1086,6 +1094,7 @@ export default class MapWorld {
     const bias = TERRAIN_REFLECTION_BIAS_M * metersToNorm;
     this.deferred.setTerrainReflection(enabled, top, bias);
     this.waterReflection.setTerrainReflection(enabled, top, bias);
+    this.terrainHorizon.setTerrain(top, bias);
   }
 
   private draw(dirty: boolean, cameraMoving: boolean, tilesLoading: boolean, cityTilesChanged: boolean) {
@@ -1292,6 +1301,8 @@ export default class MapWorld {
       // water pixel in the shading. The traced pixel of the blocks rotates for the TAA to average.
       const [blockX, blockY] = REFLECTION_BLOCKS[this.reflectionRays.value];
       const reflectionPass = reflections && reflectBuildings && blockX * blockY > 1 ? this.waterReflection : null;
+      // the ground in them: its horizon over the water, which the rays are compared with
+      if (reflections && reflectBuildings && this.reflectTerrainInWater) this.terrainHorizon.draw(this.camera, this.gBuffer, this.waterMaterials);
       if (reflectionPass) {
         reflectionPass.setBlock(blockX, blockY);
         reflectionPass.draw(this.camera, this.gBuffer, this.waterMaterials, rippleTile, this.taa.enabled.value);
@@ -1359,6 +1370,7 @@ export default class MapWorld {
     this.deferred?.destruct();
     this.ripples?.texture.destruct();
     this.waterReflection?.destruct();
+    this.terrainHorizon?.destruct();
     this.skyLightmap?.destruct();
     this.tiltShift?.destruct();
     this.sun?.destruct();

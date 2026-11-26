@@ -11,6 +11,8 @@ import WaterRippleTexture from './waterRipples/WaterRippleTexture';
 import MapGBuffer from './MapGBuffer';
 import waterReflection from './waterReflection.wgsl?raw';
 import terrainReflection from './terrainReflection.wgsl?raw';
+import terrainHorizonLookup from './terrainHorizonLookup.wgsl?raw';
+import WaterTerrainHorizon from './WaterTerrainHorizon';
 import shader from './waterReflectionHalfRes.wgsl?raw';
 
 /**
@@ -40,7 +42,7 @@ export default class WaterReflectionHalfRes {
   constructor(renderer: Renderer) {
     this.renderer = renderer;
     this.material = new VertexFragmentShader(renderer, 'waterReflectionHalfRes', shader, {
-      includes: [cameraRay, cityLightmapSurface, ...MapGBuffer.readIncludes, waterReflection, skyVisibilityTrace, terrainReflection],
+      includes: [cameraRay, cityLightmapSurface, ...MapGBuffer.readIncludes, waterReflection, skyVisibilityTrace, terrainReflection, terrainHorizonLookup],
       defines: CityScene.traceDefines,
     });
     this.material.depthWriteEnabled = false;
@@ -61,9 +63,14 @@ export default class WaterReflectionHalfRes {
     this.material.setSampler('rippleSampler', ripples.sampler);
   }
 
+  /** The horizons the ground in the reflections is read from, see setTerrainReflection. */
+  public bindTerrainHorizon(horizon: WaterTerrainHorizon): void {
+    this.material.setTexture('terrainHorizon', horizon.target);
+  }
+
   /**
-   * The ground in the reflections (isTerrainOccluded of terrainReflection.wgsl), as DeferredShading.setTerrainReflection.
-   * The material marches the height map of TerrainSunMap.bindHeights.
+   * The ground in the reflections (isTerrainOccluded of terrainHorizonLookup.wgsl), as
+   * DeferredShading.setTerrainReflection.
    */
   public setTerrainReflection(enabled: boolean, top: number, bias: number): void {
     this.material.setFloat('reflectTerrainInWater', enabled ? 1 : 0);

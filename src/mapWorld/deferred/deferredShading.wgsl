@@ -85,7 +85,7 @@ struct Uniforms {
   sunFresnel : f32,
   // how far a point goes off its surface before it is compared with terrainSunMap, see getTerrainSunShadow
   terrainSunOffset : f32,
-  // the ground in the water reflections (REFLECT_BUILDINGS), see terrainReflection.wgsl: 0 skips it
+  // the ground in the water reflections (REFLECT_BUILDINGS), see terrainHorizonLookup.wgsl: 0 skips it
   reflectTerrainInWater : u32,
   terrainReflectionTop : f32,
   terrainReflectionBias : f32,
@@ -177,6 +177,8 @@ struct ShadowMapData {
 @group(0) @binding(26) var terrainHeights : texture_2d<f32>;
 @group(0) @binding(27) var terrainMaxHeights : texture_2d<f32>;
 @group(0) @binding(28) var terrainMaxHeightsFine : texture_2d<f32>;
+// the horizon of the ground per block of pixels, see WaterTerrainHorizon.ts
+@group(0) @binding(29) var terrainHorizon : texture_2d<f32>;
 
 // SSAO_SKY: the part of the sky the SSAO sees around the pixel, relative to an open point (1), like the composite
 // (reprojectedSSAOComposite.wgsl) applies it: faded in over its first samples, times its amount. No fog fade: the fog
@@ -580,7 +582,7 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
       if (REFLECTIONS_HALF_RES) {
         occluded = getHalfResReflection(coord, rd);
       } else {
-        occluded = select(0., 1., isOccluded(world, rd) || isTerrainOccluded(world, rd));
+        occluded = select(0., 1., isOccluded(world, rd) || isTerrainOccluded(coord, world, rd));
       }
     }
     c *= 1. - uniforms.reflectionDarkening * occluded;

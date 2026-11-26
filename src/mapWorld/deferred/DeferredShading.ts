@@ -20,6 +20,8 @@ import WaterReflectionHalfRes from './WaterReflectionHalfRes';
 import waterReflection from './waterReflection.wgsl?raw';
 import terrainSun from '../terrainSun.wgsl?raw';
 import terrainReflection from './terrainReflection.wgsl?raw';
+import terrainHorizonLookup from './terrainHorizonLookup.wgsl?raw';
+import WaterTerrainHorizon from './WaterTerrainHorizon';
 
 /**
  * Shades the gBuffer of MapWorld into the scene color, once per pixel: see deferredShading.wgsl. The materials take
@@ -42,7 +44,7 @@ export default class DeferredShading {
   constructor(renderer: Renderer) {
     this.renderer = renderer;
     this.material = new VertexFragmentShader(renderer, 'mapDeferredShading', shader, {
-      includes: [toneMap, r2, cameraRay, ...SkyVisibilityLightmap.resolveIncludes, waterReflection, skyVisibilityTrace, terrainSun, terrainReflection],
+      includes: [toneMap, r2, cameraRay, ...SkyVisibilityLightmap.resolveIncludes, waterReflection, skyVisibilityTrace, terrainSun, terrainReflection, terrainHorizonLookup],
       defines: CityScene.traceDefines,
       // about 600 ms to compile on a cold shader cache: the first frames are empty instead of stalled
       asyncPipeline: true,
@@ -117,11 +119,18 @@ export default class DeferredShading {
     for (const m of this.materials) m.setConstant('TONE_MAP', value);
   }
 
+  /** The horizons the ground in the water reflections is read from, see setTerrainReflection. */
+  public bindTerrainHorizon(horizon: WaterTerrainHorizon): void {
+    for (const m of this.materials) m.setTexture('terrainHorizon', horizon.target);
+  }
+
   /**
    * The ground in the water reflections that trace the buildings (reflectBuildings of setWaterReflections): their rays
-   * march the height map of TerrainSunMap.bindHeights too (isTerrainOccluded of terrainReflection.wgsl). enabled false
-   * skips the march, where no ground is high enough above the water (most places). top: the highest ground, world y, a
-   * ray above it ends. bias: how far above the water the rays start, world units.
+   * are compared with the horizon of the ground around the pixel (isTerrainOccluded of terrainHorizonLookup.wgsl), which
+   * WaterTerrainHorizon has to draw before the shading then. A pixel without one marches the height map of
+   * TerrainSunMap.bindHeights itself. enabled false skips it, where no ground is high enough above the water (most
+   * places). top: the highest ground, world y, a ray above it ends. bias: how far above the water the rays start, world
+   * units.
    */
   public setTerrainReflection(enabled: boolean, top: number, bias: number): void {
     for (const m of this.materials) {
