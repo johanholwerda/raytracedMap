@@ -1,4 +1,4 @@
-import { CITY_LEAF, CITY_TREE } from './cityLayout';
+import { CITY_LEAF, CITY_SLOPED, CITY_TREE } from './cityLayout';
 import type { CityTraceBlock } from './cityLayout';
 
 /*
@@ -28,9 +28,18 @@ function inverse(d: number): number {
 }
 
 //the distance to the first wall, roof or floor of the building of record r0 (a vec4 index), Infinity when it misses
-function intersectBuilding(f: Float32Array, u: Uint32Array, r0: number, ro: number[], rd: number[]): number {
+function intersectBuilding(f: Float32Array, u: Uint32Array, r0: number, ro0: number[], rd0: number[]): number {
   const base = f[r0 * 4], top = f[r0 * 4 + 1];
-  const edgeStart = u[r0 * 4 + 2], edgeCount = u[r0 * 4 + 3];
+  let edgeStart = u[r0 * 4 + 2], edgeCount = u[r0 * 4 + 3];
+  let ro = ro0, rd = rd0;
+  //a sloped prism: in the frame sheared by its slope, see hitsBuilding in skyVisibilityTrace.wgsl
+  if (edgeCount & CITY_SLOPED) {
+    const s = edgeStart * 4;
+    ro = [ro0[0], ro0[1] - f[s] * (ro0[0] - f[s + 2]) - f[s + 1] * (ro0[2] - f[s + 3]), ro0[2]];
+    rd = [rd0[0], rd0[1] - f[s] * rd0[0] - f[s + 1] * rd0[2], rd0[2]];
+    edgeStart++;
+    edgeCount = (edgeCount & ~CITY_SLOPED) >>> 0;
+  }
   let tCap = -1;
   if (rd[1] < 0 && ro[1] >= top) tCap = (top - ro[1]) / rd[1];
   else if (rd[1] > 0 && ro[1] <= base) tCap = (base - ro[1]) / rd[1];

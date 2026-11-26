@@ -926,7 +926,8 @@ export default class MapWorld {
       if (this.shadowMapSkipped) this.sun.shadowMap.reset();
       this.shadowMapSkipped = false;
       shadowsSettled = this.sun.update(this.camera, cityTilesChanged || groundChanged,
-        { meshes: this.tileStreamer.cityMeshes, quantization: this.tileStreamer.cityMeshQuantization }, ground, this.shadowsAhead());
+        { meshes: this.tileStreamer.cityMeshes, quantization: this.tileStreamer.cityMeshQuantization }, ground,
+        this.geometry.bridgeBuffers, this.shadowsAhead());
     } else {
       this.shadowMapSkipped = true;
     }

@@ -29,6 +29,9 @@ export type LayerRuntime = {
   material: VertexFragmentShader;
   buffer: TerrainLayerBuffer;
   enabled: ParamBool;
+  /** The bridge decks of the layer (MapWorld: roads, railways, paths), drawn with bridgeMaterial. */
+  bridges?: TerrainLayerBuffer;
+  bridgeMaterial?: VertexFragmentShader;
 };
 
 export type Terrain3DLayerRuntime = {

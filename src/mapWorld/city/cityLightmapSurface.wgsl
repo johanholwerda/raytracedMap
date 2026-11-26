@@ -21,6 +21,19 @@ fn getGroundSurface(p: vec3<f32>) -> Surface {
 	return Surface(SURFACE_GROUND, p.xz);
 }
 
+//the charts of the bridge decks (see buildBridges in worldGeometryCore.ts): world xz like the ground, but not the ground
+//chart, where the deck, its sides and the water under it would share texels and average the open sky over the deck
+//with the shade under it. Roof charts above the ones of getRoofChart (24 bits), per facing (up, down, sideways: the top,
+//the bottom and the sides of 1 deck are over each other) and per BRIDGE_CHART_STEP of height (decks over each other)
+const BRIDGE_CHART_BASE = 0x1000000u;
+//about 2 m (a world unit is about 900 m, see MapProjection)
+const BRIDGE_CHART_STEP = 2e-3;
+fn getBridgeSurface(p: vec3<f32>, n: vec3<f32>) -> Surface {
+	let facing = select(select(2u, 1u, n.y > .5), 3u, abs(n.y) <= .5);
+	let level = u32(clamp(floor(p.y / BRIDGE_CHART_STEP) + 32768., 0., 65535.));
+	return getRoofSurface(BRIDGE_CHART_BASE * facing + level, p);
+}
+
 //chart: the height bucket of the roof, see getRoofChart in cityLayout.ts
 fn getRoofSurface(chart: u32, p: vec3<f32>) -> Surface {
 	return Surface(SURFACE_ROOF | (chart & 0x1FFFFFFFu), p.xz);

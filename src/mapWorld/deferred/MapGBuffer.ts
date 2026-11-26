@@ -88,13 +88,14 @@ export default class MapGBuffer {
 
   /**
    * A material that draws into the gBuffer. walls: the buildings, with the lightmap attribute and the selection
-   * highlight. cullMode: 'back' for closed meshes, 'none' for the ground quad, whose winding doesn't matter.
+   * highlight. cullMode: 'back' for closed meshes, 'none' for the ground quad, whose winding doesn't matter. bridge: a
+   * ground layer's bridge decks, on lightmap charts of their own (getBridgeSurface of cityLightmapSurface.wgsl).
    */
-  public createMaterial(baseColor: Vector3, walls: boolean, cullMode: GPUCullMode = 'back'): VertexFragmentShader {
+  public createMaterial(baseColor: Vector3, walls: boolean, cullMode: GPUCullMode = 'back', bridge = false): VertexFragmentShader {
     const index = this.addPaletteColors([[baseColor.x, baseColor.y, baseColor.z]]);
     const material = new VertexFragmentShader(this.renderer, 'mapGBuffer', shader, {
       includes: [cityLightmapSurface, packing, terrainNormal],
-      defines: walls ? { WALLS: true } : {},
+      defines: walls ? { WALLS: true } : bridge ? { BRIDGE: true } : {},
       // the scene is drawn every frame, so it can be missing for the frames that its pipeline compiles in
       asyncPipeline: true,
     });

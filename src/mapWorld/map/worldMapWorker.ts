@@ -45,6 +45,7 @@ ctx.onmessage = (e: MessageEvent<WorldWorkerRequest>) => {
     const transfers: Transferable[] = [];
     if (result.terrain) for (const l of Object.values(result.terrain)) transfers.push(l.vertices.buffer, l.indices.buffer);
     if (result.ground) transfers.push(result.ground.vertices.buffer, result.ground.indices.buffer);
+    if (result.bridges) for (const l of Object.values(result.bridges)) transfers.push(l.vertices.buffer, l.indices.buffer);
     if (result.roads) transfers.push(result.roads.buffer);
     if (result.buildings) {
       const b = result.buildings;

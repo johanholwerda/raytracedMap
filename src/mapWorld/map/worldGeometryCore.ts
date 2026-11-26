@@ -17,7 +17,7 @@ import type { TraceTree } from '../city/cityLayout';
 import type { BuildingPolygon, CityTraceBlock } from '../city/cityLayout';
 import { buildTrees, TREE_MATERIAL_BASE_ID } from './worldTrees';
 import { findWallBottoms } from '../city/hiddenWalls';
-import TerrainGrid, { GRID_VERTEX_FLOATS, insideRing } from './terrainGrid';
+import TerrainGrid, { encodeNormal, GRID_VERTEX_FLOATS, insideRing } from './terrainGrid';
 
 /**
  * Pure (renderer-free) geometry core for the world map. Decodes one
@@ -74,6 +74,9 @@ export const WORLD_LAYERS: WorldLayerConfig[] = [
 ];
 
 export const WORLD_LAYER_KEYS: string[] = WORLD_LAYERS.map((l) => l.key);
+
+/** The layers whose bridges are lifted over the ground (see buildBridges): their decks are in WorldTileResult.bridges. */
+export const BRIDGE_LAYER_KEYS: string[] = ['roads', 'railways', 'paths'];
 
 /*
 The height between 2 ground layers, and between the ground quad (y 0) and the lowest one, in world units (not meters:
@@ -144,6 +147,11 @@ export type WorldTileResult = {
   /** The ground mesh under the layers (only with the terrain and heights), see TerrainGrid.buildMesh. */
   ground?: WorldTerrainLayer;
   /**
+   * The bridge decks per ground layer (roads, railways, paths; only those with bridges): solid 3D meshes over the
+   * ground, GRID_VERTEX_FLOATS per vertex with the normal in .w (encodeNormal), see buildBridges.
+   */
+  bridges?: Record<string, WorldTerrainLayer>;
+  /**
    * The center lines of the roads cars drive on (only with the terrain), see packRoad: per line its point count, width
    * (m), speed (m/s) and oneway (1: only from the first point to the last), then the points in map (x, north) coords.
    */
@@ -206,7 +214,7 @@ function classifyFill(layer: string, p: Props): FillClass | null {
       // tint whole districts.
       return GREEN_PARKS.has(cls) ? { key: 'green' } : null;
     case 'transportation':
-      // Area features (pedestrian squares, piers, bridge decks).
+      // Area features (pedestrian squares, piers, bridge decks: those are lifted, see buildBridges).
       if (cls === 'rail' || cls === 'transit' || cls === 'ferry' || cls === 'aerialway') return null;
       return { key: cls === 'path' ? 'paths' : 'roads' };
     case 'aeroway':
@@ -273,6 +281,19 @@ export function buildWorldTile(
 
   const result: WorldTileResult = {};
 
+  // the bridges: their decks (with the terrain) and their boxes in the ray tracing of the buildings
+  let decks: BridgeDecks | null = null;
+  if (wantTerrain || wantBuildings) {
+    const { lines, areas } = collectBridges(vt, toMap, metersToNorm);
+    if (lines.length || areas.length) {
+      // the tile's width in map units, for the ramps of the decks
+      const corners: number[] = [];
+      toMap({ x: 0, y: 0 } as TilePoint, 4096, corners);
+      toMap({ x: 4096, y: 0 } as TilePoint, 4096, corners);
+      decks = buildBridges(lines, areas, terrain, metersToNorm, Math.abs(corners[2] - corners[0]));
+    }
+  }
+
   if (wantTerrain) {
     // Indexed like the buildings: earcut already returns indices, so a polygon point is one vertex instead of one per
     // triangle corner (about 3x fewer vertices), and a ribbon segment is 4 vertices instead of 6. Flat (x, north) first:
@@ -289,6 +310,8 @@ export function buildWorldTile(
         if (f.type !== 3) continue;
         const c = classifyFill(layerName, f.properties as Props);
         if (!c) continue;
+        // a bridge isn't draped: its deck is lifted, see collectBridges
+        if (isBridge(layerName, f.properties as Props)) continue;
         for (const poly of classifyRings(f.loadGeometry())) {
           const flat = polygonToMap(poly, extent, toMap);
           if (!flat) continue;
@@ -319,12 +342,14 @@ export function buildWorldTile(
         const speed = layerName === 'transportation' && c.key === 'roads' ? ROAD_SPEEDS[str(props.class)] : undefined;
         // OpenMapTiles: 1 one way along the line, -1 against it
         const oneway = Number(props.oneway) || 0;
+        // a bridge isn't draped: its deck is lifted, see collectBridges. The cars drive on it (on the ground under it)
+        const bridge = isBridge(layerName, props);
         for (const ring of f.loadGeometry()) {
           if (ring.length < 2) continue;
           for (const seg of clipLineToTile(ring, extent)) {
             line.length = 0;
             for (const pt of seg) toMap(pt, extent, line);
-            addRibbon(acc[c.key], line, halfW);
+            if (!bridge) addRibbon(acc[c.key], line, halfW);
             if (speed !== undefined) packRoad(roads, line, c.width, speed, oneway);
           }
         }
@@ -349,11 +374,12 @@ export function buildWorldTile(
     }
     result.terrain = layers;
     if (terrain) result.ground = { ...terrain.buildMesh(), floats: GRID_VERTEX_FLOATS };
+    if (decks) result.bridges = decks.meshes;
     result.roads = new Float32Array(roads);
   }
 
   if (wantBuildings) {
-    result.buildings = buildBuildings(vt, tile, proj, toMap, wantTrees, terrain);
+    result.buildings = buildBuildings(vt, tile, proj, toMap, wantTrees, terrain, decks?.trace ?? []);
   }
 
   return result;
@@ -503,6 +529,448 @@ function addRibbon(out: FlatMesh, line: number[], halfW: number): void {
   }
 }
 
+// --- bridges -------------------------------------------------------------------
+
+/** A bridge line of a tile, see buildBridges. */
+type BridgeLine = {
+  key: string;
+  halfW: number;
+  /** The pieces of the line in the tile (map x, north), see clipLineToTile. */
+  lines: number[][];
+  /** OSM layer: how many levels it is over what it crosses. */
+  layer: number;
+  /** The first and the last point of the unclipped line, in tiles (0 to 1 is the tile). */
+  tileEnds: number[];
+  /** The same in map (x, north). */
+  ends: number[];
+  /** The ends (map x, north) that are ends of the bridge, see findBridgeEnds. */
+  realEnds: number[];
+};
+
+/** A bridge area of a tile (the outline of a deck), see buildBridges: its points (map x, north) and earcut triangles. */
+type BridgeArea = { key: string; layer: number; coords: number[]; tris: number[] };
+
+/** The decks of the bridges of a tile (see buildBridges) and their boxes for the ray tracing (see buildTraceBlock). */
+type BridgeDecks = { meshes: Record<string, WorldTerrainLayer>; trace: BuildingPolygon[] };
+
+function isBridge(layerName: string, p: Props): boolean {
+  return layerName === 'transportation' && p.brunnel === 'bridge';
+}
+
+/** The bridge lines and areas of the tile, of the ground layers classifyLine and classifyFill put them in. */
+function collectBridges(
+  vt: VectorTile, toMap: (pt: TilePoint, extent: number, out: number[]) => void, metersToNorm: number,
+): { lines: BridgeLine[]; areas: BridgeArea[] } {
+  const lines: BridgeLine[] = [], areas: BridgeArea[] = [];
+  const layer = vt.layers['transportation'];
+  if (!layer) return { lines, areas };
+  const extent = layer.extent || 4096;
+  for (let i = 0; i < layer.length; i++) {
+    const f = layer.feature(i);
+    const p = f.properties as Props;
+    if (!isBridge('transportation', p)) continue;
+    const level = Number(p.layer) || 1;
+    if (f.type === 3) {
+      const c = classifyFill('transportation', p);
+      if (!c) continue;
+      for (const poly of classifyRings(f.loadGeometry())) {
+        const flat = polygonToMap(poly, extent, toMap);
+        if (!flat) continue;
+        const tris = earcut(flat.coords, flat.holes.length ? flat.holes : undefined, 2);
+        if (tris.length) areas.push({ key: c.key, layer: level, coords: flat.coords, tris });
+      }
+    } else if (f.type === 2) {
+      const c = classifyLine('transportation', p);
+      if (!c) continue;
+      for (const ring of f.loadGeometry()) {
+        if (ring.length < 2) continue;
+        const pieces: number[][] = [];
+        for (const seg of clipLineToTile(ring, extent)) {
+          const line: number[] = [];
+          for (const pt of seg) toMap(pt, extent, line);
+          pieces.push(line);
+        }
+        if (!pieces.length) continue;
+        const a = ring[0], b = ring[ring.length - 1];
+        const ends: number[] = [];
+        toMap(a, extent, ends);
+        toMap(b, extent, ends);
+        lines.push({
+          key: c.key, halfW: c.width * 0.5 * metersToNorm, lines: pieces, layer: level,
+          tileEnds: [a.x / extent, a.y / extent, b.x / extent, b.y / extent], ends, realEnds: [],
+        });
+      }
+    }
+  }
+  return { lines, areas };
+}
+
+// The height (m) a bridge is over what it crosses per OSM layer, where the valley fill doesn't lift it more
+const BRIDGE_LIFT_M = 4.5;
+// The thickness (m) of a deck
+const BRIDGE_THICKNESS_M = 1.2;
+// The longest piece (m) of a deck: shorter pieces follow its height profile
+const BRIDGE_STEP_M = 6;
+/*
+The vector tiles have the lines up to 64 units (of 4096) out of the tile (OpenFreeMap). An end within END_MARGIN of the
+tile is the end of the line, further out it may be where it was cut off. The ramp of a deck at an end is shorter, so a
+point in the tile within the ramp of an end has it within END_MARGIN: the 2 tiles on both sides of an edge find the
+same ends near it, and the deck meets itself there. About 16 m at 52 degrees (a z14 tile is 1.5 km)
+ */
+const BRIDGE_END_MARGIN = 48 / 4096;
+const BRIDGE_RAMP = 44 / 4096;
+// 2 line ends this close (tiles) are the same point: the joint of 2 lines of 1 bridge, not an end of it
+const BRIDGE_JOINT = 1.5 / 4096;
+const BRIDGE_MITER_LIMIT = 2;
+// a box of the ray tracing is in the plane of a stretch of a deck that strays at most this much from it (m), see
+// buildBridges: the box is BRIDGE_THICKNESS_M - this thick at least
+const BRIDGE_TRACE_FLAT_M = 0.3;
+// and at most this many segments of a line (BRIDGE_STEP_M each): a curved bridge in a few boxes, not 1 wide one
+const BRIDGE_TRACE_RUN = 12;
+
+/**
+ * Marks the ends of the bridges (realEnds): the ends of their lines in or near the tile that no other bridge line ends at
+ * (a long bridge is often a few lines, which meet in the middle of it).
+ */
+function findBridgeEnds(bridges: BridgeLine[]): void {
+  const inside = (x: number, y: number) =>
+    x >= -BRIDGE_END_MARGIN && x <= 1 + BRIDGE_END_MARGIN && y >= -BRIDGE_END_MARGIN && y <= 1 + BRIDGE_END_MARGIN;
+  bridges.forEach((b, bi) => {
+    for (let e = 0; e < 2; e++) {
+      const x = b.tileEnds[e * 2], y = b.tileEnds[e * 2 + 1];
+      if (!inside(x, y)) continue;
+      const joint = bridges.some((o, oi) => {
+        for (let k = 0; k < 2; k++) {
+          if (oi === bi && k === e) continue;
+          if (Math.abs(o.tileEnds[k * 2] - x) <= BRIDGE_JOINT && Math.abs(o.tileEnds[k * 2 + 1] - y) <= BRIDGE_JOINT) return true;
+        }
+        return false;
+      });
+      if (!joint) b.realEnds.push(b.ends[e * 2], b.ends[e * 2 + 1]);
+    }
+  });
+}
+
+/**
+ * The bridge decks of a tile: per line a box along it, BRIDGE_THICKNESS_M thick, its top at the height of the deck (see
+ * deckHeight) plus the lift of its ground layer, so it meets the draped road at its ends. Per point of the line (cut into
+ * pieces of BRIDGE_STEP_M) 8 vertices: the top 2 with the normal of the deck (up, tilted along a ramp), the sides 2 + 2
+ * with the normal sideways, the bottom 2 with the normal down (encodeNormal). Drawn without culling.
+ * tileSize: the width of the tile in map units.
+ */
+function buildBridges(
+  bridges: BridgeLine[], areas: BridgeArea[], terrain: TerrainGrid | null, metersToNorm: number, tileSize: number,
+): BridgeDecks {
+  findBridgeEnds(bridges);
+  const ramp = BRIDGE_RAMP * tileSize;
+  const thickness = BRIDGE_THICKNESS_M * metersToNorm;
+  const step = BRIDGE_STEP_M * metersToNorm;
+  // the most a deck may stray from the plane of its trace box
+  const flat = BRIDGE_TRACE_FLAT_M * metersToNorm;
+
+  /*
+  The boxes of the ray tracing (see buildTraceBlock): per stretch of a deck that is about planar one sloped prism (see
+  BuildingPolygon.slope) in that plane, inside the deck: its top at the lowest the deck top is over the plane (without
+  the lift of the ground layer), its base at the highest the deck bottom is. A ray that starts inside a box and leaves it
+  through a side is blocked, so every deck surface has to be on or outside every box: on a ramp, and where decks of other
+  layers overlap (a road, its sidewalk, the area under both, of the same deckHeight but each lifted by its LAYER_Y). Two
+  boxes of a deck overlap in height where they meet (both are in the deck there, at least thickness - 2 flat thick), so
+  no light leaks between them. A level span is 1 box, a ramp a few. The ray tracing tests a point in a footprint even-odd
+  over all its edges, so a footprint may have any rings, in any order.
+  A plane: gx, gn the rise per map unit of x and north, through 0 at the first point of the footprint
+   */
+  const trace: BuildingPolygon[] = [];
+  const box = (coords: number[], ringStarts: number[], ringEnds: number[], gx: number, gn: number, lo: number, hi: number, lift: number) =>
+    trace.push({ coords, ringStarts, ringEnds, base: hi - thickness, top: lo - lift, roofChart: 0, slope: [gx, -gn] });
+
+  // a line (its 8 vertices per point in v from vertex first, see below): runs of segments, each its outline
+  const traceLine = (v: number[], first: number, hs: Float64Array, lift: number) => {
+    const n = hs.length;
+    // the corner of point i: left (vertex 0) or right (vertex 1), map x, north
+    const cx = (i: number, side: number) => v[(first + i * 8 + side) * GRID_VERTEX_FLOATS];
+    const cn = (i: number, side: number) => -v[(first + i * 8 + side) * GRID_VERTEX_FLOATS + 2];
+    let s = 0;
+    while (s < n - 1) {
+      // the plane along the first segment, through 0 at the right corner of point s (the first of the footprint)
+      const dx = (cx(s + 1, 0) + cx(s + 1, 1) - cx(s, 0) - cx(s, 1)) / 2;
+      const dn = (cn(s + 1, 0) + cn(s + 1, 1) - cn(s, 0) - cn(s, 1)) / 2;
+      const len2 = dx * dx + dn * dn || 1;
+      const gx = (hs[s + 1] - hs[s]) * dx / len2, gn = (hs[s + 1] - hs[s]) * dn / len2;
+      const x0 = cx(s, 1), n0 = cn(s, 1);
+      const dev = (i: number, side: number) => hs[i] - gx * (cx(i, side) - x0) - gn * (cn(i, side) - n0);
+      let lo = Infinity, hi = -Infinity, e = s;
+      for (let i = s; i < n; i++) {
+        const a = dev(i, 0), b = dev(i, 1);
+        const nlo = Math.min(lo, a, b), nhi = Math.max(hi, a, b);
+        if (i > s + 1 && (nhi - nlo > flat || i - s > BRIDGE_TRACE_RUN)) break;
+        lo = nlo; hi = nhi; e = i;
+      }
+      // counter-clockwise: the right side forward, the left side back
+      const coords: number[] = [];
+      for (let i = s; i <= e; i++) coords.push(cx(i, 1), cn(i, 1));
+      for (let i = e; i >= s; i--) coords.push(cx(i, 0), cn(i, 0));
+      box(coords, [0], [coords.length / 2], gx, gn, lo, hi, lift);
+      s = e;
+    }
+  };
+
+  // an area: patches of adjacent triangles about in the plane of their first one, each the rings of its outline
+  const traceArea = (
+    coords: number[], tris: number[], hs: Float64Array, lift: number,
+    edges: Map<number, number[]>, edgeKey: (a: number, b: number) => number,
+  ) => {
+    const count = tris.length / 3;
+    const group = new Int32Array(count).fill(-1);
+    for (let seed = 0; seed < count; seed++) {
+      if (group[seed] >= 0) continue;
+      // the plane of the seed triangle
+      const a = tris[seed * 3], b = tris[seed * 3 + 1], c = tris[seed * 3 + 2];
+      const x1 = coords[b * 2] - coords[a * 2], n1 = coords[b * 2 + 1] - coords[a * 2 + 1], h1 = hs[b] - hs[a];
+      const x2 = coords[c * 2] - coords[a * 2], n2 = coords[c * 2 + 1] - coords[a * 2 + 1], h2 = hs[c] - hs[a];
+      const det = x1 * n2 - x2 * n1;
+      const ok = Math.abs(det) > 1e-18;
+      const gx = ok ? (h1 * n2 - h2 * n1) / det : 0, gn = ok ? (x1 * h2 - x2 * h1) / det : 0;
+      const dev = (k: number) => hs[k] - gx * coords[k * 2] - gn * coords[k * 2 + 1];
+      let lo = Infinity, hi = -Infinity;
+      for (let k = 0; k < 3; k++) { lo = Math.min(lo, dev(tris[seed * 3 + k])); hi = Math.max(hi, dev(tris[seed * 3 + k])); }
+      group[seed] = seed;
+      const members = [seed];
+      for (let m = 0; m < members.length; m++) {
+        const t = members[m];
+        for (let e = 0; e < 3; e++) {
+          for (const u of edges.get(edgeKey(tris[t * 3 + e], tris[t * 3 + (e + 1) % 3]))!) {
+            if (group[u] >= 0) continue;
+            let ulo = lo, uhi = hi;
+            for (let k = 0; k < 3; k++) { ulo = Math.min(ulo, dev(tris[u * 3 + k])); uhi = Math.max(uhi, dev(tris[u * 3 + k])); }
+            if (uhi - ulo > flat) continue;
+            group[u] = seed; lo = ulo; hi = uhi;
+            members.push(u);
+          }
+        }
+      }
+      // the outline: the edges (in the winding of their triangle) without a neighbour in the patch, chained into rings
+      const next = new Map<number, number[]>();
+      for (const t of members) {
+        for (let e = 0; e < 3; e++) {
+          const p0 = tris[t * 3 + e], p1 = tris[t * 3 + (e + 1) % 3];
+          if (edges.get(edgeKey(p0, p1))!.some((u) => u !== t && group[u] === seed)) continue;
+          const list = next.get(p0);
+          if (list) list.push(p1); else next.set(p0, [p1]);
+        }
+      }
+      const ring: number[] = [], starts: number[] = [], ends: number[] = [];
+      for (const [start, list] of next) {
+        while (list.length) {
+          starts.push(ring.length / 2);
+          let p = start;
+          do {
+            ring.push(coords[p * 2], coords[p * 2 + 1]);
+            p = next.get(p)!.pop()!;
+          } while (p !== start && next.get(p)?.length);
+          ends.push(ring.length / 2);
+        }
+      }
+      if (!ring.length) continue;
+      // the devs are over the plane through 0 at (0, 0): over the one through 0 at the first point of the footprint
+      const at0 = gx * ring[0] + gn * ring[1];
+      box(ring, starts, ends, gx, gn, lo + at0, hi + at0, lift);
+    }
+  };
+  const out: Record<string, { vertices: number[]; indices: number[] }> = {};
+  const down = encodeNormal(0, -1, 0);
+
+  /*
+  The top of the deck at (x, north): from the ground at an end of the bridge up to the higher of the valley fill (the
+  rims of the valley it spans, see TerrainGrid.fillHeightAt) and the lift of its layer over the ground, along a
+  smoothstep over the ramp. Only the position and the ends near it count, so 2 tiles agree on their shared edge
+   */
+  const deckHeight = (ends: number[], layer: number, x: number, y: number): number => {
+    const ground = terrain ? terrain.heightAt(x, y) : 0;
+    const fill = terrain ? terrain.fillHeightAt(x, y) : 0;
+    let d = Infinity;
+    for (let k = 0; k < ends.length; k += 2) d = Math.min(d, Math.hypot(x - ends[k], y - ends[k + 1]));
+    const t = Math.min(d / ramp, 1);
+    const s = t * t * (3 - 2 * t);
+    return ground + s * Math.max(fill - ground, Math.max(layer, 0) * BRIDGE_LIFT_M * metersToNorm);
+  };
+
+  // The ends of all the bridge lines, for every deck: an area has no ends of its own (the roads on it end where it does),
+  // and a road, its sidewalks and the area under them get the same height where they overlap
+  const allEnds: number[] = [];
+  for (const b of bridges) allEnds.push(...b.realEnds);
+  for (const area of areas) {
+    const mesh = out[area.key] ??= { vertices: [], indices: [] };
+    const { coords, tris } = subdivideTriangles(area.coords, area.tris, step * 2);
+    const n = coords.length / 2;
+    const lift = LAYER_Y[area.key];
+    const hs = new Float64Array(n);
+    for (let i = 0; i < n; i++) hs[i] = deckHeight(allEnds, area.layer, coords[i * 2], coords[i * 2 + 1]) + lift;
+    const v = mesh.vertices, idx = mesh.indices;
+    // the top (up) and the bottom (down, reversed)
+    const top = v.length / GRID_VERTEX_FLOATS, up = encodeNormal(0, 1, 0);
+    for (let i = 0; i < n; i++) v.push(coords[i * 2], hs[i], -coords[i * 2 + 1], up);
+    const bottom = v.length / GRID_VERTEX_FLOATS;
+    for (let i = 0; i < n; i++) v.push(coords[i * 2], hs[i] - thickness, -coords[i * 2 + 1], down);
+    for (let t = 0; t < tris.length; t += 3) {
+      const a = tris[t], b = tris[t + 1], c = tris[t + 2];
+      idx.push(top + a, top + b, top + c);
+      idx.push(bottom + a, bottom + c, bottom + b);
+    }
+    // the triangles of each edge, for the outline (edges of 1 triangle) and the trace patches
+    const edges = new Map<number, number[]>();
+    const edgeKey = (a: number, b: number) => Math.min(a, b) * n + Math.max(a, b);
+    for (let t = 0; t < tris.length; t += 3) {
+      for (let e = 0; e < 3; e++) {
+        const k = edgeKey(tris[t + e], tris[t + (e + 1) % 3]);
+        const list = edges.get(k);
+        if (list) list.push(t / 3); else edges.set(k, [t / 3]);
+      }
+    }
+    traceArea(coords, tris, hs, lift, edges, edgeKey);
+    // the sides: along the edges of 1 triangle only (the outline), facing out (right of the counter-clockwise edge)
+    for (let t = 0; t < tris.length; t += 3) {
+      for (let e = 0; e < 3; e++) {
+        const a = tris[t + e], b = tris[t + (e + 1) % 3];
+        if (edges.get(edgeKey(a, b))!.length !== 1) continue;
+        const ax = coords[a * 2], ay = coords[a * 2 + 1], bx = coords[b * 2], by = coords[b * 2 + 1];
+        const len = Math.hypot(bx - ax, by - ay);
+        if (len === 0) continue;
+        // out: (dy, -dx) in (x, north), engine (dy, 0, dx)
+        const nx = (by - ay) / len, ny = -(bx - ax) / len;
+        const side = encodeNormal(nx, 0, -ny);
+        const w = v.length / GRID_VERTEX_FLOATS;
+        v.push(ax, hs[a], -ay, side, bx, hs[b], -by, side, bx, hs[b] - thickness, -by, side, ax, hs[a] - thickness, -ay, side);
+        idx.push(w, w + 1, w + 2, w, w + 2, w + 3);
+      }
+    }
+  }
+
+  for (const b of bridges) {
+    const mesh = out[b.key] ??= { vertices: [], indices: [] };
+    const lift = LAYER_Y[b.key];
+    for (const line of b.lines) {
+      // the points, without repeats, cut into pieces of at most step
+      const xs: number[] = [], ys: number[] = [];
+      for (let i = 0; i < line.length; i += 2) {
+        const x = line[i], y = line[i + 1];
+        const k = xs.length - 1;
+        if (k >= 0 && xs[k] === x && ys[k] === y) continue;
+        if (k >= 0) {
+          const px = xs[k], py = ys[k];
+          const pieces = Math.ceil(Math.hypot(x - px, y - py) / step);
+          for (let p = 1; p < pieces; p++) { xs.push(px + (x - px) * p / pieces); ys.push(py + (y - py) * p / pieces); }
+        }
+        xs.push(x); ys.push(y);
+      }
+      const n = xs.length;
+      if (n < 2) continue;
+      const hs = new Float64Array(n);
+      for (let i = 0; i < n; i++) hs[i] = deckHeight(allEnds, b.layer, xs[i], ys[i]) + lift;
+
+      const first = mesh.vertices.length / GRID_VERTEX_FLOATS;
+      const v = mesh.vertices;
+      for (let i = 0; i < n; i++) {
+        // the unit directions of the segments before and after the point (the one segment at an end)
+        const i0 = Math.max(i - 1, 0), i1 = Math.min(i + 1, n - 1);
+        const pa = i > 0 ? i - 1 : 0, pb = i > 0 ? i : 1;
+        const na = i < n - 1 ? i : n - 2, nb = na + 1;
+        const pl = Math.hypot(xs[pb] - xs[pa], ys[pb] - ys[pa]), nl = Math.hypot(xs[nb] - xs[na], ys[nb] - ys[na]);
+        const pdx = (xs[pb] - xs[pa]) / pl, pdy = (ys[pb] - ys[pa]) / pl;
+        const ndx = (xs[nb] - xs[na]) / nl, ndy = (ys[nb] - ys[na]) / nl;
+        // the left normal mitered between both: halfW / cos long, cos between it and the normal of the next segment
+        let mx = -pdy - ndy, my = pdx + ndx;
+        const ml = Math.hypot(mx, my);
+        if (ml < 1e-9) { mx = -ndy; my = ndx; } else { mx /= ml; my /= ml; }
+        const cos = Math.max(mx * -ndy + my * ndx, 1 / BRIDGE_MITER_LIMIT);
+        const ox = mx * b.halfW / cos, oy = my * b.halfW / cos;
+
+        // the slope along the line, for the normal of the top: it rises sl per unit along (dx, dn) in (x, north)
+        const run = Math.hypot(xs[i1] - xs[i0], ys[i1] - ys[i0]) || 1;
+        const sl = (hs[i1] - hs[i0]) / run;
+        const dx = (xs[i1] - xs[i0]) / run, dn = (ys[i1] - ys[i0]) / run;
+        // engine space: (x, height, -north)
+        const tl = Math.hypot(sl, 1);
+        const top = encodeNormal(-sl * dx / tl, 1 / tl, sl * dn / tl);
+        // the left side faces (mx, my) in (x, north): engine (mx, 0, -my)
+        const left = encodeNormal(mx, 0, -my), right = encodeNormal(-mx, 0, my);
+        const h = hs[i], lo = h - thickness;
+        const lx = xs[i] + ox, ly = ys[i] + oy, rx = xs[i] - ox, ry = ys[i] - oy;
+        v.push(
+          lx, h, -ly, top, rx, h, -ry, top, // 0, 1: top left, right
+          lx, h, -ly, left, lx, lo, -ly, left, // 2, 3: left side top, bottom
+          rx, h, -ry, right, rx, lo, -ry, right, // 4, 5: right side top, bottom
+          lx, lo, -ly, down, rx, lo, -ry, down, // 6, 7: bottom left, right
+        );
+      }
+      traceLine(v, first, hs, lift);
+      const idx = mesh.indices;
+      for (let i = 0; i + 1 < n; i++) {
+        const a = first + i * 8, c = a + 8;
+        // the quads between 2 points (p, q here, then q, p at the next) as 2 triangles: top, sides, bottom
+        for (const [p, q] of [[0, 1], [3, 2], [4, 5], [7, 6]]) {
+          idx.push(a + p, a + q, c + q, a + p, c + q, c + p);
+        }
+      }
+    }
+  }
+
+  const meshes: Record<string, WorldTerrainLayer> = {};
+  for (const key in out) {
+    const m = out[key];
+    meshes[key] = { vertices: new Float32Array(m.vertices), indices: new Uint32Array(m.indices), floats: GRID_VERTEX_FLOATS };
+  }
+  return { meshes, trace };
+}
+
+/**
+ * Splits the triangles (coords: x, north per point; tris: 3 point indices each) until no edge is longer than maxLen, so
+ * the points can follow a height profile. An edge is halved when it is too long, whichever triangle it is of, at a point
+ * the triangles on both sides share: no cracks. A triangle with 1, 2 or 3 halved edges becomes 2, 3 or 4, in its winding.
+ */
+function subdivideTriangles(coords0: number[], tris0: ArrayLike<number>, maxLen: number): { coords: number[]; tris: number[] } {
+  const coords = coords0.slice();
+  let tris = Array.from(tris0);
+  const maxSq = maxLen * maxLen;
+  for (let pass = 0; pass < 12; pass++) {
+    const mids = new Map<string, number>();
+    const mid = (a: number, b: number): number => {
+      const dx = coords[a * 2] - coords[b * 2], dy = coords[a * 2 + 1] - coords[b * 2 + 1];
+      if (dx * dx + dy * dy <= maxSq) return -1;
+      const key = a < b ? `${a},${b}` : `${b},${a}`;
+      let m = mids.get(key);
+      if (m === undefined) {
+        m = coords.length / 2;
+        coords.push((coords[a * 2] + coords[b * 2]) / 2, (coords[a * 2 + 1] + coords[b * 2 + 1]) / 2);
+        mids.set(key, m);
+      }
+      return m;
+    };
+    const next: number[] = [];
+    for (let t = 0; t < tris.length; t += 3) {
+      const p = [tris[t], tris[t + 1], tris[t + 2]];
+      const m = [mid(p[0], p[1]), mid(p[1], p[2]), mid(p[2], p[0])];
+      const split = m.filter((x) => x >= 0).length;
+      if (split === 0) { next.push(p[0], p[1], p[2]); continue; }
+      if (split === 3) {
+        next.push(p[0], m[0], m[2], m[0], p[1], m[1], m[2], m[1], p[2], m[0], m[1], m[2]);
+        continue;
+      }
+      // rotate so that edge 0 (a, b) is halved, and with 2 halved edges also edge 1 (b, c)
+      let r = 0;
+      if (split === 1) r = m.findIndex((x) => x >= 0);
+      else r = m[2] < 0 ? 0 : m[0] < 0 ? 1 : 2;
+      const a = p[r], b = p[(r + 1) % 3], c = p[(r + 2) % 3];
+      const mab = m[r], mbc = m[(r + 1) % 3];
+      if (split === 1) next.push(a, mab, c, mab, b, c);
+      else next.push(mab, b, mbc, a, mab, mbc, a, mbc, c);
+    }
+    const done = next.length === tris.length;
+    tris = next;
+    if (done) break;
+  }
+  return { coords, tris };
+}
+
 // --- buildings -----------------------------------------------------------------
 
 // Exported for the headless test of the city lightmap.
@@ -516,6 +984,7 @@ export function buildBuildings(
   toMap: (pt: TilePoint, extent: number, out: number[]) => void,
   wantTrees = false,
   terrain: TerrainGrid | null = null,
+  bridges: BuildingPolygon[] = [],
 ): WorldBuildingResult {
   const verts: number[] = [];
   // Per vertex the lightmap chart, see SkyVisibilityLightmap: (atlas u, atlas v) of the start of a wall, (roof chart, -1)
@@ -740,7 +1209,9 @@ export function buildBuildings(
   // The ground plane of the ray tracing is the ground quad (y 0), the layers lie a few cm over it (see LAYER_GAP). On
   // the terrain the bases are on the ground already
   const buildingFootprints = footprints.slice(0, treeStart);
-  const trace = buildTraceBlock(buildingFootprints, traceTrees, terrain ? null : 0, buildingFootprints.map((fp) => fp.id));
+  // the bridge decks are in it too (see buildBridges), without an id: they shadow and occlude the sky, no picking
+  const trace = buildTraceBlock([...buildingFootprints, ...bridges], traceTrees, terrain ? null : 0,
+    [...buildingFootprints.map((fp) => fp.id), ...bridges.map(() => NO_FEATURE_ID)]);
   const { vertices, quantization } = quantizeVertices(verts, min, max);
   const lightmapData = new Float32Array(lightmap);
   return {

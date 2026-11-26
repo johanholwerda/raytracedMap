@@ -8,6 +8,8 @@ const MIN_DIST: f32 = 2e-5;
 //a child of a node that is a record, and the count of a tree record, see CityTraceBlock in cityLayout.ts
 const CITY_LEAF = 0x80000000u;
 const CITY_TREE = 0x80000000u;
+//on the count of a building record: a sloped prism, see CityTraceBlock in cityLayout.ts
+const CITY_SLOPED = 0x40000000u;
 //the top level BVH (the tiles) and the BVH of a tile (a dense one is about 16 deep) on 1 stack. Only 32 is safe (the
 //most depth, see BLOCK_DEPTH_MAX and TOP_DEPTH_MAX in cityLayout.ts): a push past the end drops the far child, which
 //misses its buildings. On real rays of Amsterdam and New York 8 missed 2-3 hits in a million, 16 none, and on an S23
@@ -44,14 +46,24 @@ fn cross2(a: vec2<f32>, b: vec2<f32>) -> f32 {
 whether the ray hits a building: its footprint (with its holes) extruded from its base to its flat roof, see
 intersectBuilding in cityTrace.wgsl. A wall the ray crosses between the base and the roof ends it in the loop over the
 edges. Else the point where the ray crosses the plane of the roof (from above) or of the floor (from below) is inside the
-footprint, even-odd, which takes all edges.
+footprint, even-odd, which takes all edges. A sloped prism (CITY_SLOPED, a bridge deck) is that in the frame sheared by
+its slope: y - the rise over its origin. The distances along the ray stay, the shear moves no x or z.
 r0: the building record (base, top, edgeStart, edgeCount)
  */
-fn hitsBuilding(ro: vec3<f32>, rd: vec3<f32>, r0: vec4<f32>) -> bool {
+fn hitsBuilding(ro0: vec3<f32>, rd0: vec3<f32>, r0: vec4<f32>) -> bool {
 	let base = r0.x;
 	let top = r0.y;
-	let edgeStart = bitcast<u32>(r0.z);
-	let edgeCount = bitcast<u32>(r0.w);
+	var edgeStart = bitcast<u32>(r0.z);
+	var edgeCount = bitcast<u32>(r0.w);
+	var ro = ro0;
+	var rd = rd0;
+	if((edgeCount & CITY_SLOPED) != 0u){
+		let s = cityBuffer[edgeStart];
+		ro.y -= dot(s.xy, ro.xz - s.zw);
+		rd.y -= dot(s.xy, rd.xz);
+		edgeStart++;
+		edgeCount &= ~CITY_SLOPED;
+	}
 
 	var tCap = -1.;
 	if(rd.y < 0. && ro.y >= top){

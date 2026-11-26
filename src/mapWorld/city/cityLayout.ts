@@ -44,6 +44,8 @@ const ROOF_CHART_OFFSET_M = 10000;
 export const CITY_LEAF = 0x80000000;
 //the count of a tree record, see CityTraceBlock
 export const CITY_TREE = 0x80000000;
+//on the count of a building record: a sloped prism, its slope the vec4 at start, see CityTraceBlock
+export const CITY_SLOPED = 0x40000000;
 //the most depth of the BVH of a tile, and of the top level BVH over the tiles (1024 tiles at most): together within
 //CITY_STACK_SIZE of skyVisibilityTrace.wgsl
 export const BLOCK_DEPTH_MAX = 22;
@@ -58,6 +60,9 @@ export type BuildingPolygon = {
   top: number;
   //the chart of the roof, see getRoofChart
   roofChart: number;
+  //a sloped prism (a bridge deck, see buildBridges): its floor and roof rise slope[0] per unit of x and slope[1] per
+  //unit of z (engine space: z = -north). base and top are their heights at the first point of coords
+  slope?: [number, number];
 };
 
 /**
@@ -67,8 +72,10 @@ export type BuildingPolygon = {
  *  (the layout of ModelBVH). A child is the vec4 index of a node, or of a record | CITY_LEAF
  * -buildingCount building records, then treeCount tree records, 1 vec4 each: (base, top, start, count). The base is the
  *  one of the ray tracing: down to the ground for a building on it, see groundY. start is a vec4 index. On a building
- *  count is its number of edges, on a tree it is CITY_TREE
- * -edgeCount edges, 1 vec4 each: (a.x, a.z, b.x, b.z)
+ *  count is its number of edges, on a tree it is CITY_TREE. On a sloped prism (BuildingPolygon.slope) count is its
+ *  number of edges | CITY_SLOPED and start is its slope: (dy/dx, dy/dz, x, z), base and top are at (x, z) and its edges
+ *  follow. In the frame sheared by the slope (y - dy/dx (x - x0) - dy/dz (z - z0)) it is a prism like any other
+ * -edgeCount edges, 1 vec4 each (and 1 slope vec4 per sloped prism): (a.x, a.z, b.x, b.z)
  * -treeCount tree shapes, 2 vec4s each, see TraceTree: (center.x, center.z, u.x, u.z), (crown base, trunk half width /
  *  crown half width, 0, 0). u is the half axis of the crown divided by its length squared: the crown is [-1, 1] on u
  *  and on u turned by 90 degrees, the trunk [-k, k]
@@ -310,6 +317,10 @@ export function buildTraceBlock(polygons: BuildingPolygon[], trees: TraceTree[],
   let edgeCount = 0;
   for (const p of polygons) {
     let minX = Infinity, minZ = Infinity, maxX = -Infinity, maxZ = -Infinity;
+    //the rise of a sloped prism over its first point, at its lowest and highest point
+    let minRise = 0, maxRise = 0;
+    const [sx, sz] = p.slope ?? [0, 0];
+    const x0 = p.coords[0], z0 = -p.coords[1];
     for (let r = 0; r < p.ringStarts.length; r++) {
       const s = p.ringStarts[r], e = p.ringEnds[r];
       const n = e - s;
@@ -318,12 +329,15 @@ export function buildTraceBlock(polygons: BuildingPolygon[], trees: TraceTree[],
         const x = p.coords[ia * 2], z = -p.coords[ia * 2 + 1];
         minX = Math.min(minX, x); maxX = Math.max(maxX, x);
         minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
+        const rise = sx * (x - x0) + sz * (z - z0);
+        minRise = Math.min(minRise, rise); maxRise = Math.max(maxRise, rise);
         if (p.coords[ia * 2] !== p.coords[ib * 2] || p.coords[ia * 2 + 1] !== p.coords[ib * 2 + 1]) edgeCount++;
       }
     }
-    const base = groundY !== null && p.base <= 0 ? groundY : p.base;
-    boxMin.push(new Vector3(minX, base, minZ));
-    boxMax.push(new Vector3(maxX, p.top, maxZ));
+    if (p.slope) edgeCount++;
+    const base = groundY !== null && p.base <= 0 && !p.slope ? groundY : p.base;
+    boxMin.push(new Vector3(minX, base + minRise, minZ));
+    boxMax.push(new Vector3(maxX, p.top + maxRise, maxZ));
   }
   //a tree is in the box around its crown: the trunk is under it and narrower. In x, z the half axis of the crown is
   //(cos, -sin) * crownHalf (the corners of square in worldTrees.ts, z = -north), its box reaches |cos| + |sin| of it
@@ -361,6 +375,11 @@ export function buildTraceBlock(polygons: BuildingPolygon[], trees: TraceTree[],
   let edge = 0;
   polygons.forEach((p, pi) => {
     const record = (recordStart + pi) * 4;
+    if (p.slope) {
+      const o = (edgeStart + edge) * 4;
+      f[o] = p.slope[0]; f[o + 1] = p.slope[1]; f[o + 2] = p.coords[0]; f[o + 3] = -p.coords[1];
+      edge++;
+    }
     const first = edge;
     for (let r = 0; r < p.ringStarts.length; r++) {
       const s = p.ringStarts[r], e = p.ringEnds[r];
@@ -375,10 +394,10 @@ export function buildTraceBlock(polygons: BuildingPolygon[], trees: TraceTree[],
         edge++;
       }
     }
-    f[record] = boxMin[pi].y;
+    f[record] = p.slope ? p.base : boxMin[pi].y;
     f[record + 1] = p.top;
-    u[record + 2] = edgeStart + first;
-    u[record + 3] = edge - first;
+    u[record + 2] = edgeStart + first - (p.slope ? 1 : 0);
+    u[record + 3] = (edge - first) | (p.slope ? CITY_SLOPED : 0);
   });
   trees.forEach((t, ti) => {
     const record = (recordStart + buildingCount + ti) * 4;

@@ -132,9 +132,10 @@ export default class SunShadows {
    * instead of around its pivot, see ShadowMap.update.
    */
   // casters: the building meshes and the decoding of their vertices, see setMeshQuantization. ground: the ground meshes,
-  // null without elevation (the flat ground at 0 is what an empty texel means already)
+  // null without elevation (the flat ground at 0 is what an empty texel means already). bridges: the bridge decks, like
+  // the ground (float vertices)
   public update(camera: MapCamera, castersChanged: boolean, casters: { meshes: Mesh[]; quantization: number[] }, ground: TerrainLayerBuffer | null,
-    ahead: ShadowMapAhead | null = null): boolean {
+    bridges: TerrainLayerBuffer[], ahead: ShadowMapAhead | null = null): boolean {
     return this.shadowMap.update(
       this.lightDir,
       camera.pivot.worldPosition,
@@ -146,10 +147,9 @@ export default class SunShadows {
           setMeshQuantization(this.depthMaterial, casters.quantization, i);
           this.renderer.draw(mesh, this.depthMaterial);
         });
-        if (ground) {
-          this.terrainDepthMaterial.setMatrix('viewProjection', cam.viewProjection);
-          ground.draw(this.terrainDepthMaterial);
-        }
+        if (ground || bridges.length) this.terrainDepthMaterial.setMatrix('viewProjection', cam.viewProjection);
+        ground?.draw(this.terrainDepthMaterial);
+        for (const deck of bridges) deck.draw(this.terrainDepthMaterial);
       },
       ahead,
     );

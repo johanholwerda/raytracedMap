@@ -2,6 +2,7 @@ import LogGL from 'webGPU-framework/renderer/core/LogGL';
 import decodePngRgba8 from 'webGPU-framework/utils/image/decodePngRgba8';
 import { tileToLatLon } from '../osm/pdokDecodeCore';
 import type { TileCoord } from '../osm/PDOKTileService';
+import { TERRAIN_RING } from './terrainGrid';
 
 /*
 The height of the ground, from the terrarium elevation tiles of the AWS Open Data terrain tiles (Mapzen, Tilezen joerd):
@@ -67,20 +68,21 @@ export default class ElevationService {
 
   /**
    * The heights (m, relative to the origin) of the grid over a map tile with a ring of the neighbour tiles' around it:
-   * (cells + 3)^2, row j (from the south, -1 to cells + 1) after row, column i from the west. Lat and lng are uniform
-   * over the tile, row and column 0 and cells at its edges exactly. The ring is for the normals on the edges, see
+   * (cells + 1 + 2 * TERRAIN_RING)^2, row j (from the south, -TERRAIN_RING to cells + TERRAIN_RING) after row, column i
+   * from the west. Lat and lng are uniform over the tile, row and column 0 and cells at its edges exactly. The ring is
+   * for the normals on the edges and the valley fill of the bridges, see
    * TerrainGrid. Rejects when an elevation tile can't be loaded (the map tile retries later).
    */
   public async getTileGrid(tile: TileCoord, cells = terrainGridCells(tile.z)): Promise<Float32Array> {
     const sw = tileToLatLon(0, 1, 1, tile), ne = tileToLatLon(1, 0, 1, tile);
-    const outer = cells + 3;
+    const outer = cells + 1 + 2 * TERRAIN_RING;
     const at = (k: number, from: number, to: number) => k === 0 ? from : k === cells ? to : from + (to - from) * k / cells;
     const lats = new Float64Array(outer * outer), lngs = new Float64Array(outer * outer);
     for (let j = 0; j < outer; j++) {
-      const lat = at(j - 1, sw.lat, ne.lat);
+      const lat = at(j - TERRAIN_RING, sw.lat, ne.lat);
       for (let i = 0; i < outer; i++) {
         lats[j * outer + i] = lat;
-        lngs[j * outer + i] = at(i - 1, sw.lon, ne.lon);
+        lngs[j * outer + i] = at(i - TERRAIN_RING, sw.lon, ne.lon);
       }
     }
     const origin = this.origin;

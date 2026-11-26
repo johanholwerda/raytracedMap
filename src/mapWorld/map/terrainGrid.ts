@@ -37,6 +37,28 @@ export function encodeTerrainNormal(nx: number, nz: number): number {
   return q(nx) * 2048 + q(nz);
 }
 
+// added to an encoded normal that faces down (y < 0), see encodeNormal
+const NORMAL_DOWN = 2048 * 2048;
+
+/**
+ * Any unit normal in the .w of a vertex: encodeTerrainNormal, plus NORMAL_DOWN when it faces down (the underside of a
+ * bridge deck), still an integer under 2^24. See decodeTerrainNormal of terrainNormal.wgsl.
+ */
+export function encodeNormal(nx: number, ny: number, nz: number): number {
+  return encodeTerrainNormal(nx, nz) + (ny < 0 ? NORMAL_DOWN : 0);
+}
+
+/**
+ * The half width (grid cells) of the square window of the valley fill of the bridges, see TerrainGrid.fillHeightAt:
+ * valleys up to about 2 * this + 1 cells wide (300 to 500 m) are filled.
+ */
+export const BRIDGE_FILL_CELLS = 6;
+/**
+ * The ring of grid points of the neighbour tiles around the grid of a tile (ElevationService.getTileGrid): 1 for the
+ * normals on the edges, 2 * BRIDGE_FILL_CELLS for the valley fill, so 2 tiles fill their shared edge the same.
+ */
+export const TERRAIN_RING = 1 + 2 * BRIDGE_FILL_CELLS;
+
 export default class TerrainGrid {
   public readonly cells: number;
   /** The heights of the grid points (world units): (cells + 1)^2, row j (from the south) after row, i from the west. */
@@ -45,24 +67,29 @@ export default class TerrainGrid {
   private readonly normals: Float32Array;
   private readonly dx: number;
   private readonly dy: number;
+  // the heights with their ring, for the valley fill (made on the first fillHeightAt)
+  private readonly bordered: Float32Array;
+  private filled: Float32Array | null = null;
 
   /**
    * x0, y0: the south west corner of the tile, x1, y1 the north east one (map coordinates). bordered: the heights in
-   * world units, (cells + 3)^2 from row and column -1 to cells + 1 (ElevationService.getTileGrid): the outer ring is in
-   * the neighbour tiles, for the normals on the edges.
+   * world units, (cells + 1 + 2 * TERRAIN_RING)^2 from row and column -TERRAIN_RING to cells + TERRAIN_RING
+   * (ElevationService.getTileGrid): the outer ring is in the neighbour tiles, for the normals on the edges and the
+   * valley fill.
    */
   constructor(
     public readonly x0: number, public readonly y0: number, public readonly x1: number, public readonly y1: number,
     bordered: Float32Array,
   ) {
+    this.bordered = bordered;
     const outer = Math.round(Math.sqrt(bordered.length));
-    const n = this.cells = outer - 3;
+    const n = this.cells = outer - 1 - 2 * TERRAIN_RING;
     this.dx = (x1 - x0) / n;
     this.dy = (y1 - y0) / n;
     const side = n + 1;
     this.heights = new Float32Array(side * side);
     this.normals = new Float32Array(side * side * 3);
-    const b = (i: number, j: number) => bordered[(j + 1) * outer + i + 1];
+    const b = (i: number, j: number) => bordered[(j + TERRAIN_RING) * outer + i + TERRAIN_RING];
     for (let j = 0; j < side; j++) {
       for (let i = 0; i < side; i++) {
         this.heights[j * side + i] = b(i, j);
@@ -100,9 +127,70 @@ export default class TerrainGrid {
    * on. The same point always gives the same height, whichever piece of a cut polygon it is a vertex of.
    */
   public heightAt(x: number, y: number): number {
+    return this.interpolate(this.heights, x, y);
+  }
+
+  /**
+   * The ground at (x, north) with its valleys filled: the closing of the heights (the lowest of the highest within
+   * BRIDGE_FILL_CELLS) on the grid points, interpolated like heightAt. A slope stays as it is, a valley narrower than
+   * the window is filled up to the lower of its rims: what a bridge spans. It depends on the heights around a point
+   * only, so 2 tiles give the same on their shared edge.
+   */
+  public fillHeightAt(x: number, y: number): number {
+    if (!this.filled) this.filled = this.fillValleys();
+    return this.interpolate(this.filled, x, y);
+  }
+
+  // the closing of the heights with the square window of BRIDGE_FILL_CELLS: the max over it (dilation) on the grid and
+  // a ring of BRIDGE_FILL_CELLS, then the min of that over it (erosion) on the grid. Separable: rows, then columns
+  private fillValleys(): Float32Array {
+    const r = BRIDGE_FILL_CELLS, side = this.cells + 1;
+    const outer = side + 2 * TERRAIN_RING;
+    const src = this.bordered;
+    // the dilation on the grid points -r to cells + r: m x m, from the bordered points -2r to cells + 2r
+    const m = side + 2 * r;
+    const off = TERRAIN_RING - r; // bordered index of dilation point 0
+    const rows = new Float32Array(outer * m);
+    for (let j = 0; j < outer; j++) {
+      for (let i = 0; i < m; i++) {
+        let v = -Infinity;
+        for (let k = -r; k <= r; k++) v = Math.max(v, src[j * outer + off + i + k]);
+        rows[j * m + i] = v;
+      }
+    }
+    const dilated = new Float32Array(m * m);
+    for (let j = 0; j < m; j++) {
+      for (let i = 0; i < m; i++) {
+        let v = -Infinity;
+        for (let k = -r; k <= r; k++) v = Math.max(v, rows[(off + j + k) * m + i]);
+        dilated[j * m + i] = v;
+      }
+    }
+    const rows2 = new Float32Array(m * side);
+    for (let j = 0; j < m; j++) {
+      for (let i = 0; i < side; i++) {
+        let v = Infinity;
+        for (let k = -r; k <= r; k++) v = Math.min(v, dilated[j * m + r + i + k]);
+        rows2[j * side + i] = v;
+      }
+    }
+    const filled = new Float32Array(side * side);
+    for (let j = 0; j < side; j++) {
+      for (let i = 0; i < side; i++) {
+        let v = Infinity;
+        for (let k = -r; k <= r; k++) v = Math.min(v, rows2[(r + j + k) * side + i]);
+        // never under the ground (it isn't, up to the float rounding)
+        filled[j * side + i] = Math.max(v, this.heights[j * side + i]);
+      }
+    }
+    return filled;
+  }
+
+  // values on the grid points (side^2), on the triangle of the mesh at (x, north)
+  private interpolate(h: Float32Array, x: number, y: number): number {
     const i = this.cellX(x), j = this.cellY(y);
     const u = (x - this.gridX(i)) / this.dx, v = (y - this.gridY(j)) / this.dy;
-    const side = this.cells + 1, h = this.heights;
+    const side = this.cells + 1;
     const sw = h[j * side + i], ne = h[(j + 1) * side + i + 1];
     if (u >= v) {
       // (sw, se, ne)

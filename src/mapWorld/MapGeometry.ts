@@ -19,7 +19,7 @@ import BoundingBoxViewer, { BBoxEntry } from './osm/BoundingBoxViewer';
 import MapProjection from './osm/MapProjection';
 import GroundQuad from './osm/GroundQuad';
 import MapGBuffer from './deferred/MapGBuffer';
-import { WORLD_LAYERS } from './map/worldGeometryCore';
+import { BRIDGE_LAYER_KEYS, WORLD_LAYERS } from './map/worldGeometryCore';
 import { setMeshQuantization } from './city/meshQuantization';
 import { TREE_COLORS, TREE_CROWN_COLORS, TREE_TRUNK_COLOR } from './map/worldTrees';
 
@@ -55,6 +55,8 @@ export default class MapGeometry {
   // The forward materials: per layer (parallel to layers), the ground quad and the buildings (with the selection
   // highlight). The host gives them the shading params and the shadow map, see forwardMaterials.
   private forwardLayerMaterials: VertexFragmentShader[] = [];
+  // the same for the bridge decks of the layers that have them (null for the others)
+  private forwardBridgeMaterials: (VertexFragmentShader | null)[] = [];
   private forwardGroundMaterial: VertexFragmentShader;
   private forwardCityMaterial: VertexFragmentShader;
   private overdrawMaterial: VertexFragmentShader;
@@ -77,11 +79,15 @@ export default class MapGeometry {
     for (const def of WORLD_LAYERS) {
       const color = Color.fromHex(def.color);
       const material = gBuffer.createMaterial(color.vector3, false);
+      // the bridge decks: solid boxes with their normals in the vertices, both sides drawn (see buildBridges)
+      const bridges = BRIDGE_LAYER_KEYS.includes(def.key);
       this.layers.push({
         def: { key: def.key, label: def.label, color: [color.r, color.g, color.b], defaultOn: def.defaultOn },
         material,
         buffer: new TerrainLayerBuffer(renderer),
         enabled: null as unknown as ParamBool,
+        bridges: bridges ? new TerrainLayerBuffer(renderer) : undefined,
+        bridgeMaterial: bridges ? gBuffer.createMaterial(color.vector3, false, 'none', true) : undefined,
       });
     }
 
@@ -107,6 +113,7 @@ export default class MapGeometry {
     };
     for (const def of WORLD_LAYERS) {
       this.forwardLayerMaterials.push(createForwardMaterial(Color.fromHex(def.color).vector3, 'back'));
+      this.forwardBridgeMaterials.push(BRIDGE_LAYER_KEYS.includes(def.key) ? createForwardMaterial(Color.fromHex(def.color).vector3, 'none') : null);
     }
     this.forwardGroundMaterial = createForwardMaterial(new Vector3(.5, .5, .5), 'none');
     this.forwardCityMaterial = createForwardMaterial(new Vector3(1, 1, 1), 'back', true);
@@ -128,6 +135,17 @@ export default class MapGeometry {
   /** The albedo of a ground layer (index into layers), in the gBuffer and the forward shading. */
   public setLayerColor(index: number, color: Vector3): void {
     this.setMaterialColor(this.layers[index].material, this.forwardLayerMaterials[index], color);
+    const bridge = this.layers[index].bridgeMaterial, forwardBridge = this.forwardBridgeMaterials[index];
+    if (bridge && forwardBridge) this.setMaterialColor(bridge, forwardBridge, color);
+  }
+
+  /** The bridge decks to draw (of the layers that are on), the casters of the shadow map with the ground. */
+  public get bridgeBuffers(): TerrainLayerBuffer[] {
+    const buffers: TerrainLayerBuffer[] = [];
+    for (const layer of this.layers) {
+      if (layer.enabled.value && layer.bridges && layer.bridges.vertexCount > 0) buffers.push(layer.bridges);
+    }
+    return buffers;
   }
 
   /** The ground quad reaches distance (world units) around the camera, see MapWorld.viewDistanceMax. */
@@ -171,7 +189,8 @@ export default class MapGeometry {
 
   /** The materials of drawForward: they take the shading params (sky, sun, fog, shadows) by name, like the deferred shading. */
   public get forwardMaterials(): VertexFragmentShader[] {
-    return [...this.forwardLayerMaterials, this.forwardGroundMaterial, this.forwardCityMaterial];
+    const bridges = this.forwardBridgeMaterials.filter((m): m is VertexFragmentShader => m !== null);
+    return [...this.forwardLayerMaterials, ...bridges, this.forwardGroundMaterial, this.forwardCityMaterial];
   }
 
   public updateFrustum(camera: MapCamera): void {
@@ -188,7 +207,8 @@ export default class MapGeometry {
    */
   public drawGBuffer(camera: MapCamera, city: CityMeshes | null, selectedID: number): void {
     if (city) this.drawBuildings(camera, city, selectedID, this.cityGBufferMaterial, true);
-    this.drawGround(camera, this.layers.map(layer => layer.material), this.groundGBufferMaterial);
+    this.drawGround(camera, this.layers.map(layer => layer.material), this.layers.map(layer => layer.bridgeMaterial ?? null),
+      this.groundGBufferMaterial);
   }
 
   /**
@@ -201,12 +221,23 @@ export default class MapGeometry {
       material.setVector3('cameraPosition', camera.worldPosition);
     }
     if (city) this.drawBuildings(camera, city, selectedID, this.forwardCityMaterial);
-    this.drawGround(camera, this.forwardLayerMaterials, this.forwardGroundMaterial);
+    this.drawGround(camera, this.forwardLayerMaterials, this.forwardBridgeMaterials, this.forwardGroundMaterial);
   }
 
-  /** The layers top first (layerMaterials parallel to layers), the ground (quad or meshes) under them last. */
-  private drawGround(camera: MapCamera, layerMaterials: VertexFragmentShader[], groundMaterial: VertexFragmentShader): void {
+  /**
+   * The bridge decks over the layers first, then the layers top first (layerMaterials and bridgeMaterials parallel to
+   * layers), the ground (quad or meshes) under them last.
+   */
+  private drawGround(camera: MapCamera, layerMaterials: VertexFragmentShader[], bridgeMaterials: (VertexFragmentShader | null)[],
+    groundMaterial: VertexFragmentShader): void {
     const stats = this.stats;
+    for (let j = this.layers.length - 1; j >= 0; j--) {
+      const layer = this.layers[j], material = bridgeMaterials[j];
+      if (!layer.enabled.value || !layer.bridges || !material || layer.bridges.vertexCount === 0) continue;
+      layer.bridges.draw(material);
+      stats.meshCount++;
+      stats.vertexCount += layer.bridges.vertexCount;
+    }
     for (let j = this.layers.length - 1; j >= 0; j--) {
       const layer = this.layers[j];
       if (!layer.enabled.value || layer.buffer.vertexCount === 0) continue;
@@ -273,6 +304,7 @@ export default class MapGeometry {
       if (!layer.enabled.value || layer.buffer.vertexCount === 0) continue;
       layer.buffer.draw(this.overdrawMaterial);
     }
+    for (const bridges of this.bridgeBuffers) bridges.draw(this.overdrawMaterial);
     if (city) {
       city.meshes.forEach((mesh, i) => {
         const bounds = this.meshBounds.get(mesh);
@@ -299,7 +331,10 @@ export default class MapGeometry {
   destruct(): void {
     this.groundQuad.destruct();
     this.groundBuffer.destruct();
-    for (const layer of this.layers) layer.buffer.destruct();
+    for (const layer of this.layers) {
+      layer.buffer.destruct();
+      layer.bridges?.destruct();
+    }
     this.boundingBoxViewer.destruct();
   }
 }

@@ -3,7 +3,7 @@
 // WALLS: the buildings and the trees, with the lightmap attribute (see city/cityLayout.ts) and in .w the feature id for
 // the selection highlight, or on a tree its palette entry (see map/worldTrees.ts), with the flat normal of the triangle.
 // Without it the ground layers and the ground quad, on the ground chart of the lightmap, with the smooth normal of the
-// terrain in .w (see terrainNormal.wgsl).
+// terrain in .w (see terrainNormal.wgsl). BRIDGE (with it): a bridge deck, on a chart of its own (getBridgeSurface).
 
 struct VertexInput {
 #ifdef WALLS
@@ -122,6 +122,10 @@ fn fs_main(input : VertexOutput) -> FragmentOutput {
   }
   selected = input.selected != 0u;
   material = input.material;
+#endif
+#ifdef BRIDGE
+  // a bridge deck: a chart of its own, not the ground under it, see getBridgeSurface
+  id = getBridgeSurface(input.relative + uniforms.cameraPosition, n).id;
 #endif
   let g = packGBuffer(id, n, material, selected, atlas);
   return FragmentOutput(g.xy, g.z);

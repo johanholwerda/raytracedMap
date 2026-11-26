@@ -250,7 +250,10 @@ export default class WorldTileStreamer {
   // --- lifecycle ---------------------------------------------------------------
 
   public clearAllTerrainTiles(): void {
-    for (const layer of this.layers) layer.buffer.clear();
+    for (const layer of this.layers) {
+      layer.buffer.clear();
+      layer.bridges?.clear();
+    }
     this.ground?.clear();
     this.groundChanged = true;
     this.heightField?.clear();
@@ -453,7 +456,10 @@ export default class WorldTileStreamer {
     const terrainRemove: string[] = [];
     for (const key of this.loadedTerrainTiles) if (!this.terrainDesired.has(key)) terrainRemove.push(key);
     if (terrainRemove.length) {
-      for (const layer of this.layers) layer.buffer.removeTiles(terrainRemove);
+      for (const layer of this.layers) {
+        layer.buffer.removeTiles(terrainRemove);
+        layer.bridges?.removeTiles(terrainRemove);
+      }
       this.ground?.removeTiles(terrainRemove);
       this.groundChanged = true;
       for (const key of terrainRemove) {
@@ -547,6 +553,16 @@ export default class WorldTileStreamer {
           if (!l || !l.indices.length) continue;
           layer.buffer.addTile(key, l.vertices, l.indices, l.floats);
           bytes += l.vertices.byteLength + l.indices.byteLength;
+        }
+      }
+      if (result?.bridges) {
+        for (const layer of this.layers) {
+          const l = result.bridges[layer.def.key];
+          if (!l || !l.indices.length || !layer.bridges) continue;
+          layer.bridges.addTile(key, l.vertices, l.indices, l.floats);
+          bytes += l.vertices.byteLength + l.indices.byteLength;
+          // they cast shadows, like the ground
+          this.groundChanged = true;
         }
       }
       if (result?.ground && this.ground) {
