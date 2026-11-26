@@ -1298,14 +1298,15 @@ export default class MapWorld {
       lightmap.setResolveUniforms(this.camera, blur, metersToNorm, this.taa.enabled.value);
       const rippleTile = rippling ? this.ripples.tileSize * metersToNorm : 0;
       // The rays of the buildings in the water: 1 per block of pixels, traced here for the shading to blend, or a ray per
-      // water pixel in the shading. The traced pixel of the blocks rotates for the TAA to average.
+      // water pixel in the shading. The traced pixel of the blocks rotates for the TAA to average, in a static view only:
+      // while the water or the camera moves the TAA blends its history like motion, and the rotation shows as jitter.
       const [blockX, blockY] = REFLECTION_BLOCKS[this.reflectionRays.value];
       const reflectionPass = reflections && reflectBuildings && blockX * blockY > 1 ? this.waterReflection : null;
       // the ground in them: its horizon over the water, which the rays are compared with
       if (reflections && reflectBuildings && this.reflectTerrainInWater) this.terrainHorizon.draw(this.camera, this.gBuffer, this.waterMaterials);
       if (reflectionPass) {
         reflectionPass.setBlock(blockX, blockY);
-        reflectionPass.draw(this.camera, this.gBuffer, this.waterMaterials, rippleTile, this.taa.enabled.value);
+        reflectionPass.draw(this.camera, this.gBuffer, this.waterMaterials, rippleTile, this.taa.enabled.value && isStatic);
       }
       this.deferred.setWaterReflections(reflections ? this.waterMaterials : 0, reflectBuildings, this.reflectionDarkening.value, rippleTile,
         this.sunReflection.value, this.sunReflectionPower.value, reflectionPass);
