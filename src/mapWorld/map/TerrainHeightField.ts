@@ -20,6 +20,9 @@ export default class TerrainHeightField {
   private maxHeights = new Map<number, number>();
   private maxHeight = -Infinity;
   private maxDirty = false;
+  // the lowest of each grid and of them all, as the highest
+  private minHeights = new Map<number, number>();
+  private minHeight = Infinity;
 
   constructor(private projection: MapProjection) {
   }
@@ -31,8 +34,13 @@ export default class TerrainHeightField {
     const k = this.key(tile.x, tile.y);
     this.grids.set(k, createTerrainGrid(tile, this.projection, heightsM));
     let max = -Infinity;
-    for (let i = 0; i < heightsM.length; i++) if (heightsM[i] > max) max = heightsM[i];
+    let min = Infinity;
+    for (let i = 0; i < heightsM.length; i++) {
+      if (heightsM[i] > max) max = heightsM[i];
+      if (heightsM[i] < min) min = heightsM[i];
+    }
     this.maxHeights.set(k, max);
+    this.minHeights.set(k, min);
     this.maxDirty = true;
   }
 
@@ -41,12 +49,26 @@ export default class TerrainHeightField {
    * -Infinity without tiles.
    */
   public get maxHeightM(): number {
-    if (this.maxDirty) {
-      this.maxDirty = false;
-      this.maxHeight = -Infinity;
-      for (const h of this.maxHeights.values()) if (h > this.maxHeight) this.maxHeight = h;
-    }
+    this.updateExtremes();
     return this.maxHeight;
+  }
+
+  /**
+   * How much higher the highest ground of the loaded tiles is than the lowest, m: about 0 where the land is flat, 0
+   * without tiles.
+   */
+  public get reliefM(): number {
+    this.updateExtremes();
+    return this.maxHeight > this.minHeight ? this.maxHeight - this.minHeight : 0;
+  }
+
+  private updateExtremes(): void {
+    if (!this.maxDirty) return;
+    this.maxDirty = false;
+    this.maxHeight = -Infinity;
+    this.minHeight = Infinity;
+    for (const h of this.maxHeights.values()) if (h > this.maxHeight) this.maxHeight = h;
+    for (const h of this.minHeights.values()) if (h < this.minHeight) this.minHeight = h;
   }
 
   /** key: z/x/y, as OpenFreeMapTileService.tileKey. */
@@ -57,12 +79,14 @@ export default class TerrainHeightField {
     if (this.grids.get(k) === this.last) this.last = null;
     this.grids.delete(k);
     this.maxHeights.delete(k);
+    this.minHeights.delete(k);
     this.maxDirty = true;
   }
 
   public clear(): void {
     this.grids.clear();
     this.maxHeights.clear();
+    this.minHeights.clear();
     this.maxDirty = true;
     this.last = null;
   }

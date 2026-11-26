@@ -73,6 +73,11 @@ const CAMERA_PITCH_START = -.7;
 const CAMERA_DISTANCE_START = 1;
 const CAMERA_FOV = 1;
 const CAMERA_NEAR = .01;
+// The water reflects the ground (MapWorld.updateTerrainReflection) only where the highest loaded ground is this much
+// above the lowest, m: below it no hill is high enough to show in the water, and the rays skip the height map
+const TERRAIN_REFLECTION_RELIEF_M = 20;
+// the rays start this far above the water, m: the water lies on the ground of the height map, see isTerrainOccluded
+const TERRAIN_REFLECTION_BIAS_M = .5;
 // The frames the page draws with 1 map worker before the others join in, see MapWorld.startTiles: the first frames
 // compile the pipelines, which the GPU process does on the cores the workers would take
 const START_FRAMES = 4;
@@ -182,6 +187,9 @@ export default class MapWorld {
   private reflectionRays!: ParamSelect;
   // traces them when that is more than 1 pixel, before the shading
   private waterReflection!: WaterReflectionHalfRes;
+  // the ground in the reflections of the buildings, where it is in reach: see updateTerrainReflection
+  private reflectTerrain!: ParamBool;
+  private reflectTerrainInWater = false;
   private reflectionDarkening!: ParamFloat;
   // the water mirrored on the ripples with the sun in it, also without waterReflections (the buildings)
   private waterRipples!: ParamBool;
@@ -361,6 +369,8 @@ export default class MapWorld {
     for (const material of this.materials) this.sun.bindResources(material);
     // the hills for the ray traced sun shadows, which trace only the buildings and the trees
     for (const material of [...this.deferred.materials, ...this.traffic.materials]) this.sun.terrainSun.bind(material);
+    // and its height map for the ground in the water reflections
+    for (const material of [...this.deferred.materials, ...this.waterReflection.materials]) this.sun.terrainSun.bindHeights(material);
 
     this.ui = new MapWorldUI(canvasParent, {
       getViewBounds: () => this.currentViewBounds(),
@@ -765,6 +775,7 @@ export default class MapWorld {
     pgShading.addParamFloat('exposure', 1.5, 0, 4, params);
     // Only with the sky visibility lightmap: it keeps the BVH of the buildings up to date
     this.waterReflections = pgShading.addParamBool('waterReflections', false, { callback: setDirty });
+    this.reflectTerrain = pgShading.addParamBool('reflectTerrain', true, { callback: setDirty });
     this.reflectionRays = pgShading.addParamSelect('reflectionRays', ReflectionRays.PerPixel, REFLECTION_RAYS, { callback: setDirty });
     this.reflectionDarkening = pgShading.addParamFloat('reflectionDarkening', .35, 0, 1, { callback: setDirty });
     this.waterRipples = pgShading.addParamBool('waterRipples', true, { callback: setDirty });
@@ -990,6 +1001,7 @@ export default class MapWorld {
     }
 
     this.updateSnow();
+    this.updateTerrainReflection();
     this.draw(this.dirty, cameraMoving, tilesLoading, cityTilesChanged);
     this.tileStreamer.frameSubmitted();
     this.dirty = false;
@@ -1058,6 +1070,24 @@ export default class MapWorld {
     return { origin, forward, focus };
   }
 
+  /**
+   * Whether the water reflections can have ground in them, into their shaders (reflectTerrainInWater): the rays of the
+   * water march the height map of the ground only where the loaded ground has relief, which most cities on the water
+   * don't. With the highest ground, above which a ray ends. Dirty when it switches.
+   */
+  private updateTerrainReflection(): void {
+    const field = this.heightField;
+    const enabled = this.reflectTerrain.value && this.waterReflections.value && this.skyLightmap.active && this.geometry.elevation &&
+      field.reliefM > TERRAIN_REFLECTION_RELIEF_M;
+    if (enabled !== this.reflectTerrainInWater) this.dirty = true;
+    this.reflectTerrainInWater = enabled;
+    const metersToNorm = this.projection.metersToNorm;
+    const top = enabled ? field.maxHeightM * metersToNorm : 0;
+    const bias = TERRAIN_REFLECTION_BIAS_M * metersToNorm;
+    this.deferred.setTerrainReflection(enabled, top, bias);
+    this.waterReflection.setTerrainReflection(enabled, top, bias);
+  }
+
   private draw(dirty: boolean, cameraMoving: boolean, tilesLoading: boolean, cityTilesChanged: boolean) {
     let shadowsSettled = true;
     // the ground casts shadows too, with elevation (without it the flat ground is at 0, what an empty texel means)
@@ -1078,7 +1108,8 @@ export default class MapWorld {
     }
     // the rays of the ray traced sun shadows don't trace the ground: the hills come from the sun's view of it
     const rayTracedSun = this.shadowMode === ShadowMode.LightmapRaytrace || this.shadowMode === ShadowMode.Raytrace;
-    if (!this.showOverdraw && rayTracedSun) this.sun.updateTerrainSun(this.camera, this.viewDistanceMax.value, ground);
+    // the water reflections march the height map it is made from
+    if (!this.showOverdraw && (rayTracedSun || this.reflectTerrainInWater))this.sun.updateTerrainSun(this.camera, this.viewDistanceMax.value, ground);
 
     if (this.drawMode.value === DrawMode.ShadowMap) {
       // instead of the scene, applyDrawMode draws it again when the mode changes back
