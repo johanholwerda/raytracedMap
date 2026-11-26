@@ -40,14 +40,16 @@ export type DriveRaycast = (ox: number, oy: number, oz: number, dx: number, dy: 
  */
 export default class DriveController {
   // m/s, m/s^2
-  public maxSpeed = 30;
+  public maxSpeed = 90;
   public maxReverseSpeed = 8;
-  public acceleration = 8;
-  public braking = 14;
+  public acceleration = 10;
+  public braking = 20;
   public handbrake = 20;
   // rolling resistance and air drag, m/s^2 and per m/s
   private readonly rolling = 0.8;
-  private readonly drag = 0.012;
+  private readonly drag = 0.0002;
+  // radians per second the car turns at the most: at speed the steering would spin it
+  private readonly maxTurnRate = 2;
   // m/s^2, a bit more than earth, so a jump off a roof doesn't float
   public gravity = 14;
   // the part of gravity a slope pulls at the car with: arcade, so it climbs the steep streets of a hilly city
@@ -329,7 +331,7 @@ export default class DriveController {
     if (this.grounded) {
       const t = this.throttle;
       if (t * this.speed < 0) accel = t * this.braking;
-      else accel = t * (t > 0 ? this.acceleration * (1 - Math.max(this.speed, 0) / this.maxSpeed) : this.acceleration * 0.6);
+      else accel = t * (t > 0 ? this.acceleration * (1 - (Math.max(this.speed, 0) / this.maxSpeed) ** 2) : this.acceleration * 0.6);
       accel -= sign * (this.rolling + this.drag * this.speed * this.speed);
       if (handbrake) accel -= sign * this.handbrake;
       // a slope pulls the car down it (a part of gravity, see slopePull); a standing car stays, as with its brake on
@@ -344,7 +346,7 @@ export default class DriveController {
     if (this.grounded) {
       const steer = this.steer * this.maxSteer / (1 + Math.abs(this.speed) * 0.08);
       // steering right (positive) turns the yaw negative
-      this.yaw -= this.speed / this.wheelbase * Math.tan(steer) * dt;
+      this.yaw -= clamp(this.speed / this.wheelbase * Math.tan(steer), -this.maxTurnRate, this.maxTurnRate) * dt;
     }
 
     // the move, unless a wall is in the way
