@@ -2,16 +2,13 @@ import LogGL from 'webGPU-framework/renderer/core/LogGL';
 import decodePngRgba8 from 'webGPU-framework/utils/image/decodePngRgba8';
 import { tileToLatLon } from '../osm/pdokDecodeCore';
 import type { TileCoord } from '../osm/PDOKTileService';
-import { demPixelMeters, removeDemSpikes } from './demSpikes';
 
 /*
 The height of the ground, from the terrarium elevation tiles of the AWS Open Data terrain tiles (Mapzen, Tilezen joerd):
 256 x 256 png in web mercator, the height in m = R * 256 + G + B / 256 - 32768. Free, no key, CORS enabled. The sources
 differ per region (https://github.com/tilezen/joerd/blob/master/docs/data-sources.md): in the US the NED (bare earth, 3
 to 10 m), elsewhere mostly SRTM (30 to 90 m) and the like, which are surface models: buildings and forests are in it
-as bumps, smoothed at the resolution used here. North of 60 degrees it is ArcticDEM in places (Iceland): heights above
-the ellipsoid, not the sea (the land there is about 65 m too high, the sea is at 0), and false mountains on the water,
-which removeDemSpikes fills in when a tile is decoded (see demSpikes.ts).
+as bumps, smoothed at the resolution used here.
 
 The tiles are fetched and decoded in the tile fetch worker (tileFetchWorker.ts, the main thread talks to it through
 ElevationClient), once per ELEVATION_ZOOM tile (a z12 tile covers 4 x 4 of the z14
@@ -222,15 +219,11 @@ export default class ElevationService {
       const png = await decodePngRgba8(await response.arrayBuffer());
       if (png.width !== DEM_SIZE || png.height !== DEM_SIZE) throw new Error(`elevation tile ${key} is ${png.width} x ${png.height}`);
       const heights = new Float32Array(DEM_SIZE * DEM_SIZE);
-      const d = png.data;
-      for (let i = 0; i < heights.length; i++) {
-        heights[i] = Math.max(d[i * 4] * 256 + d[i * 4 + 1] + d[i * 4 + 2] / 256 - 32768, MIN_HEIGHT_M);
-      }
-      // the false mountains on the sea, see demSpikes.ts
-      removeDemSpikes(heights, DEM_SIZE, demPixelMeters(y, ELEVATION_ZOOM, DEM_SIZE));
       let min = Infinity, max = -Infinity;
       for (let i = 0; i < heights.length; i++) {
-        const h = heights[i];
+        const d = png.data;
+        const h = Math.max(d[i * 4] * 256 + d[i * 4 + 1] + d[i * 4 + 2] / 256 - 32768, MIN_HEIGHT_M);
+        heights[i] = h;
         if (h < min) min = h;
         if (h > max) max = h;
       }
