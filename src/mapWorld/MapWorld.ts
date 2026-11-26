@@ -737,12 +737,21 @@ export default class MapWorld {
     const pgColors = paramGroup.addGroup('Map colors');
     const toVector3 = (c: [number, number, number]) => new Vector3(c[0], c[1], c[2]);
     const colorParam = (name: string, value: Vector3, apply: (v: Vector3) => void) => {
-      pgColors.addParamColor(name, value, { callback: (v) => {
+      return pgColors.addParamColor(name, value, { callback: (v) => {
         apply(v);
         this.dirty = true;
       } });
     };
-    colorParam('buildings', new Vector3(1, 1, 1), (v) => this.geometry.setBuildingColor(v));
+    // the albedo of a building or tree in the water reflections that the screen doesn't show, see
+    // getUnseenReflectionColor in waterScreenReflection.wgsl
+    const setReflectionAlbedo = (name: string, v: Vector3) => {
+      for (const m of [...this.deferred.materials, ...this.waterReflection.materials]) m.setVector3(name, v);
+    };
+    const buildingColor = colorParam('buildings', new Vector3(1, 1, 1), (v) => {
+      this.geometry.setBuildingColor(v);
+      setReflectionAlbedo('reflectionBuildingAlbedo', v);
+    });
+    setReflectionAlbedo('reflectionBuildingAlbedo', buildingColor.value);
     colorParam('ground', new Vector3(.5, .5, .5), (v) => this.geometry.setGroundColor(v));
     this.geometry.layers.forEach((layer, i) => {
       // the glaciers take the snowColor param
@@ -751,7 +760,11 @@ export default class MapWorld {
     });
     colorParam('treeTrunks', toVector3(TREE_TRUNK_COLOR), (v) => this.geometry.setTreeTrunkColor(v));
     const crownAverage = TREE_CROWN_COLORS.reduce((a, c) => a.add(toVector3(c)), new Vector3(0, 0, 0));
-    colorParam('treeCrowns', crownAverage.multiplyScalar(1 / TREE_CROWN_COLORS.length), (v) => this.geometry.setTreeCrownColor(v));
+    const crownColor = colorParam('treeCrowns', crownAverage.multiplyScalar(1 / TREE_CROWN_COLORS.length), (v) => {
+      this.geometry.setTreeCrownColor(v);
+      setReflectionAlbedo('reflectionTreeAlbedo', v);
+    });
+    setReflectionAlbedo('reflectionTreeAlbedo', crownColor.value);
 
     const pgShading = paramGroup.addGroup('Shading');
 
@@ -802,13 +815,14 @@ export default class MapWorld {
     this.waterReflections = waterGroup.addParamBool('waterReflections', false, { callback: setDirty });
     this.reflectTerrain = waterGroup.addParamBool('reflectTerrain', true, { callback: setDirty });
     this.reflectionRays = waterGroup.addParamSelect('reflectionRays', ReflectionRays.PerPixel, REFLECTION_RAYS, { callback: setDirty });
-    this.reflectionDarkening = waterGroup.addParamFloat('reflectionDarkening', .35, 0, 1, { callback: setDirty });
+    this.reflectionDarkening = waterGroup.addParamFloat('reflectionDarkening', .5, 0, 1, { callback: setDirty });
     // the buildings and trees in the water in their colors from the screen, else they only darken it
     this.screenReflectionsParam = waterGroup.addParamBool('screenReflections', true, { callback: setDirty });
     // how much of the darkening the color of a building on the screen gives back, see deferredShading.wgsl
     waterGroup.addParamFloat('reflectionColor', 1, 0, 1, params);
-    // the brightness of a building in the water that the screen doesn't show (an underside), times the sky color
-    waterGroup.addParamFloat('reflectionUnseen', .35, 0, 1, params);
+    // the sky light of a building in the water that the screen doesn't show (an underside), a part of the open sky's: in
+    // place of the occlusion of the lightmap. Its sun is by the normal, see getUnseenReflectionColor
+    waterGroup.addParamFloat('reflectionUnseen', .5, 0, 1, params);
     this.waterRipples = waterGroup.addParamBool('waterRipples', true, { callback: setDirty });
     const updateRipples = () => {
       // the bake scales the gradient by the height, which makes the slope of the ripples independent of their wavelength

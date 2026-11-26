@@ -40,9 +40,13 @@ struct Uniforms {
   exposure : f32,
   // whether reflectionHistory is of this view (0: no colors)
   screenReflectionHistory : u32,
-  // the color of a building the screen doesn't show, see getUnseenReflectionColor
+  // the light and the albedos of a building the screen doesn't show, see getUnseenReflectionColor
   skyColor : vec3<f32>,
   reflectionUnseen : f32,
+  sunColor : vec3<f32>,
+  lightDirection : vec3<f32>,
+  reflectionBuildingAlbedo : vec3<f32>,
+  reflectionTreeAlbedo : vec3<f32>,
 };
 
 // the rays are mirrored on the ripples of rippleTexture, else on the flat water: as the shading's
@@ -95,10 +99,10 @@ fn fs_main(input : VertexOutput) -> @location(0) vec2<u32> {
   if (!SCREEN_REFLECTIONS) {
     return vec2(pack4x8unorm(vec4(select(.5, 1., isOccluded(world, rd)), rd * .5 + .5)), 0u);
   }
-  let t = getOcclusionDistance(world, rd);
-  if (t >= 0.) {
+  let hit = getOcclusionHit(world, rd);
+  if (hit.t >= 0.) {
     // the building it hits in the color of the screen at the hit point where it shows it
-    return vec2(pack4x8unorm(vec4(1., rd * .5 + .5)), packReflectionColor(getWorldHitReflectionColor(world, rd, t)));
+    return vec2(pack4x8unorm(vec4(1., rd * .5 + .5)), packReflectionColor(getWorldHitReflectionColor(world, rd, hit)));
   }
   return vec2(pack4x8unorm(vec4(.5, rd * .5 + .5)), 0u);
 }

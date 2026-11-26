@@ -1,10 +1,11 @@
 // The colors of the buildings and trees in the water reflections of MapWorld, from the screen. The mirror ray of a
 // water pixel (getWaterReflectionRay of waterReflection.wgsl) is traced through the city with its hit distance
-// (getOcclusionDistance of cityTraceDistance.wgsl). Where the screen shows the hit point (the depth of the gBuffer at its
+// (getOcclusionHit of cityTraceDistance.wgsl). Where the screen shows the hit point (the depth of the gBuffer at its
 // pixel is its own), the water mirrors its color: of the image of the frame before (the TAA history), at where the
 // point was in it, turned back into the linear color of the shading (getLinearFromDisplay), see
 // getWorldHitReflectionColor. A hit off the screen takes the color where the ray leaves it (a tower that goes on above
-// its top), one the screen doesn't show (an underside, a side away from the camera) that of an unseen surface.
+// its top), one the screen doesn't show (an underside, a side away from the camera) is shaded from the normal of the
+// face the ray hits, see getUnseenReflectionColor.
 // A march of the rays over the depth of the gBuffer first (screen space reflections) stepped over buildings between its
 // samples (dark bands in the reflections, lost hits) and took .1 ms more at 1080p for the same image: the hit point of
 // the world trace is what the color of a ray needs.
@@ -12,8 +13,8 @@
 // Needs the uniforms
 //   viewProjection (the jittered camera of the gBuffer), resolution, depthParams (see getGBufferDistance), cameraPosition,
 //   inverseProjection and inverseView (of the same camera, see cameraRay.wgsl), waterMaterials, backgroundColor,
-//   distanceFog, viewDistanceMax, contrast, exposure, skyColor (see deferredShading.wgsl), reflectionUnseen (see
-//   getUnseenReflectionColor), historyViewProjection (the camera of the history, without the jitter),
+//   distanceFog, viewDistanceMax, contrast, exposure, skyColor, sunColor, lightDirection (see deferredShading.wgsl),
+//   reflectionUnseen, reflectionBuildingAlbedo and reflectionTreeAlbedo (see getUnseenReflectionColor), historyViewProjection (the camera of the history, without the jitter),
 //   screenReflectionHistory (u32, 0: the history isn't of the view, no colors)
 // the bindings gBufferTexture, gBufferDepth, reflectionHistory (texture_2d<f32>) and reflectionHistorySampler (bilinear,
 // clamped), mapGBufferPacking.wgsl, cityTraceDistance.wgsl and the override TONE_MAP
@@ -98,10 +99,16 @@ fn getLinearFromDisplay(c : vec3<f32>, fog : f32) -> vec3<f32> {
 
 // the color the water mirrors of the surface the ray from ro hits at p: of the image of the frame before at p, which
 // is fogged by the horizontal camera distance (getFog), and fogged here by the way from p to ro instead. a 0 where p
-// was off the screen of the frame before, or the history isn't of this view
-fn getScreenReflectionColor(ro : vec3<f32>, p : vec3<f32>) -> vec4<f32> {
+// was off the screen of the frame before, or the history isn't of this view.
+// atEdge: p is the surface at the edge of the screen (getScreenReflectionFallbackColor), which is off the screen of the
+// frame before as soon as the camera moves towards it: it takes the edge of the history there instead. Without that
+// the reflections of buildings above the screen flickered to the unseen color while the camera moved
+fn getScreenReflectionColor(ro : vec3<f32>, p : vec3<f32>, atEdge : bool) -> vec4<f32> {
   let h = uniforms.historyViewProjection * vec4(p, 1.);
-  let uv = vec2(h.x / h.w * .5 + .5, .5 - h.y / h.w * .5);
+  var uv = vec2(h.x / h.w * .5 + .5, .5 - h.y / h.w * .5);
+  if (atEdge) {
+    uv = clamp(uv, vec2(0.), vec2(1.));
+  }
   if (uniforms.screenReflectionHistory == 0u || h.w <= 0. || any(uv < vec2(0.)) || any(uv > vec2(1.))) {
     return vec4(0.);
   }
@@ -145,38 +152,40 @@ fn getScreenExitPixel(ro : vec3<f32>, p : vec3<f32>) -> vec2<f32> {
 // what the screen shows at the pixel where it left (getScreenExitPixel, as getScreenReflectionColor), which is most of the time
 // the building it hits, or one beside it. Only a surface that faces the ray (rd): a facade, not a roof it passes over.
 // Else (on the sky and the water, a ray that went behind something, a point the frame before didn't show) the color of
-// a surface the screen doesn't show, a 0. Without SCREEN_REFLECTIONS 0, dark as before
-fn getScreenReflectionFallbackColor(ro : vec3<f32>, rd : vec3<f32>, pixel : vec2<f32>) -> vec4<f32> {
+// a surface the screen doesn't show (of the hit, see getUnseenReflectionColor), a 0. Without SCREEN_REFLECTIONS 0, dark
+// as before
+fn getScreenReflectionFallbackColor(ro : vec3<f32>, rd : vec3<f32>, hit : CityHit, pixel : vec2<f32>) -> vec4<f32> {
   if (!SCREEN_REFLECTIONS) {
     return vec4(0.);
   }
-  if (pixel.x < 0.) {
-    return vec4(getUnseenReflectionColor(), 0.);
+  if (pixel.x >= 0.) {
+    let p = clamp(vec2<i32>(pixel), vec2(0), vec2<i32>(uniforms.resolution) - 1);
+    let depth = textureLoad(gBufferDepth, p, 0);
+    let g = vec3(textureLoad(gBufferTexture, p, 0).xy, 0u);
+    if (depth > 0. && ((uniforms.waterMaterials >> getGBufferMaterial(g)) & 1u) == 0u && dot(getGBufferNormal(g), rd) < 0.) {
+      let uv = (vec2<f32>(p) + .5) / uniforms.resolution;
+      let d = getGBufferDistance(depth, uv, uniforms.inverseProjection, uniforms.depthParams);
+      let c = getScreenReflectionColor(ro, depthToPosition(d, uv * 2. - 1.), true);
+      if (c.a > 0.) {
+        return c;
+      }
+    }
   }
-  let p = clamp(vec2<i32>(pixel), vec2(0), vec2<i32>(uniforms.resolution) - 1);
-  let depth = textureLoad(gBufferDepth, p, 0);
-  let g = vec3(textureLoad(gBufferTexture, p, 0).xy, 0u);
-  if (depth <= 0. || ((uniforms.waterMaterials >> getGBufferMaterial(g)) & 1u) != 0u || dot(getGBufferNormal(g), rd) >= 0.) {
-    return vec4(getUnseenReflectionColor(), 0.);
-  }
-  let uv = (vec2<f32>(p) + .5) / uniforms.resolution;
-  let d = getGBufferDistance(depth, uv, uniforms.inverseProjection, uniforms.depthParams);
-  let c = getScreenReflectionColor(ro, depthToPosition(d, uv * 2. - 1.));
-  return select(vec4(getUnseenReflectionColor(), 0.), c, c.a > 0.);
+  return vec4(getUnseenReflectionColor(ro, rd, hit), 0.);
 }
 
 // how far the hit point of the world trace may be from the surface the screen shows at its pixel, a part of its camera
 // distance, and still be that surface (getWorldHitReflectionColor)
 const SCREEN_REFLECTION_VISIBLE = .02;
 
-// The color of what the world trace of a ray from ro along rd hit at distance t (getOcclusionDistance of
-// cityTraceDistance.wgsl): of the screen at that point where it is visible there (the surface of its pixel is at its
-// distance). Else the color at the edge of the screen or of an unseen surface, see getScreenReflectionFallbackColor
-fn getWorldHitReflectionColor(ro : vec3<f32>, rd : vec3<f32>, t : f32) -> vec3<f32> {
+// The color of what the world trace of a ray from ro along rd hit (getOcclusionHit of cityTraceDistance.wgsl): of the
+// screen at that point where it is visible there (the surface of its pixel is at its distance). Else the color at the
+// edge of the screen or of an unseen surface, see getScreenReflectionFallbackColor
+fn getWorldHitReflectionColor(ro : vec3<f32>, rd : vec3<f32>, hit : CityHit) -> vec3<f32> {
   if (!SCREEN_REFLECTIONS) {
     return vec3(0.);
   }
-  let p = ro + rd * t;
+  let p = ro + rd * hit.t;
   let clip = uniforms.viewProjection * vec4(p, 1.);
   var fallback = vec2(-1.);
   if (clip.w > 0.) {
@@ -187,19 +196,31 @@ fn getWorldHitReflectionColor(ro : vec3<f32>, rd : vec3<f32>, t : f32) -> vec3<f
     } else {
       let scene = getScreenReflectionDepth(s.xy);
       if (scene > 0. && abs(1. / scene - 1. / s.z) < SCREEN_REFLECTION_VISIBLE / scene) {
-        let c = getScreenReflectionColor(ro, p);
+        let c = getScreenReflectionColor(ro, p, false);
         if (c.a > 0.) {
           return c.rgb;
         }
       }
     }
   }
-  return getScreenReflectionFallbackColor(ro, rd, fallback).rgb;
+  return getScreenReflectionFallbackColor(ro, rd, hit, fallback).rgb;
 }
 
-// The color of a building in the water that the screen doesn't show (its underside, a side away from the camera, one
-// behind another), linear like the shading: a white wall in the sky light times reflectionUnseen. Without it those were
-// only the darkened water, black bands next to the colors of the ones the screen shows
-fn getUnseenReflectionColor() -> vec3<f32> {
-  return uniforms.skyColor * uniforms.skyColor * uniforms.reflectionUnseen;
+// The color of a building or tree in the water that the screen doesn't show (its underside, a side away from the
+// camera, one behind another) that the ray from ro along rd hit: shaded like the deferred shading from the normal of the
+// face it hit, linear. Its albedo (reflectionBuildingAlbedo or reflectionTreeAlbedo, the map colors), the sky of the
+// open sky the normal faces (n.y * .5 + .5, the shading's without the lightmap) times reflectionUnseen, which stands in
+// for the occlusion of the lightmap, and the sun by n.l, without its shadows. Then fogged by the way from p to ro, as
+// the colors of the screen. Only the sky light before: a sunlit facade behind another one was a dark blue band below
+// the orange of the part the screen shows
+fn getUnseenReflectionColor(ro : vec3<f32>, rd : vec3<f32>, hit : CityHit) -> vec3<f32> {
+  let n = getCityHitNormal(ro, rd, hit);
+  let p = ro + rd * hit.t;
+  let albedo = select(uniforms.reflectionBuildingAlbedo, uniforms.reflectionTreeAlbedo, isCityHitTree(hit));
+  let sky = uniforms.skyColor * uniforms.skyColor * ((n.y * .5 + .5) * uniforms.reflectionUnseen);
+  let sun = uniforms.sunColor * uniforms.sunColor * max(dot(n, uniforms.lightDirection), 0.);
+  let surface = albedo * albedo * (sky + sun);
+  let background = getLinearFromDisplay(uniforms.backgroundColor, 0.);
+  let way = 1. - exp(-distance(p.xz, ro.xz) * uniforms.distanceFog);
+  return mix(surface, background, way);
 }

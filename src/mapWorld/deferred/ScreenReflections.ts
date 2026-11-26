@@ -5,7 +5,7 @@ import TAA from '../taa/TAA';
 
 /**
  * The colors of the buildings and trees in the water reflections, from the screen (waterScreenReflection.wgsl): the
- * world trace of a mirror ray gives where it hits (getOcclusionDistance of cityTraceDistance.wgsl), and where the screen
+ * world trace of a mirror ray gives where it hits (getOcclusionHit of cityTraceDistance.wgsl), and where the screen
  * shows that point the water mirrors its color, from the image of the frame before (the TAA history, at where the point
  * was in it). A hit off the screen takes the color where the ray leaves it, one the screen doesn't show (an underside)
  * the color of an unseen surface. Without it a building in the water only darkens it.

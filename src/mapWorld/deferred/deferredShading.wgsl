@@ -99,8 +99,11 @@ struct Uniforms {
   // how much of the light the water loses where it reflects a building (reflectionDarkening) the color of the building
   // gives back, where the screen shows it: 0 dark as without it, 1 all of it
   reflectionColor : f32,
-  // the brightness of a building in the water that the screen doesn't show, see getUnseenReflectionColor
+  // the sky light of a building in the water that the screen doesn't show, and the albedos it has (as the map color
+  // params, not squared), see getUnseenReflectionColor
   reflectionUnseen : f32,
+  reflectionBuildingAlbedo : vec3<f32>,
+  reflectionTreeAlbedo : vec3<f32>,
 };
 
 // the reflectance of water seen straight down (index of refraction 1.33)
@@ -618,10 +621,10 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
       } else {
         if (SCREEN_REFLECTIONS) {
           // in the color of the screen at the hit point where it shows it
-          let t = getOcclusionDistance(world, rd);
-          if (t >= 0.) {
+          let hit = getOcclusionHit(world, rd);
+          if (hit.t >= 0.) {
             occluded = 1.;
-            reflected = getWorldHitReflectionColor(world, rd, t);
+            reflected = getWorldHitReflectionColor(world, rd, hit);
           }
         } else {
           occluded = select(0., 1., isOccluded(world, rd));
