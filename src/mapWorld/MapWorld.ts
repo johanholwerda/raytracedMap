@@ -1,6 +1,7 @@
 import Renderer from 'webGPU-framework/renderer/render/Renderer';
 import WebGPUPreLoader from 'webGPU-framework/renderer/core/WebGPUPreLoader';
 import LogGL from 'webGPU-framework/renderer/core/LogGL';
+import Matrix4x4 from 'webGPU-framework/renderer/math/Matrix4x4';
 import Vector3 from 'webGPU-framework/renderer/math/Vector3';
 import Vector2 from 'webGPU-framework/renderer/math/Vector2';
 import Color from 'webGPU-framework/renderer/math/Color';
@@ -77,7 +78,7 @@ const CAMERA_NEAR = .01;
 // The water reflects the ground (MapWorld.updateTerrainReflection) only where the highest loaded ground is this much
 // above the lowest, m: below it no hill is high enough to show in the water, and the rays skip the height map
 const TERRAIN_REFLECTION_RELIEF_M = 20;
-// the rays start this far above the water, m: the water lies on the ground of the height map, see isTerrainOccluded
+// the rays start this far above the water, m: the water lies on the ground of the height map, see traceTerrain
 const TERRAIN_REFLECTION_BIAS_M = .5;
 // The frames the page draws with 1 map worker before the others join in, see MapWorld.startTiles: the first frames
 // compile the pipelines, which the GPU process does on the cores the workers would take
@@ -359,9 +360,8 @@ export default class MapWorld {
     this.waterReflection = new WaterReflectionHalfRes(this.renderer);
     this.waterReflection.bindCity(this.skyLightmap.cityScene);
     this.waterReflection.bindWaterRipples(this.ripples);
-    this.terrainHorizon = new WaterTerrainHorizon(this.renderer);
+    this.terrainHorizon = new WaterTerrainHorizon(this.renderer, this.gBuffer);
     this.deferred.bindTerrainHorizon(this.terrainHorizon);
-    this.waterReflection.bindTerrainHorizon(this.terrainHorizon);
     for (const layer of this.geometry.layers) {
       if (layer.def.key === 'water' || layer.def.key === 'waterways') this.waterMaterials |= 1 << this.gBuffer.materialIndex(layer.material);
     }
@@ -374,11 +374,12 @@ export default class MapWorld {
     this.wallAtlasView = new WallAtlasView(this.renderer);
     for (const material of this.materials) this.sun.bindResources(material);
     // the hills for the ray traced sun shadows, which trace only the buildings and the trees
-    for (const material of [...this.deferred.materials, ...this.traffic.materials]) this.sun.terrainSun.bind(material);
-    // and its height map for the ground in the water reflections
-    for (const material of [...this.deferred.materials, ...this.waterReflection.materials, ...this.terrainHorizon.materials]) {
-      this.sun.terrainSun.bindHeights(material);
+    for (const material of [...this.deferred.materials, ...this.traffic.materials, ...this.terrainHorizon.materials]) {
+      this.sun.terrainSun.bind(material);
     }
+    // and its height map for the ground in the water reflections, with the materials of the ground for its color
+    for (const material of [...this.deferred.materials, ...this.terrainHorizon.materials]) this.sun.terrainSun.bindHeights(material);
+    for (const material of this.terrainHorizon.materials) this.sun.terrainSun.bindMaterials(material);
 
     this.ui = new MapWorldUI(canvasParent, {
       getViewBounds: () => this.currentViewBounds(),
@@ -766,7 +767,7 @@ export default class MapWorld {
     this.geometry.setLayerColor(glacier, this.snowColor.value);
     pgSnow.collapsed = true;
 
-    const params = { materials: this.materials, callback: setDirty };
+    const params = { materials: this.shadingMaterials, callback: setDirty };
     this.backgroundColor = sunAndSky.addParamColor('backgroundColor', this.clearColor.vector3, { ...params, callback: (v) => {
       this.clearColor.setValues(v.x, v.y, v.z, 1);
       this.dirty = true;
@@ -822,7 +823,7 @@ export default class MapWorld {
     // the sun in the sky (deferred only, the forward pass clears to the background color)
     sunAndSky.addParamFloat('sunSize', .02, 0, .1, params);
     sunAndSky.addParamFloat('sunGlow', .4, 0, 1, params);
-    this.sun.initParams(pgShading, this.materials, setDirty);
+    this.sun.initParams(pgShading, this.shadingMaterials, setDirty);
     this.applyTimeOfDay();
 
     this.applyDrawMode();
@@ -969,6 +970,12 @@ export default class MapWorld {
     return [...this.deferred.materials, ...this.geometry.forwardMaterials, ...this.traffic.materials];
   }
 
+  // the materials the sun and sky params go to by their names: with the one that shades the ground in the water
+  // reflections
+  private get shadingMaterials() {
+    return [...this.materials, ...this.terrainHorizon.materials];
+  }
+
   /** The building meshes to draw, null while the buildings are hidden. */
   private get visibleCity(): CityMeshes | null {
     if (!this.drawBuildings.value) return null;
@@ -1066,6 +1073,7 @@ export default class MapWorld {
     p.metersPerUnit = 1 / metersToNorm;
     p.color = this.snowColor.value;
     this.geometry.setSnow(p);
+    this.terrainHorizon.setSnow(p, this.geometry.snowMaterial);
     // a still view draws again when the pipeline of the snow switched on or off is there (the frames before used the old
     // one): while it is made, and once after
     const pending = this.geometry.snowPipelinePending;
@@ -1105,7 +1113,6 @@ export default class MapWorld {
     const top = enabled ? field.maxHeightM * metersToNorm : 0;
     const bias = TERRAIN_REFLECTION_BIAS_M * metersToNorm;
     this.deferred.setTerrainReflection(enabled, top, bias);
-    this.waterReflection.setTerrainReflection(enabled, top, bias);
     this.terrainHorizon.setTerrain(top, bias);
   }
 
@@ -1130,7 +1137,15 @@ export default class MapWorld {
     // the rays of the ray traced sun shadows don't trace the ground: the hills come from the sun's view of it
     const rayTracedSun = this.shadowMode === ShadowMode.LightmapRaytrace || this.shadowMode === ShadowMode.Raytrace;
     // the water reflections march the height map it is made from
-    if (!this.showOverdraw && (rayTracedSun || this.reflectTerrainInWater))this.sun.updateTerrainSun(this.camera, this.viewDistanceMax.value, ground);
+    if (!this.showOverdraw && (rayTracedSun || this.reflectTerrainInWater)){
+      // with the materials of the ground, for its color in the water
+      const field = this.heightField;
+      const metersToNorm = this.projection.metersToNorm;
+      const materials = this.reflectTerrainInWater
+        ? { draw: (viewProjection: Matrix4x4) => this.geometry.drawMaterialMap(viewProjection), top: field.maxHeightM * metersToNorm, bottom: field.minHeightM * metersToNorm }
+        : null;
+      this.sun.updateTerrainSun(this.camera, this.viewDistanceMax.value, ground, materials);
+    }
 
     if (this.drawMode.value === DrawMode.ShadowMap) {
       // instead of the scene, applyDrawMode draws it again when the mode changes back

@@ -10,9 +10,6 @@ import CityScene from '../city/CityScene';
 import WaterRippleTexture from './waterRipples/WaterRippleTexture';
 import MapGBuffer from './MapGBuffer';
 import waterReflection from './waterReflection.wgsl?raw';
-import terrainReflection from './terrainReflection.wgsl?raw';
-import terrainHorizonLookup from './terrainHorizonLookup.wgsl?raw';
-import WaterTerrainHorizon from './WaterTerrainHorizon';
 import shader from './waterReflectionHalfRes.wgsl?raw';
 
 /**
@@ -42,7 +39,7 @@ export default class WaterReflectionHalfRes {
   constructor(renderer: Renderer) {
     this.renderer = renderer;
     this.material = new VertexFragmentShader(renderer, 'waterReflectionHalfRes', shader, {
-      includes: [cameraRay, cityLightmapSurface, ...MapGBuffer.readIncludes, waterReflection, skyVisibilityTrace, terrainReflection, terrainHorizonLookup],
+      includes: [cameraRay, cityLightmapSurface, ...MapGBuffer.readIncludes, waterReflection, skyVisibilityTrace],
       defines: CityScene.traceDefines,
     });
     this.material.depthWriteEnabled = false;
@@ -61,25 +58,6 @@ export default class WaterReflectionHalfRes {
   public bindWaterRipples(ripples: WaterRippleTexture): void {
     this.material.setTexture('rippleTexture', ripples.texture);
     this.material.setSampler('rippleSampler', ripples.sampler);
-  }
-
-  /** The horizons the ground in the reflections is read from, see setTerrainReflection. */
-  public bindTerrainHorizon(horizon: WaterTerrainHorizon): void {
-    this.material.setTexture('terrainHorizon', horizon.target);
-  }
-
-  /**
-   * The ground in the reflections (isTerrainOccluded of terrainHorizonLookup.wgsl), as
-   * DeferredShading.setTerrainReflection.
-   */
-  public setTerrainReflection(enabled: boolean, top: number, bias: number): void {
-    this.material.setFloat('reflectTerrainInWater', enabled ? 1 : 0);
-    this.material.setFloat('terrainReflectionTop', top);
-    this.material.setFloat('terrainReflectionBias', bias);
-  }
-
-  public get materials(): VertexFragmentShader[] {
-    return [this.material];
   }
 
   // the samples, a texture_2d<f32>

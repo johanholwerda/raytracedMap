@@ -14,7 +14,7 @@ import viewShaderSource from './shadowMapView.wgsl?raw';
 import { SHADOW_MODES, ShadowMode } from './MapWorldSettings';
 import { setMeshQuantization } from './city/meshQuantization';
 import TerrainLayerBuffer from './osm/TerrainLayerBuffer';
-import TerrainSunMap from './TerrainSunMap';
+import TerrainSunMap, { TerrainMaterials } from './TerrainSunMap';
 
 /**
  * The sun: its direction (sunAngleX/Y params) and its cascaded VSM shadow map, with the buildings, the trees and the
@@ -154,12 +154,13 @@ export default class SunShadows {
 
   /**
    * The ground in the way of the sun for the ray traced shadows (TerrainSunMap), rendered again when stale: under the
-   * camera, as far as viewDistance (world units). ground null: no elevation, nothing in the way.
+   * camera, as far as viewDistance (world units). ground null: no elevation, nothing in the way. materials: the
+   * materials of the ground on the same map, see TerrainSunMap.update.
    */
-  public updateTerrainSun(camera: MapCamera, viewDistance: number, ground: TerrainLayerBuffer | null): void {
+  public updateTerrainSun(camera: MapCamera, viewDistance: number, ground: TerrainLayerBuffer | null, materials: TerrainMaterials | null = null): void {
     const p = camera.worldPosition;
     const center = new Vector3(p.x, camera.pivot.worldPosition.y, p.z);
-    this.terrainSun.update(this.lightDir, center, viewDistance, this.sunRadius.value, ground);
+    this.terrainSun.update(this.lightDir, center, viewDistance, this.sunRadius.value, ground, materials);
   }
 
   /** The 4 cascades as a 2 x 2 grid on the screen, letterboxed to a square (the shadowMap drawMode). */

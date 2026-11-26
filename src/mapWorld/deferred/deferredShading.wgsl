@@ -177,7 +177,7 @@ struct ShadowMapData {
 @group(0) @binding(26) var terrainHeights : texture_2d<f32>;
 @group(0) @binding(27) var terrainMaxHeights : texture_2d<f32>;
 @group(0) @binding(28) var terrainMaxHeightsFine : texture_2d<f32>;
-// the horizon of the ground per block of pixels, see WaterTerrainHorizon.ts
+// the horizon of the ground per block of pixels and the color of it, see WaterTerrainHorizon.ts
 @group(0) @binding(29) var terrainHorizon : texture_2d<f32>;
 
 // SSAO_SKY: the part of the sky the SSAO sees around the pixel, relative to an open point (1), like the composite
@@ -582,7 +582,17 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
       if (REFLECTIONS_HALF_RES) {
         occluded = getHalfResReflection(coord, rd);
       } else {
-        occluded = select(0., 1., isOccluded(world, rd) || isTerrainOccluded(coord, world, rd));
+        occluded = select(0., 1., isOccluded(world, rd));
+      }
+    }
+    // the ground in it, where no building is: the buildings and the trees are in front of the hills more often than
+    // behind them. Its color (terrainColor.a: how much of the mirror has one) goes in with the sky, below
+    var terrainColor = vec4<f32>(0.);
+    if (REFLECT_BUILDINGS) {
+      let terrain = getTerrainReflection(coord, world, rd);
+      if (terrain.occluded) {
+        terrainColor = vec4(terrain.color.rgb, 1.) * (terrain.color.a * (1. - occluded));
+        occluded = 1.;
       }
     }
     c *= 1. - uniforms.reflectionDarkening * occluded;
@@ -595,7 +605,9 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
     // the sky in the mirror where it misses the buildings: the water goes to the sky color at grazing angles. Linear,
     // like the shading (getSkyColor is gamma space)
     let sky = getSkyColor(rd, false);
-    c = mix(c, sky * sky, min(fresnel * uniforms.skyReflection, 1.) * (1. - occluded));
+    // and the ground: it is in the mirror in place of the sky, by the same fresnel term
+    let mirror = min(fresnel * uniforms.skyReflection, 1.);
+    c = c * (1. - mirror * (1. - occluded + terrainColor.a)) + (sky * sky * (1. - occluded) + terrainColor.rgb) * mirror;
     if (uniforms.sunReflection > 0. && occluded < 1.) {
       // the sun in the mirror where it sees the sky, in the shadows of the buildings like the sun light of the water.
       // Brighter at grazing angles: 1 straight down, 1 + sunFresnel at the horizon

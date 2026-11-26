@@ -53,6 +53,12 @@ export default class TerrainHeightField {
     return this.maxHeight;
   }
 
+  /** The lowest ground (m, relative to the origin of the ElevationService) of the loaded tiles, Infinity without. */
+  public get minHeightM(): number {
+    this.updateExtremes();
+    return this.minHeight;
+  }
+
   /**
    * How much higher the highest ground of the loaded tiles is than the lowest, m: about 0 where the land is flat, 0
    * without tiles.

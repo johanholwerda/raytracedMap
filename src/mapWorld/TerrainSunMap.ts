@@ -10,6 +10,16 @@ import TerrainLayerBuffer from './osm/TerrainLayerBuffer';
 import heightShaderSource from './terrainSunHeight.wgsl?raw';
 
 /**
+ * The materials of the ground for TerrainSunMap.update: draw draws the ground and its layers with the viewProjection of
+ * the map, a material each (MapGeometry.drawMaterialMap). top and bottom: the highest and the lowest ground, world y.
+ */
+export type TerrainMaterials = {
+  draw: (viewProjection: Matrix4x4) => void;
+  top: number;
+  bottom: number;
+};
+
+/**
  * The hills in the way of the sun, for the ray traced sun shadows: their rays trace only the buildings and the trees of
  * CityScene, so without this a hill casts no shadow while the trees on it do. A map of the ground top down, centered
  * under the camera and as large as the view distance, per texel the height a point there has to be at to see the sun
@@ -44,6 +54,12 @@ export default class TerrainSunMap {
   private readonly heights: RenderTexture;
   // the highest ground per cell of 4, 16 (COARSE), 64 and all texels of heights, each level from the one before
   private readonly maxHeights: RenderTexture[] = [];
+  // the material of the ground top down (terrainMaterialMap.wgsl), for the color of the ground in the water
+  // reflections: only drawn with the materials of update
+  private readonly materialMap: RenderTexture;
+  private readonly materialViewProjection = new Matrix4x4();
+  private hasMaterials = false;
+  private static readonly MATERIAL_CLEAR = new Color(0, 0, 0, 0);
   // the height to see the sun at and the penumbra, what the shading reads
   private readonly target: RenderTexture;
   private readonly maxHeightsMaterials: VertexFragmentShader[] = [];
@@ -62,6 +78,7 @@ export default class TerrainSunMap {
     const resolution = TerrainSunMap.RESOLUTION;
     this.heights = new RenderTexture(renderer, resolution, resolution, { formats: ['r32float'], depth: true, depthFormat: 'depth32float' });
     this.target = new RenderTexture(renderer, resolution, resolution, { formats: ['rg32float'] });
+    this.materialMap = new RenderTexture(renderer, resolution, resolution, { formats: ['r32uint'], depth: true, depthFormat: 'depth32float' });
 
     // 1024 / 4 = 256 / 4 = 64 (COARSE: 16 texels) / 4 = 16 / 16 = 1
     let source = this.heights;
@@ -111,6 +128,14 @@ export default class TerrainSunMap {
     material.setMatrix('terrainSunViewProjection', this.viewProjection);
   }
 
+  /**
+   * The materials of the ground on the same map (materials of update) on a material that shades the ground from it
+   * (waterTerrainHorizon.wgsl): the texture now.
+   */
+  public bindMaterials(material: ShaderBase): void {
+    material.setTexture('terrainMaterials', this.materialMap);
+  }
+
   /** Render again in the next update: the ground tiles changed. */
   public setDirty(): void {
     this.dirty = true;
@@ -119,9 +144,13 @@ export default class TerrainSunMap {
   /**
    * Renders the map again when it is stale. lightDirection: toward the sun. center: under the camera. viewDistance: how
    * far from it (world units, xz) the shading needs it. sunRadius: the angular radius of the sun (radians), the
-   * penumbra. ground null: no elevation, nothing in the way.
+   * penumbra. ground null: no elevation, nothing in the way. materials: the materials of the ground are drawn too, for
+   * bindMaterials, null when nothing reads them.
    */
-  public update(lightDirection: Vector3, center: Vector3, viewDistance: number, sunRadius: number, ground: TerrainLayerBuffer | null): void {
+  public update(lightDirection: Vector3, center: Vector3, viewDistance: number, sunRadius: number, ground: TerrainLayerBuffer | null,
+    materials: TerrainMaterials | null = null): void {
+    // they weren't drawn with the map there is
+    if (materials && !this.hasMaterials) this.dirty = true;
     const lightKey = `${lightDirection.x.toFixed(4)},${lightDirection.y.toFixed(4)},${lightDirection.z.toFixed(4)},${sunRadius}`;
     if (lightKey !== this.lightKey) {
       this.lightKey = lightKey;
@@ -136,10 +165,10 @@ export default class TerrainSunMap {
     this.dirty = false;
     this.size = size;
     this.center = center.clone();
-    this.render(lightDirection, sunRadius, ground);
+    this.render(lightDirection, sunRadius, ground, materials);
   }
 
-  private render(toSun: Vector3, sunRadius: number, ground: TerrainLayerBuffer | null): void {
+  private render(toSun: Vector3, sunRadius: number, ground: TerrainLayerBuffer | null, materials: TerrainMaterials | null): void {
     const size = this.size;
     const texel = (2 * size) / TerrainSunMap.RESOLUTION;
     // the center snapped to the texel grid, as the cascades do (ShadowMap.renderCascade): a render around a new center
@@ -164,6 +193,23 @@ export default class TerrainSunMap {
       ground.draw(this.heightMaterial);
     }
     this.maxHeights.forEach((level, i) => this.renderer.blit(null, level, this.maxHeightsMaterials[i]));
+
+    this.hasMaterials = materials != null;
+    if (materials) {
+      // the same map, with the depth from the highest to the lowest ground: the layers are centimeters above each other
+      // (LAYER_GAP of worldGeometryCore.ts), less than the depth of the height map above tells apart
+      const margin = 0.01 + 0.01 * Math.max(materials.top - materials.bottom, 0);
+      const materialTop = materials.top + margin;
+      const materialRange = materials.top - materials.bottom + 2 * margin;
+      this.materialViewProjection.setValues(
+        1 / size, 0, 0, 0,
+        0, 0, -1 / materialRange, 0,
+        0, -1 / size, 0, 0,
+        -cx / size, cz / size, materialTop / materialRange, 1,
+      );
+      this.renderer.startRenderPass(this.materialMap, { clearColor: TerrainSunMap.MATERIAL_CLEAR, colorClear: true, depthClear: true });
+      if (ground && Number.isFinite(materialRange)) materials.draw(this.materialViewProjection);
+    }
 
     // the sun across the map in texels: a texel is a step of texel world units in x or z
     const horizontal = Math.hypot(toSun.x, toSun.z);
@@ -190,6 +236,7 @@ export default class TerrainSunMap {
     this.heights.destruct();
     for (const level of this.maxHeights) level.destruct();
     this.target.destruct();
+    this.materialMap.destruct();
     for (const material of this.maxHeightsMaterials) material.destruct();
     this.shadowHeightMaterial.destruct();
   }

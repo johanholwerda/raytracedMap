@@ -23,6 +23,7 @@ import { WORLD_LAYERS } from './map/worldGeometryCore';
 import { setMeshQuantization } from './city/meshQuantization';
 import { TREE_COLORS, TREE_CROWN_COLORS, TREE_TRUNK_COLOR } from './map/worldTrees';
 import snow from './snow.wgsl?raw';
+import terrainMaterialMap from './terrainMaterialMap.wgsl?raw';
 import type { SnowParams } from './map/snowLine';
 
 // the ground layers the snow lies on (and the ground under them), see snow.wgsl. Not the water, the roads (cleared) or
@@ -68,6 +69,9 @@ export default class MapGeometry {
   private overdrawMaterial: VertexFragmentShader;
   // the building meshes, with their unorm16 vertices
   private overdrawCityMaterial: VertexFragmentShader;
+  // the materials of drawMaterialMap: per layer (parallel to layers), and the ground
+  private materialMapLayerMaterials: VertexFragmentShader[] = [];
+  private materialMapGroundMaterial: VertexFragmentShader;
   private boundingBoxViewer: BoundingBoxViewer;
   // the first palette entry of TREE_COLORS (the trunk, then the crowns)
   private treeMaterial: number;
@@ -132,7 +136,40 @@ export default class MapGeometry {
       material.depthCompare = 'always';
     }
 
+    // what drawMaterialMap writes: the palette index of the gBuffer material + 1, and TERRAIN_MATERIAL_SNOW (256) where
+    // the snow lies on it, see waterTerrainHorizon.wgsl
+    const createMaterialMapMaterial = (gBufferMaterial: VertexFragmentShader, snowy: boolean) => {
+      const material = new VertexFragmentShader(renderer, 'terrainMaterialMap', terrainMaterialMap);
+      // seen from above, with a mirrored viewProjection
+      material.cullMode = 'none';
+      material.setFloat('material', gBuffer.materialIndex(gBufferMaterial) + 1 + (snowy ? 256 : 0));
+      return material;
+    };
+    this.materialMapLayerMaterials = this.layers.map(layer => createMaterialMapMaterial(layer.material, SNOW_LAYERS.has(layer.def.key)));
+    this.materialMapGroundMaterial = createMaterialMapMaterial(this.groundGBufferMaterial, true);
+
     this.boundingBoxViewer = new BoundingBoxViewer(renderer);
+  }
+
+  /**
+   * The ground and its layers with their materials into the current pass, for a map of the materials of the ground top
+   * down (TerrainSunMap.update, its viewProjection): the highest wins the depth test. Only with elevation.
+   */
+  public drawMaterialMap(viewProjection: Matrix4x4): void {
+    if (!this.elevation) return;
+    this.layers.forEach((layer, i) => {
+      if (!layer.enabled.value || layer.buffer.vertexCount === 0) return;
+      this.materialMapLayerMaterials[i].setMatrix('viewProjection', viewProjection);
+      layer.buffer.draw(this.materialMapLayerMaterials[i]);
+    });
+    if (this.groundBuffer.vertexCount === 0) return;
+    this.materialMapGroundMaterial.setMatrix('viewProjection', viewProjection);
+    this.groundBuffer.draw(this.materialMapGroundMaterial);
+  }
+
+  /** The palette index of the snow, for what shades the ground itself (WaterTerrainHorizon.setSnow). */
+  public get snowMaterial(): number {
+    return this.gBuffer.materialIndex(this.layers.find(layer => layer.def.key === SNOW_MATERIAL_LAYER)!.material);
   }
 
   /** The albedo of a ground layer (index into layers), in the gBuffer and the forward shading. */

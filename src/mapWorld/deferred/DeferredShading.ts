@@ -126,8 +126,9 @@ export default class DeferredShading {
 
   /**
    * The ground in the water reflections that trace the buildings (reflectBuildings of setWaterReflections): their rays
-   * are compared with the horizon of the ground around the pixel (isTerrainOccluded of terrainHorizonLookup.wgsl), which
-   * WaterTerrainHorizon has to draw before the shading then. A pixel without one marches the height map of
+   * are compared with the horizon of the ground around the pixel (getTerrainReflection of terrainHorizonLookup.wgsl),
+   * which WaterTerrainHorizon has to draw before the shading then: where a ray hits the ground, the water mirrors its
+   * color. A pixel without one marches the height map of
    * TerrainSunMap.bindHeights itself. enabled false skips it, where no ground is high enough above the water (most
    * places). top: the highest ground, world y, a ray above it ends. bias: how far above the water the rays start, world
    * units.
