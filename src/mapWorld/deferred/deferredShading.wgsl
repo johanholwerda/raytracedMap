@@ -85,6 +85,10 @@ struct Uniforms {
   sunFresnel : f32,
   // how far a point goes off its surface before it is compared with terrainSunMap, see getTerrainSunShadow
   terrainSunOffset : f32,
+  // the ground in the water reflections (REFLECT_BUILDINGS), see terrainHorizonLookup.wgsl: 0 skips it
+  reflectTerrainInWater : u32,
+  terrainReflectionTop : f32,
+  terrainReflectionBias : f32,
 };
 
 // the reflectance of water seen straight down (index of refraction 1.33)
@@ -169,6 +173,12 @@ struct ShadowMapData {
 @group(0) @binding(24) var reflectionTexture : texture_2d<f32>;
 // the ground as the sun sees it (TerrainSunMap.ts): the hills for the ray traced sun shadows, see terrainSun.wgsl
 @group(0) @binding(25) var terrainSunMap : texture_2d<f32>;
+// the height map of the ground it is made from, for the ground in the water reflections, see TerrainSunMap.bindHeights
+@group(0) @binding(26) var terrainHeights : texture_2d<f32>;
+@group(0) @binding(27) var terrainMaxHeights : texture_2d<f32>;
+@group(0) @binding(28) var terrainMaxHeightsFine : texture_2d<f32>;
+// the horizon of the ground per block of pixels, see WaterTerrainHorizon.ts
+@group(0) @binding(29) var terrainHorizon : texture_2d<f32>;
 
 // SSAO_SKY: the part of the sky the SSAO sees around the pixel, relative to an open point (1), like the composite
 // (reprojectedSSAOComposite.wgsl) applies it: faded in over its first samples, times its amount. No fog fade: the fog
@@ -561,7 +571,8 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
     c += albedo * ((n.y * .5 + .5) * getSSAO(coord)) * skyColor;
   }
 
-  // the water reflects a building: darker. The ray mirrored on the normal of the water goes up, it can only hit a building
+  // the water reflects a building or the ground: darker. The ray mirrored on the normal of the water goes up, it can only
+  // hit a building, or the ground where that is higher than the water (isTerrainOccluded)
   if (WATER_REFLECTIONS && ((uniforms.waterMaterials >> materialIndex) & 1u) != 0u) {
     let rd = getWaterReflectionRay(n, world, d);
     // the part of the reflection that hits a building: the ray of the pixel (0 or 1), or the rays of the half resolution
@@ -571,7 +582,7 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
       if (REFLECTIONS_HALF_RES) {
         occluded = getHalfResReflection(coord, rd);
       } else {
-        occluded = select(0., 1., isOccluded(world, rd));
+        occluded = select(0., 1., isOccluded(world, rd) || isTerrainOccluded(coord, world, rd));
       }
     }
     c *= 1. - uniforms.reflectionDarkening * occluded;

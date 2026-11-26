@@ -25,6 +25,9 @@ export default class TerrainSunMap {
   private static readonly RESOLUTION = 1024;
   // texels per cell of the highest ground, mirrors COARSE of terrainSunHeight.wgsl
   private static readonly COARSE = 16;
+  // and of the first level of it, which the terrain in the water reflections skips by too (TERRAIN_FINE of
+  // terrainReflection.wgsl)
+  private static readonly FINE = 4;
   // the half-extent of the map is this many times the view distance: the ground in view stays in it while the camera
   // drifts up to REDRAW_DRIFT of the view distance from its center
   private static readonly SIZE_SCALE = 1.25;
@@ -47,6 +50,8 @@ export default class TerrainSunMap {
   private readonly shadowHeightMaterial: VertexFragmentShader;
   private readonly viewProjection = new Matrix4x4();
   private readonly materials: ShaderBase[] = [];
+  // the materials that march the height map itself, see bindHeights
+  private readonly heightsMaterials: ShaderBase[] = [];
   private center = new Vector3(1e9, 1e9, 1e9);
   private size = 0;
   private lightKey = '';
@@ -76,7 +81,8 @@ export default class TerrainSunMap {
       source = level;
       sourceSize = size;
     }
-    if (resolution / TerrainSunMap.COARSE !== this.maxHeights[1].width || this.maxHeights[3].width !== 1) {
+    if (resolution / TerrainSunMap.COARSE !== this.maxHeights[1].width || resolution / TerrainSunMap.FINE !== this.maxHeights[0].width ||
+      this.maxHeights[3].width !== 1) {
       throw new Error('TerrainSunMap: the levels of maxHeights do not fit RESOLUTION');
     }
     this.shadowHeightMaterial = new VertexFragmentShader(renderer, 'terrainSunShadowHeight', heightShaderSource, { defines: { SHADOW_HEIGHT: true } });
@@ -91,6 +97,18 @@ export default class TerrainSunMap {
     material.setTexture('terrainSunMap', this.target);
     this.materials.push(material);
     this.setUniforms(material);
+  }
+
+  /**
+   * The height map itself on a material that marches it (isTerrainOccluded of terrainReflection.wgsl, the terrain in the
+   * water reflections): its textures now, its matrix on every render.
+   */
+  public bindHeights(material: ShaderBase): void {
+    material.setTexture('terrainHeights', this.heights);
+    material.setTexture('terrainMaxHeights', this.maxHeights[1]);
+    material.setTexture('terrainMaxHeightsFine', this.maxHeights[0]);
+    this.heightsMaterials.push(material);
+    material.setMatrix('terrainSunViewProjection', this.viewProjection);
   }
 
   /** Render again in the next update: the ground tiles changed. */
@@ -160,6 +178,7 @@ export default class TerrainSunMap {
     this.renderer.blit(null, this.target, m);
 
     for (const material of this.materials) this.setUniforms(material);
+    for (const material of this.heightsMaterials) material.setMatrix('terrainSunViewProjection', this.viewProjection);
   }
 
   private setUniforms(material: ShaderBase): void {
