@@ -25,14 +25,15 @@ export default class ModelBVH {
   //the parent of every node, -1 for the root, and the node that has the box as a child. For refit
   private parents: Int32Array;
   private leafParents: Int32Array;
-  private boxMin: Vector3[];
-  private boxMax: Vector3[];
+  //null when the BVH was made from a Float64Array of boxes
+  private boxMin: Vector3[] | null;
+  private boxMax: Vector3[] | null;
   //the most nodes on a path from the root to a leaf that the build allows, see split
   private readonly maxDepth: number;
 
   //only during the build
   //min.xyz and max.xyz per box
-  private boxes!: Float64Array;
+  private boxes: Float64Array;
   //the box indices sorted on their center, per axis. A range holds the same boxes on every axis
   private sorted!: Uint32Array[];
   private rightArea!: Float64Array;
@@ -40,11 +41,28 @@ export default class ModelBVH {
   private isLeft!: Uint8Array;
   private partitioned!: Uint32Array;
 
-  constructor(boxMin: Vector3[], boxMax: Vector3[], maxDepth = Infinity) {
+  /**
+   * The boxes as their min and max corners, or as 1 Float64Array of min.xyz and max.xyz per box (boxMax null): no
+   * Vector3s per box for a BVH that is made once (the buildings of a tile): refit then reads the boxes as they were.
+   */
+  constructor(boxMin: Vector3[] | Float64Array, boxMax: Vector3[] | null, maxDepth = Infinity) {
     this.maxDepth = maxDepth;
-    this.boxMin = boxMin;
-    this.boxMax = boxMax;
-    const count = boxMin.length;
+    let count: number;
+    if (boxMin instanceof Float64Array) {
+      this.boxes = boxMin;
+      this.boxMin = this.boxMax = null;
+      count = boxMin.length / 6;
+    } else {
+      this.boxMin = boxMin;
+      this.boxMax = boxMax!;
+      count = boxMin.length;
+      this.boxes = new Float64Array(count * 6);
+      for (let i = 0; i < count; i++) {
+        const min = boxMin[i], max = boxMax![i], o = i * 6;
+        this.boxes[o] = min.x; this.boxes[o + 1] = min.y; this.boxes[o + 2] = min.z;
+        this.boxes[o + 3] = max.x; this.boxes[o + 4] = max.y; this.boxes[o + 5] = max.z;
+      }
+    }
     const data = new ArrayBuffer(Math.max(count - 1, 1) * ModelBVH.bytesPerNode);
     this.nodeFloats = new Float32Array(data);
     this.nodeUints = new Uint32Array(data);
@@ -59,18 +77,20 @@ export default class ModelBVH {
       this.depth = 1;
       this.refit(0);
     } else if (count > 1) {
-      this.boxes = new Float64Array(count * 6);
+      const boxes = this.boxes;
       const centers = new Float64Array(count * 3);
       for (let i = 0; i < count; i++) {
-        const min = boxMin[i], max = boxMax[i];
-        this.boxes.set([min.x, min.y, min.z, max.x, max.y, max.z], i * 6);
-        centers.set([(min.x + max.x) * .5, (min.y + max.y) * .5, (min.z + max.z) * .5], i * 3);
+        for (let k = 0; k < 3; k++) centers[i * 3 + k] = (boxes[i * 6 + k] + boxes[i * 6 + 3 + k]) * .5;
       }
       this.sorted = [0, 1, 2].map(axis => {
         const indices = new Uint32Array(count);
         for (let i = 0; i < count; i++) indices[i] = i;
-        //equal centers in the order of the boxes, so the BVH is the same on every browser
-        return indices.sort((a, b) => centers[a * 3 + axis] - centers[b * 3 + axis] || a - b);
+        //equal centers in the order of the boxes, so the BVH is the same on every browser. -1, 0 or 1, not the
+        //difference: a double returned from the function is a number on the heap, per comparison
+        return indices.sort((a, b) => {
+          const ca = centers[a * 3 + axis], cb = centers[b * 3 + axis];
+          return ca < cb ? -1 : ca > cb ? 1 : a - b;
+        });
       });
       this.rightArea = new Float64Array(count);
       this.isLeft = new Uint8Array(count);
@@ -87,9 +107,17 @@ export default class ModelBVH {
   //to the root. The tree stays the same, so it is less good than a new one when the box moved far
   public refit(boxIndex: number) {
     const f = this.nodeFloats, u = this.nodeUints;
-    const min = this.boxMin[boxIndex], max = this.boxMax[boxIndex];
-    let minX = min.x, minY = min.y, minZ = min.z;
-    let maxX = max.x, maxY = max.y, maxZ = max.z;
+    let minX, minY, minZ, maxX, maxY, maxZ;
+    if (this.boxMin && this.boxMax) {
+      const min = this.boxMin[boxIndex], max = this.boxMax[boxIndex];
+      minX = min.x; minY = min.y; minZ = min.z;
+      maxX = max.x; maxY = max.y; maxZ = max.z;
+    } else {
+      //made from a Float64Array: the box as it was made with
+      const b = this.boxes, o = boxIndex * 6;
+      minX = b[o]; minY = b[o + 1]; minZ = b[o + 2];
+      maxX = b[o + 3]; maxY = b[o + 4]; maxZ = b[o + 5];
+    }
     let child = (boxIndex | ModelBVH.leafFlag) >>> 0;
     let node = this.leafParents[boxIndex];
     while (node >= 0) {
@@ -222,7 +250,8 @@ export default class ModelBVH {
         if (isLeft[box]) partitioned[left++] = box;
         else partitioned[right++] = box;
       }
-      indices.set(partitioned.subarray(start, end), start);
+      // copied back without a view of the range (an object per node)
+      for (let i = start; i < end; i++) indices[i] = partitioned[i];
     }
 
     const o = index * ModelBVH.wordsPerNode;

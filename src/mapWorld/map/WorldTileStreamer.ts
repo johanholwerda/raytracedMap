@@ -794,7 +794,7 @@ export default class WorldTileStreamer {
 
     if (entry.city && this.cityStreamingEnabled && this.cityDesired.has(key) && !this.loadedCityTiles.has(key)) {
       const buildings = result?.buildings ?? {
-        vertices: new Uint16Array(0), lightmap: new Float32Array(0), interleaved: new ArrayBuffer(0), indices: new Uint16Array(0), trace: null, buildings: [], min: [0, 0, 0], max: [0, 0, 0],
+        vertexCount: 0, interleaved: new ArrayBuffer(0), indices: new Uint16Array(0), trace: null, buildings: [], min: [0, 0, 0], max: [0, 0, 0],
       };
       this.cityReadyQueue.push({ key, result: buildings as WorldBuildingResult, margin: entry.margin, timing: entry.timing });
     }
@@ -848,7 +848,7 @@ export default class WorldTileStreamer {
       }
 
       let mesh: Mesh | null = null;
-      if (result.vertices.length > 0) {
+      if (result.vertexCount > 0) {
         mesh = new Mesh(this.renderer);
         // The layout of the vertex buffer the worker interleaved (WorldBuildingResult.interleaved): the quantized
         // position, and the lightmap chart per vertex, read by the materials that declare it (see SkyVisibilityLightmap)
@@ -860,11 +860,11 @@ export default class WorldTileStreamer {
           label: `cityTile ${key}`,
         });
         this.renderer.device.queue.writeBuffer(vertexBuffer, 0, result.interleaved);
-        mesh.setVertexBuffer(vertexBuffer, result.vertices.length / 4);
+        mesh.setVertexBuffer(vertexBuffer, result.vertexCount);
         // Indexed, see buildBuildings; 16 bit when they fit
         mesh.setIndices(result.indices, result.indices instanceof Uint16Array ? 'uint16' : 'uint32');
-        const { vertices, lightmap, indices, atlasSize } = result;
-        if (atlasSize) this.lastCityTile = { key, result: { vertices, quantization: result.quantization, lightmap, indices, atlasSize } };
+        const { interleaved, vertexCount, indices, atlasSize } = result;
+        if (atlasSize) this.lastCityTile = { key, result: { interleaved, vertexCount, quantization: result.quantization, indices, atlasSize } };
         this.meshBounds.set(mesh, new AABox(
           new Vector3(result.min[0], result.min[1], result.min[2]),
           new Vector3(result.max[0], result.max[1], result.max[2]),

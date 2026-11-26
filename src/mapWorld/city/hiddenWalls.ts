@@ -13,12 +13,14 @@ import type { BuildingPolygon } from './cityLayout';
  * coplanarCovers. polygons[i].top when it is hidden altogether, NaN for an edge of 0 length (no wall).
  *
  * Only the polygons before `count` take part (the buildings, not the trees). eps: the offset of the test, in world
- * units: walls of touching parts that are that close count as touching
+ * units: walls of touching parts that are that close count as touching. pointStarts: per polygon the index of its first
+ * point in all of them, and the count of all after the last: the result is 1 array, polygon i's from pointStarts[i]
  */
-export function findWallBottoms(polygons: BuildingPolygon[], count: number, eps: number): Float32Array[] {
-  const out = polygons.map(p => new Float32Array(p.coords.length / 2).fill(p.base));
+export function findWallBottoms(polygons: BuildingPolygon[], count: number, eps: number, pointStarts: Int32Array): Float32Array {
+  const out = new Float32Array(pointStarts[polygons.length]);
+  for (let i = 0; i < polygons.length; i++) out.fill(polygons[i].base, pointStarts[i], pointStarts[i + 1]);
   if (count < 2) {
-    fillZeroEdges(polygons, out, count);
+    fillZeroEdges(polygons, out, count, pointStarts);
     return out;
   }
 
@@ -32,18 +34,33 @@ export function findWallBottoms(polygons: BuildingPolygon[], count: number, eps:
       x0 = Math.min(x0, c[k]); x1 = Math.max(x1, c[k]);
       y0 = Math.min(y0, c[k + 1]); y1 = Math.max(y1, c[k + 1]);
     }
-    bounds.set([x0, y0, x1, y1], i * 4);
+    bounds[i * 4] = x0; bounds[i * 4 + 1] = y0; bounds[i * 4 + 2] = x1; bounds[i * 4 + 3] = y1;
     minX = Math.min(minX, x0); maxX = Math.max(maxX, x1);
     minY = Math.min(minY, y0); maxY = Math.max(maxY, y1);
   }
   const grid = Math.max(1, Math.min(256, Math.ceil(Math.sqrt(count))));
   const cellX = Math.max(maxX - minX, 1e-12) / grid, cellY = Math.max(maxY - minY, 1e-12) / grid;
   const cellOf = (v: number, min: number, size: number) => Math.min(grid - 1, Math.max(0, Math.floor((v - min) / size)));
-  const cells: number[][] = Array.from({ length: grid * grid }, () => []);
-  for (let i = 0; i < count; i++) {
-    const cx0 = cellOf(bounds[i * 4], minX, cellX), cx1 = cellOf(bounds[i * 4 + 2], minX, cellX);
-    const cy0 = cellOf(bounds[i * 4 + 1], minY, cellY), cy1 = cellOf(bounds[i * 4 + 3], minY, cellY);
-    for (let y = cy0; y <= cy1; y++) for (let x = cx0; x <= cx1; x++) cells[y * grid + x].push(i);
+  let cellEntries = new Int32Array(0), cellFill = new Int32Array(0);
+  // the polygons of cell c are cellEntries[cellStarts[c]] to cellEntries[cellStarts[c + 1]], in their order (as an
+  // array per cell they were most of the garbage here): a count per cell, then the polygons
+  const cellStarts = new Int32Array(grid * grid + 1);
+  for (let pass = 0; pass < 2; pass++) {
+    for (let i = 0; i < count; i++) {
+      const cx0 = cellOf(bounds[i * 4], minX, cellX), cx1 = cellOf(bounds[i * 4 + 2], minX, cellX);
+      const cy0 = cellOf(bounds[i * 4 + 1], minY, cellY), cy1 = cellOf(bounds[i * 4 + 3], minY, cellY);
+      for (let y = cy0; y <= cy1; y++) {
+        for (let x = cx0; x <= cx1; x++) {
+          if (pass === 0) cellStarts[y * grid + x + 1]++;
+          else cellEntries[cellFill[y * grid + x]++] = i;
+        }
+      }
+    }
+    if (pass === 0) {
+      for (let c = 0; c < grid * grid; c++) cellStarts[c + 1] += cellStarts[c];
+      cellEntries = new Int32Array(cellStarts[grid * grid]);
+      cellFill = cellStarts.slice(0, grid * grid);
+    }
   }
 
   // per candidate the stamp of the wall it was last tested for, so a polygon in several cells is tested once
@@ -89,9 +106,9 @@ export function findWallBottoms(polygons: BuildingPolygon[], count: number, eps:
         // the cell of the middle, then the one of the inner middle when it is another
         for (let side = 0; side < 2 && !midCovered; side++) {
           if (side === 1 && innerCell === midCell) break;
-          const list = cells[side === 0 ? midCell : innerCell];
-          for (let k = 0; k < list.length; k++) {
-            const qi = list[k];
+          const cell = side === 0 ? midCell : innerCell;
+          for (let k = cellStarts[cell]; k < cellStarts[cell + 1]; k++) {
+            const qi = cellEntries[k];
             const q = polygons[qi];
             if (qi === pi || q.base > p.base + eps || q.top <= p.base) continue;
             if (pointInBounds(bounds, qi, mx, my)) {
@@ -110,9 +127,9 @@ export function findWallBottoms(polygons: BuildingPolygon[], count: number, eps:
         const cx0 = cellOf(sx0, minX, cellX), cx1 = cellOf(sx1, minX, cellX);
         const cy0 = cellOf(sy0, minY, cellY), cy1 = cellOf(sy1, minY, cellY);
         for (let gy = cy0; gy <= cy1; gy++) for (let gx = cx0; gx <= cx1; gx++) {
-          const list = cells[gy * grid + gx];
-          for (let k = 0; k < list.length; k++) {
-            const qi = list[k];
+          const cell = gy * grid + gx;
+          for (let k = cellStarts[cell]; k < cellStarts[cell + 1]; k++) {
+            const qi = cellEntries[k];
             if (qi === pi || stamp[qi] === wallIndex) continue;
             stamp[qi] = wallIndex;
             const q = polygons[qi];
@@ -130,24 +147,24 @@ export function findWallBottoms(polygons: BuildingPolygon[], count: number, eps:
         if (rectFloats > 0) {
           cover[0] = p.base; cover[1] = p.top; cover[2] = eps / len; cover[3] = eps;
           coveredBottom();
-          out[pi][ia] = cover[4];
-        } else out[pi][ia] = p.base;
+          out[pointStarts[pi] + ia] = cover[4];
+        } else out[pointStarts[pi] + ia] = p.base;
       }
     }
   }
-  fillZeroEdges(polygons, out, count);
+  fillZeroEdges(polygons, out, count, pointStarts);
   return out;
 }
 
 /** NaN for the edges of 0 length of the buildings */
-function fillZeroEdges(polygons: BuildingPolygon[], out: Float32Array[], count: number): void {
+function fillZeroEdges(polygons: BuildingPolygon[], out: Float32Array, count: number, pointStarts: Int32Array): void {
   for (let pi = 0; pi < count; pi++) {
     const { coords: c, ringStarts, ringEnds } = polygons[pi];
     for (let r = 0; r < ringStarts.length; r++) {
       const s = ringStarts[r], n = ringEnds[r] - s;
       for (let j = 0; j < n; j++) {
         const ia = s + j, ib = s + ((j + 1) % n);
-        if (c[ia * 2] === c[ib * 2] && c[ia * 2 + 1] === c[ib * 2 + 1]) out[pi][ia] = NaN;
+        if (c[ia * 2] === c[ib * 2] && c[ia * 2 + 1] === c[ib * 2 + 1]) out[pointStarts[pi] + ia] = NaN;
       }
     }
   }
