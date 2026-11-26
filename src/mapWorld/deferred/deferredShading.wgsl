@@ -7,10 +7,11 @@
 // micro normal of the ripples (rippleTexture, see WaterRippleTexture.ts), which makes the reflections wobble. A ray
 // that misses the buildings reflects the sun where it points at it: the glints on the ripples. The rays are traced here, a
 // ray per water pixel, or by the half resolution pass before it (REFLECTIONS_HALF_RES, see WaterReflectionHalfRes.ts).
+// Where the screen shows what a ray hits, the water mirrors its color (SCREEN_REFLECTIONS, waterScreenReflection.wgsl).
 // The sun shadows (SUN_SHADOWS) are the VSM cascades, a ray to the sun traced against the same city (getRayTracedShadow),
 // or the sun visibility the lightmap texels hold (the zw of getLightmapLookup: from the half resolution samples, or in
 // the lookup of the sky visibility).
-// Needs hash.wgsl, r2.wgsl, toneMap.wgsl, cameraRay.wgsl, waterReflection.wgsl, skyVisibilityTrace.wgsl and the includes of the lightmap resolve (see SkyVisibilityLightmap.resolveIncludes):
+// Needs hash.wgsl, r2.wgsl, toneMap.wgsl, cameraRay.wgsl, waterReflection.wgsl, waterScreenReflection.wgsl, skyVisibilityTrace.wgsl and the includes of the lightmap resolve (see SkyVisibilityLightmap.resolveIncludes):
 // the lightmap holds the part of the sky a point sees, times the sky color here
 
 struct Uniforms {
@@ -19,6 +20,9 @@ struct Uniforms {
   viewProjection : mat4x4<f32>,
   // the sun's view of the ground for the ray traced shadows (SUN_SHADOWS 2 and 3), see terrainSun.wgsl
   terrainSunViewProjection : mat4x4<f32>,
+  // the camera of reflectionHistory, without the jitter: the screen space reflections read their colors from it (see
+  // waterScreenReflection.wgsl)
+  historyViewProjection : mat4x4<f32>,
   cameraPosition : vec3<f32>,
   resolution : vec2<f32>,
   lightDirection : vec3<f32>,
@@ -89,6 +93,14 @@ struct Uniforms {
   reflectTerrainInWater : u32,
   terrainReflectionTop : f32,
   terrainReflectionBias : f32,
+  // the colors of the reflections from the screen (SCREEN_REFLECTIONS), see waterScreenReflection.wgsl: whether
+  // reflectionHistory is of this view (0: no colors)
+  screenReflectionHistory : u32,
+  // how much of the light the water loses where it reflects a building (reflectionDarkening) the color of the building
+  // gives back, where the screen shows it: 0 dark as without it, 1 all of it
+  reflectionColor : f32,
+  // the brightness of a building in the water that the screen doesn't show, see getUnseenReflectionColor
+  reflectionUnseen : f32,
 };
 
 // the reflectance of water seen straight down (index of refraction 1.33)
@@ -115,8 +127,8 @@ override WATER_REFLECTIONS : bool = false;
 override REFLECT_BUILDINGS : bool = false;
 // the reflections are mirrored on the ripples of rippleTexture, else on the flat water
 override WATER_RIPPLES : bool = false;
-// REFLECT_BUILDINGS from the samples of reflectionTexture, 1 traced ray per 2 x 2 pixels (see getHalfResReflection),
-// instead of a ray per water pixel here
+// REFLECT_BUILDINGS from the samples of reflectionTexture (with their colors with SCREEN_REFLECTIONS), 1 traced ray per
+// block of pixels (see getHalfResReflection), instead of a ray per water pixel here
 override REFLECTIONS_HALF_RES : bool = false;
 // the debug views of the sun shadows (MapWorld's drawMode): 0 off, 1 the shadow lookup (getSunShadow) alone, black on the
 // faces away from the sun, 2 the
@@ -168,9 +180,9 @@ struct ShadowMapData {
 @group(0) @binding(22) var blueNoiseTexture : texture_2d<f32>;
 // the SSAO of this frame (SSAO_SKY): (visibility, sample count, camera distance, 0), see reprojectedSSAO.wgsl
 @group(0) @binding(23) var ssaoTexture : texture_2d<f32>;
-// the reflection rays of the water at half resolution (REFLECTIONS_HALF_RES): x 0 no water, .5 the ray reaches the sky, 1
-// it hits a building, yzw the ray, see waterReflectionHalfRes.wgsl
-@group(0) @binding(24) var reflectionTexture : texture_2d<f32>;
+// the reflection rays of the water at half resolution (REFLECTIONS_HALF_RES): x 4 x 8 bits, 0 no water, .5 the ray reaches
+// the sky, 1 it hits a building, then the ray. y the color of what it hits on the screen, see waterReflectionHalfRes.wgsl
+@group(0) @binding(24) var reflectionTexture : texture_2d<u32>;
 // the ground as the sun sees it (TerrainSunMap.ts): the hills for the ray traced sun shadows, see terrainSun.wgsl
 @group(0) @binding(25) var terrainSunMap : texture_2d<f32>;
 // the height map of the ground it is made from, for the ground in the water reflections, see TerrainSunMap.bindHeights
@@ -179,6 +191,10 @@ struct ShadowMapData {
 @group(0) @binding(28) var terrainMaxHeightsFine : texture_2d<f32>;
 // the horizon of the ground per block of pixels and the color of it, see WaterTerrainHorizon.ts
 @group(0) @binding(29) var terrainHorizon : texture_2d<f32>;
+// the image of the frame before (the TAA history, gamma space) and its bilinear sampler, the colors of the screen space
+// reflections (SCREEN_REFLECTIONS), see waterScreenReflection.wgsl
+@group(0) @binding(30) var reflectionHistory : texture_2d<f32>;
+@group(0) @binding(31) var reflectionHistorySampler : sampler;
 
 // SSAO_SKY: the part of the sky the SSAO sees around the pixel, relative to an open point (1), like the composite
 // (reprojectedSSAOComposite.wgsl) applies it: faded in over its first samples, times its amount. No fog fade: the fog
@@ -430,8 +446,9 @@ fn getReflectionSampleWeight(s : vec4<f32>, rd : vec3<f32>) -> f32 {
 // getReflectionSampleOffset of each block, so a pixel is on a sample or between 2 or 4 of them. Bilinearly, times
 // how alike the ray of the sample and rd are: the ripples turn the rays of neighbouring pixels degrees apart, and what a
 // ray hits follows its direction more than its pixel. Without it the reflections are a pixel softer. Only the samples on
-// the water count, none: no building
-fn getHalfResReflection(coord : vec2<u32>, rd : vec3<f32>) -> f32 {
+// the water count, none: no building. The colors of the samples (0 where a ray hit no building the screen shows) with
+// the same weights: the rgb of the result, its a the part that hits
+fn getHalfResReflection(coord : vec2<u32>, rd : vec3<f32>) -> vec4<f32> {
   let last = vec2<i32>(textureDimensions(reflectionTexture)) - 1;
   let block = vec2<i32>(vec2(REFLECTION_BLOCK_X, REFLECTION_BLOCK_Y));
   // from the sample of the first block, which the first pixels are before: + block keeps the division rounding down
@@ -441,14 +458,27 @@ fn getHalfResReflection(coord : vec2<u32>, rd : vec3<f32>) -> f32 {
   let h0 = clamp(h, vec2(0), last);
   let h1 = clamp(h + min(between, vec2(1)), vec2(0), last);
   let f = vec2<f32>(between) / vec2<f32>(block);
-  let s00 = textureLoad(reflectionTexture, h0, 0);
-  let s10 = textureLoad(reflectionTexture, vec2(h1.x, h0.y), 0);
-  let s01 = textureLoad(reflectionTexture, vec2(h0.x, h1.y), 0);
-  let s11 = textureLoad(reflectionTexture, h1, 0);
+  let t00 = textureLoad(reflectionTexture, h0, 0).xy;
+  let t10 = textureLoad(reflectionTexture, vec2(h1.x, h0.y), 0).xy;
+  let t01 = textureLoad(reflectionTexture, vec2(h0.x, h1.y), 0).xy;
+  let t11 = textureLoad(reflectionTexture, h1, 0).xy;
+  let s00 = unpack4x8unorm(t00.x);
+  let s10 = unpack4x8unorm(t10.x);
+  let s01 = unpack4x8unorm(t01.x);
+  let s11 = unpack4x8unorm(t11.x);
   let w = vec4((1. - f.x) * (1. - f.y), f.x * (1. - f.y), (1. - f.x) * f.y, f.x * f.y) * vec4(
     getReflectionSampleWeight(s00, rd), getReflectionSampleWeight(s10, rd), getReflectionSampleWeight(s01, rd), getReflectionSampleWeight(s11, rd));
   let sum = w.x + w.y + w.z + w.w;
-  return select(0., dot(w, step(vec4(.75), vec4(s00.x, s10.x, s01.x, s11.x))) / sum, sum > 0.);
+  if (sum <= 0.) {
+    return vec4(0.);
+  }
+  let occluded = dot(w, step(vec4(.75), vec4(s00.x, s10.x, s01.x, s11.x))) / sum;
+  if (!SCREEN_REFLECTIONS) {
+    return vec4(0., 0., 0., occluded);
+  }
+  let color = unpackReflectionColor(t00.y) * w.x + unpackReflectionColor(t10.y) * w.y + unpackReflectionColor(t01.y) * w.z +
+    unpackReflectionColor(t11.y) * w.w;
+  return vec4(color / sum, occluded);
 }
 
 // The distance fog: exponential (distanceFog per world unit), with a smoothstep from .7 of viewDistanceMax that takes
@@ -576,13 +606,26 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
   if (WATER_REFLECTIONS && ((uniforms.waterMaterials >> materialIndex) & 1u) != 0u) {
     let rd = getWaterReflectionRay(n, world, d);
     // the part of the reflection that hits a building: the ray of the pixel (0 or 1), or the rays of the half resolution
-    // pass around it
+    // pass around it. With SCREEN_REFLECTIONS the trace gives where it hits, which takes the color of the screen there
     var occluded = 0.;
+    // the color of the buildings in the mirror that the screen shows, linear, 0 for the others
+    var reflected = vec3<f32>(0.);
     if (REFLECT_BUILDINGS) {
       if (REFLECTIONS_HALF_RES) {
-        occluded = getHalfResReflection(coord, rd);
+        let samples = getHalfResReflection(coord, rd);
+        occluded = samples.a;
+        reflected = samples.rgb;
       } else {
-        occluded = select(0., 1., isOccluded(world, rd));
+        if (SCREEN_REFLECTIONS) {
+          // in the color of the screen at the hit point where it shows it
+          let t = getOcclusionDistance(world, rd);
+          if (t >= 0.) {
+            occluded = 1.;
+            reflected = getWorldHitReflectionColor(world, rd, t);
+          }
+        } else {
+          occluded = select(0., 1., isOccluded(world, rd));
+        }
       }
     }
     // the ground in it, where no building is: the buildings and the trees are in front of the hills more often than
@@ -595,7 +638,8 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
         occluded = 1.;
       }
     }
-    c *= 1. - uniforms.reflectionDarkening * occluded;
+    // the light the water loses to a building in the mirror, of which its color gives some back
+    c = c * (1. - uniforms.reflectionDarkening * occluded) + reflected * (uniforms.reflectionDarkening * uniforms.reflectionColor);
     // the fresnel term (Schlick) of the facet that mirrors the view into rd: its normal is halfway between rd and the
     // direction to the eye, the micro normal of the ripples with WATER_RIPPLES, which makes it vary per ripple
     let toEye = normalize(uniforms.cameraPosition - world);

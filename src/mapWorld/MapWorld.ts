@@ -23,6 +23,7 @@ import TAA from './taa/TAA';
 import MapGBuffer from './deferred/MapGBuffer';
 import DeferredShading from './deferred/DeferredShading';
 import WaterReflectionHalfRes from './deferred/WaterReflectionHalfRes';
+import ScreenReflections from './deferred/ScreenReflections';
 import WaterTerrainHorizon from './deferred/WaterTerrainHorizon';
 import { NOTABLE_BUILDINGS } from './map/notableBuildings';
 import { describeCity, findCity, pickRandomCity, pickStartCity } from './map/worldCities';
@@ -189,6 +190,9 @@ export default class MapWorld {
   private reflectionRays!: ParamSelect;
   // traces them when that is more than 1 pixel, before the shading
   private waterReflection!: WaterReflectionHalfRes;
+  // the colors of the buildings in the water from the screen (see ScreenReflections), and its param
+  private screenReflections!: ScreenReflections;
+  private screenReflectionsParam!: ParamBool;
   // the ground in the reflections of the buildings, where it is in reach: see updateTerrainReflection. From its horizon
   // over the water, per block of pixels
   private terrainHorizon!: WaterTerrainHorizon;
@@ -360,6 +364,7 @@ export default class MapWorld {
     this.waterReflection = new WaterReflectionHalfRes(this.renderer);
     this.waterReflection.bindCity(this.skyLightmap.cityScene);
     this.waterReflection.bindWaterRipples(this.ripples);
+    this.screenReflections = new ScreenReflections(this.renderer);
     this.terrainHorizon = new WaterTerrainHorizon(this.renderer, this.gBuffer);
     this.deferred.bindTerrainHorizon(this.terrainHorizon);
     for (const layer of this.geometry.layers) {
@@ -784,9 +789,11 @@ export default class MapWorld {
     pgShading.addParamFloat('contrast', .2, 0, 1, params);
     const toneMap = pgShading.addParamBool('toneMap', true, { callback: (v) => {
       this.deferred.toneMap = v;
+      this.waterReflection.toneMap = v;
       this.dirty = true;
     } });
     this.deferred.toneMap = toneMap.value;
+    this.waterReflection.toneMap = toneMap.value;
     pgShading.addParamFloat('exposure', 1.5, 0, 4, params);
 
     const waterGroup = pgShading.addGroup('Water');
@@ -796,6 +803,12 @@ export default class MapWorld {
     this.reflectTerrain = waterGroup.addParamBool('reflectTerrain', true, { callback: setDirty });
     this.reflectionRays = waterGroup.addParamSelect('reflectionRays', ReflectionRays.PerPixel, REFLECTION_RAYS, { callback: setDirty });
     this.reflectionDarkening = waterGroup.addParamFloat('reflectionDarkening', .35, 0, 1, { callback: setDirty });
+    // the buildings and trees in the water in their colors from the screen, else they only darken it
+    this.screenReflectionsParam = waterGroup.addParamBool('screenReflections', true, { callback: setDirty });
+    // how much of the darkening the color of a building on the screen gives back, see deferredShading.wgsl
+    waterGroup.addParamFloat('reflectionColor', 1, 0, 1, params);
+    // the brightness of a building in the water that the screen doesn't show (an underside), times the sky color
+    waterGroup.addParamFloat('reflectionUnseen', .35, 0, 1, params);
     this.waterRipples = waterGroup.addParamBool('waterRipples', true, { callback: setDirty });
     const updateRipples = () => {
       // the bake scales the gradient by the height, which makes the slope of the ripples independent of their wavelength
@@ -971,9 +984,10 @@ export default class MapWorld {
   }
 
   // the materials the sun and sky params go to by their names: with the one that shades the ground in the water
-  // reflections
+  // reflections, and the reduced pass of the reflections (the fog, the contrast and the exposure the colors of the
+  // screen are turned back from)
   private get shadingMaterials() {
-    return [...this.materials, ...this.terrainHorizon.materials];
+    return [...this.materials, ...this.terrainHorizon.materials, ...this.waterReflection.materials];
   }
 
   /** The building meshes to draw, null while the buildings are hidden. */
@@ -1331,9 +1345,12 @@ export default class MapWorld {
       const reflectionPass = reflections && reflectBuildings && blockX * blockY > 1 ? this.waterReflection : null;
       // the ground in them: its horizon over the water, which the rays are compared with
       if (reflections && reflectBuildings && this.reflectTerrainInWater) this.terrainHorizon.draw(this.camera, this.gBuffer, this.waterMaterials);
+      // their colors from the image of the frame before (the TAA has not resolved this one yet)
+      this.screenReflections.update(reflections && reflectBuildings && this.screenReflectionsParam.value, this.taa);
+      this.deferred.setScreenReflections(this.screenReflections);
       if (reflectionPass) {
         reflectionPass.setBlock(blockX, blockY);
-        reflectionPass.draw(this.camera, this.gBuffer, this.waterMaterials, rippleTile, this.taa.enabled.value && isStatic);
+        reflectionPass.draw(this.camera, this.gBuffer, this.waterMaterials, rippleTile, this.taa.enabled.value && isStatic, this.screenReflections);
       }
       this.deferred.setWaterReflections(reflections ? this.waterMaterials : 0, reflectBuildings, this.reflectionDarkening.value, rippleTile,
         this.sunReflection.value, this.sunReflectionPower.value, reflectionPass);

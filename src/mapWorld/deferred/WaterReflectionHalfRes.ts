@@ -6,20 +6,25 @@ import Vector2 from 'webGPU-framework/renderer/math/Vector2';
 import cameraRay from '../cameraRay.wgsl?raw';
 import cityLightmapSurface from '../city/cityLightmapSurface.wgsl?raw';
 import skyVisibilityTrace from '../skyVisibilityLightmap/skyVisibilityTrace.wgsl?raw';
+import cityTraceDistance from './cityTraceDistance.wgsl?raw';
 import CityScene from '../city/CityScene';
 import WaterRippleTexture from './waterRipples/WaterRippleTexture';
 import MapGBuffer from './MapGBuffer';
 import waterReflection from './waterReflection.wgsl?raw';
+import waterScreenReflection from './waterScreenReflection.wgsl?raw';
 import shader from './waterReflectionHalfRes.wgsl?raw';
+import ScreenReflections from './ScreenReflections';
 
 /**
  * The buildings in the water reflections of MapWorld with fewer rays (waterReflectionHalfRes.wgsl): the reflection ray
- * of the deferred shading for 1 pixel per block of blockX x blockY pixels of the gBuffer, into an rgba8unorm target
- * (hit or not, and the ray) the shading blends by how alike the rays are (getHalfResReflection in
+ * of the deferred shading for 1 pixel per block of blockX x blockY pixels of the gBuffer, into an rg32uint target
+ * (hit or not, the ray and the color) the shading blends by how alike the rays are (getHalfResReflection in
  * deferredShading.wgsl, DeferredShading.setWaterReflections).
  * The rays were more than half of the deferred shading at 4K with a quarter of the screen water (1.05 of 1.7 ms on an
  * RTX 3080). This pass takes .7 ms for half of them and .4 for a quarter: a ray costs about 1.4x as much here as in the
  * shading, whose other work overlaps with it.
+ * The colors of what the rays hit, from the screen (ScreenReflections), go into the samples too,
+ * which the shading blends with the same weights.
  * The traced pixel of the blocks rotates per frame (rotate, with the TAA): its history averages them, which in a static
  * view is every pixel traced. Without it the sample is always the first pixel of the block.
  */
@@ -39,14 +44,24 @@ export default class WaterReflectionHalfRes {
   constructor(renderer: Renderer) {
     this.renderer = renderer;
     this.material = new VertexFragmentShader(renderer, 'waterReflectionHalfRes', shader, {
-      includes: [cameraRay, cityLightmapSurface, ...MapGBuffer.readIncludes, waterReflection, skyVisibilityTrace],
+      includes: [cameraRay, cityLightmapSurface, ...MapGBuffer.readIncludes, waterReflection, waterScreenReflection, skyVisibilityTrace, cityTraceDistance],
       defines: CityScene.traceDefines,
     });
     this.material.depthWriteEnabled = false;
     this.material.depthCompare = 'always';
     this.dummyCityBuffer = renderer.createBuffer(16, GPUBufferUsage.STORAGE, false, 'dummyCityBuffer');
     this.material.setBuffer('cityBuffer', this.dummyCityBuffer);
-    this.target = new RenderTexture(renderer, 1, 1, { formats: ['rgba8unorm'], sampleCount: 1 });
+    this.target = new RenderTexture(renderer, 1, 1, { formats: ['rg32uint'], sampleCount: 1 });
+  }
+
+  /** The materials that take the params of the shading by name (the fog, the contrast, the exposure), see ScreenReflections. */
+  public get materials(): VertexFragmentShader[] {
+    return [this.material];
+  }
+
+  /** The tone map of the shading (DeferredShading.toneMap), which the colors of the screen are turned back from. */
+  public set toneMap(value: boolean) {
+    this.material.setConstant('TONE_MAP', value);
   }
 
   /** The city the rays trace: CityScene sets its buffer and root on the material. */
@@ -60,7 +75,7 @@ export default class WaterReflectionHalfRes {
     this.material.setSampler('rippleSampler', ripples.sampler);
   }
 
-  // the samples, a texture_2d<f32>
+  // the samples, a texture_2d<u32>
   public get view(): GPUTextureView {
     return this.target.views[0];
   }
@@ -103,8 +118,9 @@ export default class WaterReflectionHalfRes {
   /**
    * The samples of the gBuffer of this frame, before the shading. waterMaterials and rippleTile: as
    * DeferredShading.setWaterReflections takes them. rotate: another pixel of the blocks every frame, for a TAA to average.
+   * screen: the colors of what the rays hit, see ScreenReflections.
    */
-  public draw(camera: Camera, gBuffer: MapGBuffer, waterMaterials: number, rippleTile: number, rotate: boolean): void {
+  public draw(camera: Camera, gBuffer: MapGBuffer, waterMaterials: number, rippleTile: number, rotate: boolean, screen: ScreenReflections): void {
     const size = gBuffer.target.size;
     // rounded up: the samples cover every pixel
     this.target.setSize(Math.ceil(size.x / this._blockX), Math.ceil(size.y / this._blockY));
@@ -123,6 +139,8 @@ export default class WaterReflectionHalfRes {
     m.setFloat('rippleTile', rippleTile);
     m.setTexture('gBufferTexture', gBuffer.view);
     m.setTexture('gBufferDepth', gBuffer.depthView);
+    m.setMatrix('viewProjection', camera.viewProjection);
+    screen.bind(m);
     this.renderer.blit(null, this.target, m);
   }
 
