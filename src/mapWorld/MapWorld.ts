@@ -747,27 +747,33 @@ export default class MapWorld {
     const crownAverage = TREE_CROWN_COLORS.reduce((a, c) => a.add(toVector3(c)), new Vector3(0, 0, 0));
     colorParam('treeCrowns', crownAverage.multiplyScalar(1 / TREE_CROWN_COLORS.length), (v) => this.geometry.setTreeCrownColor(v));
 
+    const pgShading = paramGroup.addGroup('Shading');
+
+    const sunAndSky = pgShading.addGroup('Sun and Sky');
+
+
     // the snow above the snow line (see map/snowLine.ts), on the ground and the layers of MapGeometry's SNOW_LAYERS
-    const pgSnow = paramGroup.addGroup('Snow');
+    const pgSnow = pgShading.addGroup('Snow');
     this.snow = pgSnow.addParamBool('snow', true, { callback: setDirty });
     this.snowLineOffset = pgSnow.addParamFloat('snowLineOffset', 0, -2000, 2000, { callback: setDirty });
     this.snowLineNoise = pgSnow.addParamFloat('snowLineNoise', 150, 0, 500, { callback: setDirty });
     // also the albedo of the glaciers (the layer of the landcover class ice)
     const glacier = this.geometry.layers.findIndex((layer) => layer.def.key === 'glacier');
     this.snowColor = pgSnow.addParamColor('snowColor', Color.fromHex('#eef2f7').vector3, { callback: (v) => {
-      this.geometry.setLayerColor(glacier, v);
-      this.dirty = true;
-    } });
+        this.geometry.setLayerColor(glacier, v);
+        this.dirty = true;
+      } });
     this.geometry.setLayerColor(glacier, this.snowColor.value);
+    pgSnow.collapsed = true;
 
-    const pgShading = paramGroup.addGroup('Shading');
     const params = { materials: this.materials, callback: setDirty };
-    this.backgroundColor = pgShading.addParamColor('backgroundColor', this.clearColor.vector3, { ...params, callback: (v) => {
+    this.backgroundColor = sunAndSky.addParamColor('backgroundColor', this.clearColor.vector3, { ...params, callback: (v) => {
       this.clearColor.setValues(v.x, v.y, v.z, 1);
       this.dirty = true;
     } });
-    this.skyColor = pgShading.addParamColor('skyColor', Color.fromHex('#96a3b0').vector3, params);
-    this.sunColor = pgShading.addParamColor('sunColor', Color.fromHex('#b0a7a0').vector3, params);
+    this.skyColor = sunAndSky.addParamColor('skyColor', Color.fromHex('#96a3b0').vector3, params);
+    this.sunColor = sunAndSky.addParamColor('sunColor', Color.fromHex('#b0a7a0').vector3, params);
+
     this.distanceFog = pgShading.addParamFloat('distanceFog', .25, 0, 1, params);
     this.viewDistanceMax = pgShading.addParamFloat('viewDistanceMax', 8, 3, 12, { ...params, callback: () => {
       this.applyViewDistanceMax();
@@ -781,12 +787,15 @@ export default class MapWorld {
     } });
     this.deferred.toneMap = toneMap.value;
     pgShading.addParamFloat('exposure', 1.5, 0, 4, params);
+
+    const waterGroup = pgShading.addGroup('Water');
+
     // Only with the sky visibility lightmap: it keeps the BVH of the buildings up to date
-    this.waterReflections = pgShading.addParamBool('waterReflections', false, { callback: setDirty });
-    this.reflectTerrain = pgShading.addParamBool('reflectTerrain', true, { callback: setDirty });
-    this.reflectionRays = pgShading.addParamSelect('reflectionRays', ReflectionRays.PerPixel, REFLECTION_RAYS, { callback: setDirty });
-    this.reflectionDarkening = pgShading.addParamFloat('reflectionDarkening', .35, 0, 1, { callback: setDirty });
-    this.waterRipples = pgShading.addParamBool('waterRipples', true, { callback: setDirty });
+    this.waterReflections = waterGroup.addParamBool('waterReflections', false, { callback: setDirty });
+    this.reflectTerrain = waterGroup.addParamBool('reflectTerrain', true, { callback: setDirty });
+    this.reflectionRays = waterGroup.addParamSelect('reflectionRays', ReflectionRays.PerPixel, REFLECTION_RAYS, { callback: setDirty });
+    this.reflectionDarkening = waterGroup.addParamFloat('reflectionDarkening', .35, 0, 1, { callback: setDirty });
+    this.waterRipples = waterGroup.addParamBool('waterRipples', true, { callback: setDirty });
     const updateRipples = () => {
       // the bake scales the gradient by the height, which makes the slope of the ripples independent of their wavelength
       this.ripples.material.setFloat('rippleStrength', this.rippleSlope.value * this.ripples.wavelength);
@@ -794,22 +803,25 @@ export default class MapWorld {
       this.ripplesDirty = true;
       this.dirty = true;
     };
-    this.rippleSlope = pgShading.addParamFloat('rippleSlope', .05, 0, .5, { callback: updateRipples });
-    pgShading.addParamFloat('rippleWavelength', this.ripples.wavelength, 1, 50, { callback: (v) => {
+    this.rippleSlope = waterGroup.addParamFloat('rippleSlope', .05, 0, .5, { callback: updateRipples });
+    waterGroup.addParamFloat('rippleWavelength', this.ripples.wavelength, 1, 50, { callback: (v) => {
       this.ripples.wavelength = v;
       updateRipples();
     } });
-    this.rippleSpeed = pgShading.addParamFloat('rippleSpeed', .5, 0, 2, { callback: updateRipples });
-    this.animateWater = pgShading.addParamBool('animateWater', true, { callback: setDirty });
+    this.rippleSpeed = waterGroup.addParamFloat('rippleSpeed', .5, 0, 2, { callback: updateRipples });
+    this.animateWater = waterGroup.addParamBool('animateWater', true, { callback: setDirty });
     updateRipples();
-    this.sunReflection = pgShading.addParamFloat('sunReflection', 8, 0, 16, { callback: setDirty });
-    this.sunReflectionPower = pgShading.addParamFloat('sunReflectionPower', 200, 10, 1000, { callback: setDirty });
+    this.sunReflection = waterGroup.addParamFloat('sunReflection', 8, 0, 16, { callback: setDirty });
+    this.sunReflectionPower = waterGroup.addParamFloat('sunReflectionPower', 200, 10, 1000, { callback: setDirty });
+
     // the fresnel term of the water: the sky it mirrors (scales the fresnel weight) and the glints at grazing angles
-    pgShading.addParamFloat('skyReflection', 1, 0, 4, params);
-    pgShading.addParamFloat('sunFresnel', 4, 0, 16, params);
+    waterGroup.addParamFloat('skyReflection', 1, 0, 4, params);
+    waterGroup.addParamFloat('sunFresnel', 4, 0, 16, params);
+    waterGroup.collapsed = true;
+
     // the sun in the sky (deferred only, the forward pass clears to the background color)
-    pgShading.addParamFloat('sunSize', .02, 0, .1, params);
-    pgShading.addParamFloat('sunGlow', .4, 0, 1, params);
+    sunAndSky.addParamFloat('sunSize', .02, 0, .1, params);
+    sunAndSky.addParamFloat('sunGlow', .4, 0, 1, params);
     this.sun.initParams(pgShading, this.materials, setDirty);
     this.applyTimeOfDay();
 
