@@ -179,7 +179,9 @@ export default class WorldTileStreamer {
 
   // --- tile state ---
   private loadedTerrainTiles: Set<string> = new Set();
-  private loadedCityTiles: Map<string, { mesh: Mesh | null; slot: number; wallTile: [number, number]; quantization: number[] }> = new Map();
+  private loadedCityTiles: Map<string, {
+    mesh: Mesh | null; slot: number; wallTile: [number, number]; quantization: number[]; treeIndexStart: number; treeSize: number;
+  }> = new Map();
   // the tiles the workers are at, with the job of the pool (see loadTile)
   private inFlight: Map<string, { terrain: boolean; city: boolean; job: number; entry: QueuedTile }> = new Map();
   private fetchQueue: QueuedTile[] = [];
@@ -208,6 +210,13 @@ export default class WorldTileStreamer {
   public cityMeshTiles: number[] = [];
   // per mesh the decoding of its unorm16 vertices, 8 numbers (see setMeshQuantization)
   public cityMeshQuantization: number[] = [];
+  // per mesh the indices to draw: without its trees when they are too small on the screen, see cullTrees
+  public cityMeshIndexCounts: number[] = [];
+  // per mesh where its trees start in the indices and their size, see WorldBuildingResult.treeIndexStart
+  private cityMeshTreeStarts: number[] = [];
+  private cityMeshTreeSizes: number[] = [];
+  // the meshes whose trees cullTrees left out
+  public culledTreeMeshes = 0;
   // The mesh data of the last finalized city tile with walls: the wallAtlas drawMode, see WallAtlasView, which makes a
   // mesh of its own from it
   public lastCityTile: { key: string; result: WallAtlasMeshData } | null = null;
@@ -398,6 +407,9 @@ export default class WorldTileStreamer {
     this.cityMeshSlots.length = 0;
     this.cityMeshTiles.length = 0;
     this.cityMeshQuantization.length = 0;
+    this.cityMeshIndexCounts.length = 0;
+    this.cityMeshTreeStarts.length = 0;
+    this.cityMeshTreeSizes.length = 0;
     this.slotBuildings.length = 0;
     this.freeSlots.length = 0;
     this.nextSlot = 0;
@@ -872,7 +884,9 @@ export default class WorldTileStreamer {
       }
       const slot = this.freeSlots.length > 0 ? this.freeSlots.pop()! : this.nextSlot++;
       this.slotBuildings[slot] = result.buildings;
-      this.loadedCityTiles.set(key, { mesh, slot, wallTile: result.wallTile, quantization: result.quantization });
+      this.loadedCityTiles.set(key, {
+        mesh, slot, wallTile: result.wallTile, quantization: result.quantization, treeIndexStart: result.treeIndexStart, treeSize: result.treeSize,
+      });
       this.cityScene?.addTile(key, result.trace);
       // A tile ahead of the view whose buildings change nothing in it: the image goes on converging (the lightmap resets
       // the texels around it when it updates next, see CityScene). Else the accumulation of the image starts over
@@ -903,13 +917,47 @@ export default class WorldTileStreamer {
     this.cityMeshSlots.length = 0;
     this.cityMeshTiles.length = 0;
     this.cityMeshQuantization.length = 0;
+    this.cityMeshIndexCounts.length = 0;
+    this.cityMeshTreeStarts.length = 0;
+    this.cityMeshTreeSizes.length = 0;
     for (const tile of this.loadedCityTiles.values()) {
       if (!tile.mesh) continue;
       this.cityMeshes.push(tile.mesh);
       this.cityMeshSlots.push(tile.slot);
       this.cityMeshTiles.push(tile.wallTile[0], tile.wallTile[1]);
       this.cityMeshQuantization.push(...tile.quantization);
+      this.cityMeshIndexCounts.push(tile.mesh.indexCount);
+      this.cityMeshTreeStarts.push(tile.treeIndexStart);
+      this.cityMeshTreeSizes.push(tile.treeSize);
     }
+  }
+
+  /**
+   * Leaves out the trees of the meshes where the largest of them is under minPixels on the screen at the nearest point
+   * of the mesh bounds (the trees are the last indices of a mesh, see WorldBuildingResult.treeIndexStart): sets
+   * cityMeshIndexCounts. eye: the camera position, pixelsPerRadian: the screen height over the vertical field of view
+   * (its tangent). minPixels 0: all trees.
+   */
+  public cullTrees(eye: Vector3, pixelsPerRadian: number, minPixels: number): void {
+    let culled = 0;
+    for (let i = 0; i < this.cityMeshes.length; i++) {
+      const mesh = this.cityMeshes[i];
+      let count = mesh.indexCount;
+      const start = this.cityMeshTreeStarts[i];
+      const bounds = this.meshBounds.get(mesh);
+      if (minPixels > 0 && start < count && bounds) {
+        const dx = Math.max(bounds.min.x - eye.x, 0, eye.x - bounds.max.x);
+        const dy = Math.max(bounds.min.y - eye.y, 0, eye.y - bounds.max.y);
+        const dz = Math.max(bounds.min.z - eye.z, 0, eye.z - bounds.max.z);
+        const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (this.cityMeshTreeSizes[i] * pixelsPerRadian < minPixels * distance) {
+          count = start;
+          culled++;
+        }
+      }
+      this.cityMeshIndexCounts[i] = count;
+    }
+    this.culledTreeMeshes = culled;
   }
 
   public destruct(): void {

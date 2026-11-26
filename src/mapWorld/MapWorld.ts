@@ -176,6 +176,12 @@ export default class MapWorld {
   // QualitySettings.forward of the quality param
   private forward: boolean = false;
   private drawBuildings!: ParamBool;
+  // the trees of a tile are left out of the gBuffer where the sphere around the largest is smaller than this many
+  // pixels, see WorldTileStreamer.cullTrees. The sphere is 23 m at most: 1 pixel is beyond the city tiles of the farthest
+  // camera. Measured (video/treeCullBench.mjs, the Veluwe at 1.8 km, 1264x649): 3 leaves out the trees of half the tiles,
+  // the gBuffer 0.60 -> 0.36 ms per frame (no trees: 0.22), the image differs 0.2 / 255 on average, at the horizon:
+  // their shadows and the sky visibility of the lightmap keep them
+  private treeCullPixels!: ParamFloat;
   private clearColor = Color.fromHex('#b8dbff');
   private logDrawInfo!: ParamBool;
   private distanceFog!: ParamFloat;
@@ -465,9 +471,9 @@ export default class MapWorld {
 
     // Start on one of a few well-known cities (pickStartCity). The projection
     // is centered on it so vertex coordinates stay small (fp32 precision).
-    // ?lat=&lng=(&dist=&pitch=&yaw=): the camera of a shared link, see updateUrl. Not in a bench or a video,
-    // they move the camera themselves.
-    const urlCamera = urlParams.has('bench') || urlParams.has('video') ? null : parseUrlCamera(urlParams);
+    // ?lat=&lng=(&dist=&pitch=&yaw=): the camera of a shared link, see updateUrl. A bench starts its drags there. Not in
+    // a video, it moves the camera itself.
+    const urlCamera = urlParams.has('video') ? null : parseUrlCamera(urlParams);
     let city: City | undefined;
     if (urlCamera) {
       this.setPlace(this.boundsAround(urlCamera.lat, urlCamera.lng));
@@ -724,6 +730,7 @@ export default class MapWorld {
       this.tileStreamer.setTreesEnabled(trees.value);
     } });
     this.tileStreamer.setTreesEnabled(trees.value);
+    this.treeCullPixels = layersGroup.addParamFloat('treeCullPixels', 3, 0, 8, { callback: setDirty });
     // the heights of the ground (ElevationService), off: the flat ground at 0. The tiles load again
     this.elevationParam = layersGroup.addParamBool('elevation', true, { callback: () => this.applyElevation() });
     if (this.elevationParam.value !== this.geometry.elevation) this.applyElevation();
@@ -980,7 +987,7 @@ export default class MapWorld {
   private get visibleCity(): CityMeshes | null {
     if (!this.drawBuildings.value) return null;
     const s = this.tileStreamer;
-    return { meshes: s.cityMeshes, slots: s.cityMeshSlots, tiles: s.cityMeshTiles, quantization: s.cityMeshQuantization };
+    return { meshes: s.cityMeshes, slots: s.cityMeshSlots, tiles: s.cityMeshTiles, quantization: s.cityMeshQuantization, indexCounts: s.cityMeshIndexCounts };
   }
 
   public update(time: number = 0): void {
@@ -1118,6 +1125,10 @@ export default class MapWorld {
 
   private draw(dirty: boolean, cameraMoving: boolean, tilesLoading: boolean, cityTilesChanged: boolean) {
     let shadowsSettled = true;
+    // the pixels per radian at the center of the screen: the trees too small to see are left out of the gBuffer (not
+    // out of the shadow map: there they cost next to nothing, and a change of the cut would draw all cascades again)
+    const pixelsPerRadian = this.renderer.canvas.height / (2 * Math.tan(this.camera.projection.FOV * 0.5));
+    this.tileStreamer.cullTrees(this.camera.worldPosition, pixelsPerRadian, this.treeCullPixels.value);
     // the ground casts shadows too, with elevation (without it the flat ground is at 0, what an empty texel means)
     const ground = this.geometry.elevation ? this.geometry.groundBuffer : null;
     const groundChanged = this.tileStreamer.consumeGroundChanged();
