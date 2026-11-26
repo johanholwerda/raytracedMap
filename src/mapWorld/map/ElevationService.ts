@@ -2,13 +2,18 @@ import LogGL from 'webGPU-framework/renderer/core/LogGL';
 import decodePngRgba8 from 'webGPU-framework/utils/image/decodePngRgba8';
 import { tileToLatLon } from '../osm/pdokDecodeCore';
 import type { TileCoord } from '../osm/PDOKTileService';
+import { demPixelMeters, removeDemSpikes } from './demSpikes';
+import { COARSE_ZOOM, correctArcticDem, mayBeArcticDem } from './arcticDem';
 
 /*
 The height of the ground, from the terrarium elevation tiles of the AWS Open Data terrain tiles (Mapzen, Tilezen joerd):
 256 x 256 png in web mercator, the height in m = R * 256 + G + B / 256 - 32768. Free, no key, CORS enabled. The sources
 differ per region (https://github.com/tilezen/joerd/blob/master/docs/data-sources.md): in the US the NED (bare earth, 3
 to 10 m), elsewhere mostly SRTM (30 to 90 m) and the like, which are surface models: buildings and forests are in it
-as bumps, smoothed at the resolution used here.
+as bumps, smoothed at the resolution used here. North of 60 degrees it is ArcticDEM in places (Iceland): heights above
+the ellipsoid, not the sea, which correctArcticDem corrects with the tile at COARSE_ZOOM (see arcticDem.ts), and false
+mountains on the water, which removeDemSpikes fills in (see demSpikes.ts) and the sea of the map tiles flattens (see
+seaMask.ts).
 
 The tiles are fetched and decoded in the tile fetch worker (tileFetchWorker.ts, the main thread talks to it through
 ElevationClient), once per ELEVATION_ZOOM tile (a z12 tile covers 4 x 4 of the z14
@@ -39,16 +44,22 @@ export function terrainGridCells(z: number): number {
 }
 // decoded tiles kept (256 KB each)
 const CACHE_MAX = 96;
+// the coarse tiles kept for correctArcticDem: 1 covers 4 x 4 tiles
+const COARSE_CACHE_MAX = 8;
 // The heights are clamped to the sea level: the tiles have the depth of the sea (ETOPO1), the water layer lies on the
 // ground. Land below the sea level (polders, the Dead Sea) becomes flat at 0.
 const MIN_HEIGHT_M = 0;
 
 type DemTile = { heights: Float32Array; min: number; max: number };
+/** The heights of a map tile (see getTileGrid) and the height of the sea in them: both relative to the origin. */
+export type TileGrid = { heights: Float32Array; seaLevel: number };
 
 export default class ElevationService {
   // per tile key: the tile, null where there is none (404). LRU: a hit moves the key to the end
   private tiles = new Map<string, Promise<DemTile | null>>();
   private decoded = new Map<string, DemTile | null>();
+  // the tiles at COARSE_ZOOM (see arcticDem.ts) by key, LRU
+  private coarse = new Map<string, Promise<Float32Array | null>>();
   private origin: Promise<number> = Promise.resolve(0);
   private originM = 0;
   /**
@@ -105,9 +116,10 @@ export default class ElevationService {
    * The heights (m, relative to the origin) of the grid over a map tile with a ring of the neighbour tiles' around it:
    * (cells + 3)^2, row j (from the south, -1 to cells + 1) after row, column i from the west. Lat and lng are uniform
    * over the tile, row and column 0 and cells at its edges exactly. The ring is for the normals on the edges, see
-   * TerrainGrid. Rejects when an elevation tile can't be loaded (the map tile retries later).
+   * TerrainGrid. With the height of the sea relative to the same origin (see seaMask.ts). Rejects when an elevation
+   * tile can't be loaded (the map tile retries later).
    */
-  public async getTileGrid(tile: TileCoord, cells = terrainGridCells(tile.z)): Promise<Float32Array> {
+  public async getTileGrid(tile: TileCoord, cells = terrainGridCells(tile.z)): Promise<TileGrid> {
     const sw = tileToLatLon(0, 1, 1, tile), ne = tileToLatLon(1, 0, 1, tile);
     const outer = cells + 3;
     const at = (k: number, from: number, to: number) => k === 0 ? from : k === cells ? to : from + (to - from) * k / cells;
@@ -123,7 +135,7 @@ export default class ElevationService {
     const heights = await this.sample(lats, lngs);
     const h0 = await origin;
     for (let k = 0; k < heights.length; k++) heights[k] -= h0;
-    return heights;
+    return { heights, seaLevel: MIN_HEIGHT_M - h0 };
   }
 
   /**
@@ -211,19 +223,20 @@ export default class ElevationService {
       this.tiles.set(key, cached);
       return cached;
     }
-    const url = TERRARIUM_URL.replace('{z}', String(ELEVATION_ZOOM)).replace('{x}', String(x)).replace('{y}', String(y));
     const promise = (async (): Promise<DemTile | null> => {
-      const response = await fetch(url);
-      if (response.status === 404 || response.status === 403) return null;
-      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-      const png = await decodePngRgba8(await response.arrayBuffer());
-      if (png.width !== DEM_SIZE || png.height !== DEM_SIZE) throw new Error(`elevation tile ${key} is ${png.width} x ${png.height}`);
-      const heights = new Float32Array(DEM_SIZE * DEM_SIZE);
+      const heights = await fetchHeights(ELEVATION_ZOOM, x, y);
+      if (!heights) return null;
+      // ArcticDEM: above the ellipsoid, see arcticDem.ts
+      if (mayBeArcticDem(x, y, ELEVATION_ZOOM)) {
+        const shift = ELEVATION_ZOOM - COARSE_ZOOM;
+        const coarse = await this.loadCoarse(x >> shift, y >> shift);
+        if (coarse) correctArcticDem(heights, coarse, DEM_SIZE, x, y, ELEVATION_ZOOM);
+      }
+      // the false mountains on the sea, see demSpikes.ts
+      removeDemSpikes(heights, DEM_SIZE, demPixelMeters(y, ELEVATION_ZOOM, DEM_SIZE));
       let min = Infinity, max = -Infinity;
       for (let i = 0; i < heights.length; i++) {
-        const d = png.data;
-        const h = Math.max(d[i * 4] * 256 + d[i * 4 + 1] + d[i * 4 + 2] / 256 - 32768, MIN_HEIGHT_M);
-        heights[i] = h;
+        const h = heights[i];
         if (h < min) min = h;
         if (h > max) max = h;
       }
@@ -244,4 +257,37 @@ export default class ElevationService {
     }
     return promise;
   }
+
+  /** The tile (x, y) at COARSE_ZOOM, for correctArcticDem: cached (LRU), null where there is none. */
+  private loadCoarse(x: number, y: number): Promise<Float32Array | null> {
+    const key = this.key(x, y);
+    const cached = this.coarse.get(key);
+    if (cached) {
+      this.coarse.delete(key);
+      this.coarse.set(key, cached);
+      return cached;
+    }
+    const promise = fetchHeights(COARSE_ZOOM, x, y);
+    this.coarse.set(key, promise);
+    // a network error: asked for again by the next tile
+    promise.catch(() => { if (this.coarse.get(key) === promise) this.coarse.delete(key); });
+    while (this.coarse.size > COARSE_CACHE_MAX) this.coarse.delete(this.coarse.keys().next().value as string);
+    return promise;
+  }
+}
+
+/** The heights (m) of the terrarium tile z/x/y, clamped to the sea level. Null where there is none, rejects on a network error. */
+async function fetchHeights(z: number, x: number, y: number): Promise<Float32Array | null> {
+  const url = TERRARIUM_URL.replace('{z}', String(z)).replace('{x}', String(x)).replace('{y}', String(y));
+  const response = await fetch(url);
+  if (response.status === 404 || response.status === 403) return null;
+  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  const png = await decodePngRgba8(await response.arrayBuffer());
+  if (png.width !== DEM_SIZE || png.height !== DEM_SIZE) throw new Error(`elevation tile ${z}/${x}/${y} is ${png.width} x ${png.height}`);
+  const heights = new Float32Array(DEM_SIZE * DEM_SIZE);
+  const d = png.data;
+  for (let i = 0; i < heights.length; i++) {
+    heights[i] = Math.max(d[i * 4] * 256 + d[i * 4 + 1] + d[i * 4 + 2] / 256 - 32768, MIN_HEIGHT_M);
+  }
+  return heights;
 }

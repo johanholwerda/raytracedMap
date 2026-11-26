@@ -1,4 +1,5 @@
 import ElevationService from './ElevationService';
+import type { TileGrid } from './ElevationService';
 import type { WorldBuildMessage, WorldBuildDone, WorldWorkerRequest } from './worldMapWorker';
 import { jobClock } from './jobTimes';
 import type { JobTimes } from './jobTimes';
@@ -83,7 +84,7 @@ function setOrigin(lat: number, lng: number): void {
 }
 
 /** The heights of the tile of a job (ElevationService.getTileGrid), relative to the ground at the center of its bounds. */
-function getHeights(job: WorldWorkerRequest): Promise<Float32Array> {
+function getHeights(job: WorldWorkerRequest): Promise<TileGrid> {
   // the projection center, as MapProjection.setBounds has it: where MapWorld puts the origin
   setOrigin((job.bounds.south + job.bounds.north) * 0.5, (job.bounds.west + job.bounds.east) * 0.5);
   return service.getTileGrid(job.tile);
@@ -91,7 +92,7 @@ function getHeights(job: WorldWorkerRequest): Promise<Float32Array> {
 
 // --- the jobs
 
-type Ready = { job: WorldWorkerRequest; pbf: ArrayBuffer; heights: Float32Array | null; fetchMs: number; ready: number; times: JobTimes };
+type Ready = { job: WorldWorkerRequest; pbf: ArrayBuffer; grid: TileGrid | null; fetchMs: number; ready: number; times: JobTimes };
 
 let jobsPort: MessagePort | null = null;
 const builders: { port: MessagePort; busy: boolean }[] = [];
@@ -123,7 +124,7 @@ async function start(job: WorldWorkerRequest): Promise<void> {
   pending.set(job.id, job);
   try {
     // the heights of the ground, in parallel with the vector tile
-    const [pbf, heights] = await Promise.all([
+    const [pbf, grid] = await Promise.all([
       fetchTile(job.url, abort.signal, job.margin).then((data) => (times.pbf = jobClock(), data)),
       job.elevation ? getHeights(job).then((data) => (times.heights = jobClock(), data)) : null,
     ]);
@@ -131,13 +132,13 @@ async function start(job: WorldWorkerRequest): Promise<void> {
     if (abort.signal.aborted) return;
     fetching.delete(job.id);
     // No data for this tile. On the terrain it still gets its ground.
-    if (!pbf && !heights) {
+    if (!pbf && !grid) {
       pending.delete(job.id);
       return void report({ id: job.id, empty: true });
     }
     const now = performance.now();
     times.ready = jobClock();
-    ready.push({ job, pbf: pbf ?? new ArrayBuffer(0), heights, fetchMs: now - began, ready: now, times });
+    ready.push({ job, pbf: pbf ?? new ArrayBuffer(0), grid, fetchMs: now - began, ready: now, times });
     dispatch();
   } catch (err: any) {
     if (abort.signal.aborted) return;
@@ -177,10 +178,12 @@ function dispatch(): void {
     pending.delete(next.job.id);
     builder.busy = true;
     next.times.dispatched = jobClock();
+    const heights = next.grid?.heights ?? null;
     const message: WorldBuildMessage = {
-      job: next.job, pbf: next.pbf, heights: next.heights, fetchMs: next.fetchMs, waitMs: performance.now() - next.ready, times: next.times,
+      job: next.job, pbf: next.pbf, heights, seaLevel: next.grid?.seaLevel ?? 0, fetchMs: next.fetchMs,
+      waitMs: performance.now() - next.ready, times: next.times,
     };
-    builder.port.postMessage(message, next.heights ? [next.pbf, next.heights.buffer] : [next.pbf]);
+    builder.port.postMessage(message, heights ? [next.pbf, heights.buffer] : [next.pbf]);
   }
 }
 

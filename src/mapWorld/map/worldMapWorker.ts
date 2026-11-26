@@ -41,6 +41,8 @@ export type WorldBuildMessage = {
   job: WorldWorkerRequest;
   pbf: ArrayBuffer;
   heights: Float32Array | null;
+  // the height of the sea in heights (m, relative to the same origin), see seaMask.ts
+  seaLevel: number;
   fetchMs: number;
   waitMs: number;
   times: JobTimes;
@@ -82,6 +84,7 @@ function build(msg: WorldBuildMessage, port: MessagePort): void {
       job.wantBuildings,
       job.wantTrees,
       heights,
+      msg.seaLevel,
     );
     const transfers: Transferable[] = [];
     if (result.terrain) for (const l of Object.values(result.terrain)) transfers.push(l.vertices.buffer, l.indices.buffer);

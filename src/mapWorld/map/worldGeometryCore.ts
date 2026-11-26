@@ -19,6 +19,7 @@ import type { BuildingPolygon, CityTraceBlock } from '../city/cityLayout';
 import { buildTrees, TREE_MATERIAL_BASE_ID } from './worldTrees';
 import { findWallBottoms } from '../city/hiddenWalls';
 import TerrainGrid, { GRID_VERTEX_FLOATS, GridMesh, insideRing } from './terrainGrid';
+import { flattenSea } from './seaMask';
 
 /**
  * Pure (renderer-free) geometry core for the world map. Decodes one
@@ -251,7 +252,8 @@ const LINE_LAYERS = ['waterway', 'transportation', 'aeroway'];
 /**
  * Decode an OpenMapTiles vector tile and build the requested geometry,
  * projected relative to `bounds` (the shared {@link MapProjection} frame).
- * heights: the ground of the tile (m), see ElevationService.getTileGrid. Null: the flat ground at 0.
+ * heights: the ground of the tile (m), see ElevationService.getTileGrid. Null: the flat ground at 0. Flattened in place
+ * to seaLevel (m, relative to the same origin) where the tile has sea, see seaMask.ts.
  */
 export function buildWorldTile(
   bytes: Uint8Array,
@@ -261,12 +263,14 @@ export function buildWorldTile(
   wantBuildings: boolean,
   wantTrees = false,
   heights: Float32Array | null = null,
+  seaLevel = 0,
 ): WorldTileResult {
   const scratch = tileScratch ??= new TileScratch();
   const vt = new VectorTile(new PbfReader(bytes));
   const proj = new MapProjection();
   proj.setBounds(bounds);
   const metersToNorm = proj.metersToNorm;
+  if (heights) flattenSea(vt.layers.water, tile, heights, seaLevel);
   const terrain = heights ? createTerrainGrid(tile, proj, heights) : null;
 
   // Tile-local MVT point -> projected map (x, north) coords: tileToLatLon and MapProjection.project (the same sums, in
