@@ -76,6 +76,10 @@ const CAMERA_PITCH_START = -.7;
 const CAMERA_DISTANCE_START = 1;
 const CAMERA_FOV = 1;
 const CAMERA_NEAR = .01;
+// The orbit camera stays this far (m) above the ground under it and around it, see keepAboveGround. At least
+// CAMERA_GROUND_CLEARANCE_NEAR near planes (world units): the corners of the near plane reach ~1.3 of it from the eye.
+const CAMERA_GROUND_CLEARANCE_M = 25;
+const CAMERA_GROUND_CLEARANCE_NEAR = 2;
 // The water reflects the ground (MapWorld.updateTerrainReflection) only where the highest loaded ground is this much
 // above the lowest, m: below it no hill is high enough to show in the water, and the rays skip the height map
 const TERRAIN_REFLECTION_RELIEF_M = 20;
@@ -323,6 +327,7 @@ export default class MapWorld {
     // always look a bit down, never from under the map
     this.camera.rotationController.rotationLimitX = new Vector2(CAMERA_PITCH_MIN, CAMERA_PITCH_MAX);
     this.camera.setDistanceLimit(CAMERA_DISTANCE_MIN, CAMERA_DISTANCE_MAX);
+    this.camera.constrainView = () => this.keepAboveGround();
     // Geometry is projected relative to the bounds center (world origin).
     this.camera.pivot.position = new Vector3(0, 0, 0);
     this.airplane = new AirplaneController(this.renderer, this.camera);
@@ -919,6 +924,46 @@ export default class MapWorld {
     let y = pivot.y + (ground - pivot.y) * (1 - Math.exp(-PIVOT_GROUND_RATE * Math.min(this.renderer.time.dt, .1)));
     if (Math.abs(ground - y) < PIVOT_GROUND_SNAP_M * this.projection.metersToNorm) y = ground;
     this.camera.pivot.setPositionValues(pivot.x, y, pivot.z);
+  }
+
+  /**
+   * Keeps the orbit camera out of the terrain: where the eye would be under the ground (a hill behind it, when it
+   * looks flat over a valley), the view tilts down until it clears the ground by the clearance. Only the view: the
+   * rotation controller keeps the pitch of the user, so the view tilts back up once the ground behind is lower again.
+   * The ground is sampled under the eye and around it (the near plane is wider than a point).
+   */
+  private keepAboveGround(): void {
+    if (this.elevationParam?.value === false) return;
+    const pivot = this.camera.pivot.position;
+    const eye = this.camera.worldPosition;
+    const dx = eye.x - pivot.x;
+    const dz = eye.z - pivot.z;
+    const horizontal = Math.hypot(dx, dz);
+    if (horizontal < 1e-9) return;
+    const dirX = dx / horizontal;
+    const dirZ = dz / horizontal;
+    const distance = this.camera.distance;
+    const clearance = Math.max(CAMERA_GROUND_CLEARANCE_M * this.projection.metersToNorm, CAMERA_GROUND_CLEARANCE_NEAR * CAMERA_NEAR);
+    const pitch = this.camera.eulerX;
+    let p = pitch;
+    // the eye moves toward the pivot as the view tilts down, over other ground: a few rounds
+    for (let i = 0; i < 4; i++) {
+      const h = distance * Math.cos(p);
+      const x = pivot.x + dirX * h;
+      const z = pivot.z + dirZ * h;
+      let ground = -Infinity;
+      for (const [ox, oz] of [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const g = this.heightField.heightAt(x + ox * clearance, z + oz * clearance);
+        if (g !== null && g > ground) ground = g;
+      }
+      if (ground === -Infinity) break;
+      const needed = (ground + clearance - pivot.y) / distance;
+      if (Math.sin(-p) >= needed - 1e-9) break;
+      p = Math.max(-Math.asin(Math.min(needed, 1)), CAMERA_PITCH_MIN);
+      if (p === CAMERA_PITCH_MIN) break;
+    }
+    if (p === pitch) return;
+    this.camera.pivot.euler = new Vector3(p, this.camera.eulerY, 0);
   }
 
   /** The elevation param to the tiles (they load again) and the ground (meshes or the flat quad). */
