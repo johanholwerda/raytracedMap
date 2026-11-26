@@ -3,7 +3,7 @@ import { LatLngBounds } from './OSMBuilder';
 /**
  * Fullscreen OpenStreetMap (Leaflet) location picker.
  *
- * Shows the slippy map with a fixed crosshair indicator in the screen center
+ * Shows the slippy map
  * and a single "Create 3D map" button. Panning the map moves the geographic
  * location under the crosshair; clicking the button reports that location (as a
  * lat/lng bbox sized by the initial span) through the onCreate callback, which
@@ -136,8 +136,6 @@ export default class MapSelector {
     } as CSSStyleDeclaration);
     this.overlay.appendChild(this.mapEl);
 
-    this.overlay.appendChild(this.makeIndicator());
-
     const buttonBar = document.createElement('div');
     Object.assign(buttonBar.style, {
       position: 'absolute',
@@ -159,25 +157,6 @@ export default class MapSelector {
 
     this.overlay.appendChild(buttonBar);
     this.parent.appendChild(this.overlay);
-  }
-
-  /** Fixed crosshair marker centered over the map (purely visual). */
-  private makeIndicator(): HTMLDivElement {
-    const indicator = document.createElement('div');
-    Object.assign(indicator.style, {
-      position: 'absolute',
-      top: '50%',
-      left: '50%',
-      transform: 'translate(-50%, -50%)',
-      zIndex: '1001',
-      pointerEvents: 'none',
-    } as CSSStyleDeclaration);
-    indicator.innerHTML = `
-      <div style="position:absolute;top:50%;left:50%;width:40px;height:2px;background:#2d7ef7;transform:translate(-50%,-50%);box-shadow:0 0 2px rgba(255,255,255,0.9);"></div>
-      <div style="position:absolute;top:50%;left:50%;width:2px;height:40px;background:#2d7ef7;transform:translate(-50%,-50%);box-shadow:0 0 2px rgba(255,255,255,0.9);"></div>
-      <div style="position:absolute;top:50%;left:50%;width:18px;height:18px;border-radius:50%;background:#2d7ef7;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,0.4);transform:translate(-50%,-50%);"></div>
-    `;
-    return indicator;
   }
 
   private makeButton(label: string, bg: string, bgHover: string): HTMLButtonElement {
