@@ -8,7 +8,7 @@ import { GBUFFER_ATLAS_MAX, GBUFFER_ATLAS_STEP_M } from './cityLayout';
 import type { WorldBuildingResult } from '../map/worldGeometryCore';
 
 /** The part of a tile's building mesh data the view needs. */
-export type WallAtlasMeshData = Pick<WorldBuildingResult, 'vertices' | 'quantization' | 'lightmap' | 'indices' | 'atlasSize'>;
+export type WallAtlasMeshData = Pick<WorldBuildingResult, 'interleaved' | 'vertexCount' | 'quantization' | 'indices' | 'atlasSize'>;
 import shaderSource from './wallAtlasView.wgsl?raw';
 
 // the margin around the atlas, a fraction of the screen
@@ -70,10 +70,15 @@ export default class WallAtlasView {
   // per triangle of a wall its corners at their atlas positions: the attribute of its first vertex plus the distance
   // along the wall and the height, like mapGBuffer.wgsl. position: atlas u, v, 0, the feature id
   private createMesh(result: WallAtlasMeshData): Mesh | null {
-    const { vertices, quantization: s, lightmap, indices } = result;
-    // the vertices decoded, see quantizeVertices
-    const p = new Float32Array(vertices.length);
-    for (let i = 0; i < vertices.length; i++) p[i] = vertices[i] / 65535 * s[i & 3] + s[4 + (i & 3)];
+    const { interleaved, vertexCount, quantization: s, indices } = result;
+    // the vertices decoded (see interleaveVertices in worldGeometryCore.ts), and their lightmap charts
+    const u16 = new Uint16Array(interleaved), f32 = new Float32Array(interleaved);
+    const p = new Float32Array(vertexCount * 4), lightmap = new Float32Array(vertexCount * 2);
+    for (let v = 0; v < vertexCount; v++) {
+      for (let k = 0; k < 4; k++) p[v * 4 + k] = u16[v * 8 + k] / 65535 * s[k] + s[4 + k];
+      lightmap[v * 2] = f32[v * 4 + 2];
+      lightmap[v * 2 + 1] = f32[v * 4 + 3];
+    }
     const out: number[] = [];
     for (let t = 0; t + 2 < indices.length; t += 3) {
       const a = indices[t];

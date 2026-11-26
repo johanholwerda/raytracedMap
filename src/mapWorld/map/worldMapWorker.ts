@@ -92,7 +92,7 @@ function build(msg: WorldBuildMessage, port: MessagePort): void {
     if (result.roads) transfers.push(result.roads.buffer);
     if (result.buildings) {
       const b = result.buildings;
-      transfers.push(b.vertices.buffer, b.lightmap.buffer, b.interleaved, b.indices.buffer);
+      transfers.push(b.interleaved, b.indices.buffer);
       if (result.buildings.trace) transfers.push(result.buildings.trace.words.buffer, result.buildings.trace.ids.buffer);
     }
     if (heights) transfers.push(heights.buffer);
