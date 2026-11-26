@@ -27,6 +27,7 @@ import WaterTerrainHorizon from './deferred/WaterTerrainHorizon';
 import { NOTABLE_BUILDINGS } from './map/notableBuildings';
 import { describeCity, findCity, pickRandomCity, pickStartCity } from './map/worldCities';
 import type { City } from './map/worldCities';
+import { randomNiceView } from './map/niceViews';
 import OpenFreeMapTileService from './map/OpenFreeMapTileService';
 import WorldWorkerPool from './map/WorldWorkerPool';
 import WorldTileStreamer, { PreviewCamera } from './map/WorldTileStreamer';
@@ -414,9 +415,9 @@ export default class MapWorld {
     // on by default, see the elevation param
     this.geometry.elevation = true;
 
-    const { urlCamera, city } = await tilesStarted;
+    const { urlCamera, city, time } = await tilesStarted;
     // not in a bench: its frames have to compare between runs
-    const timeIndex = TIMES_OF_DAY.indexOf(urlParams.get('time') ?? '');
+    const timeIndex = TIMES_OF_DAY.indexOf(urlParams.get('time') ?? time ?? '');
     if (!this.bench && timeIndex >= 0) this.urlTimeOfDay = timeIndex as TimeOfDay;
     // the user's input, for telling their camera moves from the program's, see updateUrl
     const markInput = () => this.lastInputTime = performance.now();
@@ -440,7 +441,7 @@ export default class MapWorld {
    * of a PreviewCamera with that view (WorldTileStreamer.prefetch). Returns the camera of the URL (null without) and
    * the city the map starts on (undefined with a URL camera).
    */
-  private async startTiles(urlParams: URLSearchParams, canvasParent: HTMLElement): Promise<{ urlCamera: UrlCamera | null; city?: City }> {
+  private async startTiles(urlParams: URLSearchParams, canvasParent: HTMLElement): Promise<{ urlCamera: UrlCamera | null; city?: City; time?: string }> {
     // ?workers=4: the number of map workers, for timings (default: see WorldWorkerPool)
     // ?jobsPerWorker=3: the jobs under way per worker, for timings (see WorldWorkerPool.capacity)
     if (urlParams.has('jobsPerWorker')) WorldWorkerPool.JOBS_PER_WORKER = parseFloat(urlParams.get('jobsPerWorker')!);
@@ -473,8 +474,17 @@ export default class MapWorld {
     // is centered on it so vertex coordinates stay small (fp32 precision).
     // ?lat=&lng=(&dist=&pitch=&yaw=): the camera of a shared link, see updateUrl. A bench starts its drags there. Not in
     // a video, it moves the camera itself.
-    const urlCamera = urlParams.has('video') ? null : parseUrlCamera(urlParams);
+    let urlCamera = urlParams.has('video') ? null : parseUrlCamera(urlParams);
     let city: City | undefined;
+    // a plain page load: half the time one of the NICE_VIEWS (with its time of day) instead of a start city. Not in a
+    // bench, a video, a tile timing run or with ?city=: those want the same start every time
+    let time: string | undefined;
+    const plainLoad = !['video', 'bench', 'tileTimings', 'city'].some((key) => urlParams.has(key));
+    if (!urlCamera && plainLoad && Math.random() < 0.5) {
+      const niceView = randomNiceView();
+      urlCamera = niceView;
+      time = niceView.time;
+    }
     if (urlCamera) {
       this.setPlace(this.boundsAround(urlCamera.lat, urlCamera.lng));
       LogGL.log(`[MapWorld] centering on the URL camera (${urlCamera.lat}, ${urlCamera.lng})`);
@@ -499,7 +509,7 @@ export default class MapWorld {
     this.tileStreamer.setTerrainStreamingEnabled(true);
     this.tileStreamer.setCityStreamingEnabled(true);
     this.tileStreamer.prefetch(preview);
-    return { urlCamera, city };
+    return { urlCamera, city, time };
   }
 
   /** The quality the map starts with, see the quality param. */
