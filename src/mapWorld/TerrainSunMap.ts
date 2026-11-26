@@ -16,9 +16,9 @@ import heightShaderSource from './terrainSunHeight.wgsl?raw';
  * (terrainSunHeight.wgsl); the shading compares the height of a point with it (getTerrainSunShadow of terrainSun.wgsl).
  * That height is continuous over the map, so interpolated the edge of a shadow is a smooth curve. A depth map from the
  * sun (as this was before) jumps at every ridge, its edges are the texel grid, stretched to long stairs at a low sun.
- * Three passes: the ground meshes (MapGeometry.groundBuffer) top down with the depth material of the cascades (-height),
- * the highest ground per cell of COARSE texels, and the march toward the sun per texel, which skips the cells below the
- * ray.
+ * The passes: the ground meshes (MapGeometry.groundBuffer) top down with the depth material of the cascades (-height),
+ * the highest ground per cell of 4, 16 (COARSE), 64 and all texels, and the march toward the sun per texel, which skips
+ * the cells of COARSE below the ray and stops where it is above all the ground.
  * Rendered again only when the sun moves, the ground tiles change or the camera drifts off its center.
  */
 export default class TerrainSunMap {
@@ -39,11 +39,11 @@ export default class TerrainSunMap {
 
   // the ground top down: -height, and the depth to keep the highest
   private readonly heights: RenderTexture;
-  // the highest ground per cell of COARSE texels
-  private readonly maxHeights: RenderTexture;
+  // the highest ground per cell of 4, 16 (COARSE), 64 and all texels of heights, each level from the one before
+  private readonly maxHeights: RenderTexture[] = [];
   // the height to see the sun at and the penumbra, what the shading reads
   private readonly target: RenderTexture;
-  private readonly maxHeightsMaterial: VertexFragmentShader;
+  private readonly maxHeightsMaterials: VertexFragmentShader[] = [];
   private readonly shadowHeightMaterial: VertexFragmentShader;
   private readonly viewProjection = new Matrix4x4();
   private readonly materials: ShaderBase[] = [];
@@ -55,18 +55,35 @@ export default class TerrainSunMap {
   /** heightMaterial: the depth material of the cascades (DRAW_DEPTH, DEPTH_CLAMP, no culling), it writes -height. */
   constructor(private renderer: Renderer, private heightMaterial: VertexFragmentShader) {
     const resolution = TerrainSunMap.RESOLUTION;
-    const coarse = resolution / TerrainSunMap.COARSE;
     this.heights = new RenderTexture(renderer, resolution, resolution, { formats: ['r32float'], depth: true, depthFormat: 'depth32float' });
-    this.maxHeights = new RenderTexture(renderer, coarse, coarse, { formats: ['r32float'] });
     this.target = new RenderTexture(renderer, resolution, resolution, { formats: ['rg32float'] });
 
-    this.maxHeightsMaterial = new VertexFragmentShader(renderer, 'terrainSunMaxHeights', heightShaderSource, { defines: { MAX_HEIGHTS: true } });
-    this.maxHeightsMaterial.depthWriteEnabled = false;
-    this.maxHeightsMaterial.setTexture('heights', this.heights);
+    // 1024 / 4 = 256 / 4 = 64 (COARSE: 16 texels) / 4 = 16 / 16 = 1
+    let source = this.heights;
+    let sourceSize = resolution;
+    for (const factor of [4, 4, 4, sourceSize / 64]) {
+      const size = sourceSize / factor;
+      const level = new RenderTexture(renderer, size, size, { formats: ['r32float'] });
+      const material = new VertexFragmentShader(renderer, 'terrainSunMaxHeights', heightShaderSource, { defines: { MAX_HEIGHTS: true } });
+      material.depthWriteEnabled = false;
+      material.setTexture('source', source);
+      material.setFloat('factor', factor);
+      // the first level: a texel around its block too (see terrainSunHeight.wgsl), from -height
+      material.setFloat('apron', source === this.heights ? 1 : 0);
+      material.setFloat('sign', source === this.heights ? -1 : 1);
+      this.maxHeights.push(level);
+      this.maxHeightsMaterials.push(material);
+      source = level;
+      sourceSize = size;
+    }
+    if (resolution / TerrainSunMap.COARSE !== this.maxHeights[1].width || this.maxHeights[3].width !== 1) {
+      throw new Error('TerrainSunMap: the levels of maxHeights do not fit RESOLUTION');
+    }
     this.shadowHeightMaterial = new VertexFragmentShader(renderer, 'terrainSunShadowHeight', heightShaderSource, { defines: { SHADOW_HEIGHT: true } });
     this.shadowHeightMaterial.depthWriteEnabled = false;
     this.shadowHeightMaterial.setTexture('heights', this.heights);
-    this.shadowHeightMaterial.setTexture('maxHeights', this.maxHeights);
+    this.shadowHeightMaterial.setTexture('maxHeights', this.maxHeights[1]);
+    this.shadowHeightMaterial.setTexture('maxHeight', this.maxHeights[3]);
   }
 
   /** The map on a material that reads it with getTerrainSunShadow: its texture now, its matrix on every render. */
@@ -128,7 +145,7 @@ export default class TerrainSunMap {
       this.heightMaterial.setMatrix('viewProjection', this.viewProjection);
       ground.draw(this.heightMaterial);
     }
-    this.renderer.blit(null, this.maxHeights, this.maxHeightsMaterial);
+    this.maxHeights.forEach((level, i) => this.renderer.blit(null, level, this.maxHeightsMaterials[i]));
 
     // the sun across the map in texels: a texel is a step of texel world units in x or z
     const horizontal = Math.hypot(toSun.x, toSun.z);
@@ -152,9 +169,9 @@ export default class TerrainSunMap {
 
   public destruct(): void {
     this.heights.destruct();
-    this.maxHeights.destruct();
+    for (const level of this.maxHeights) level.destruct();
     this.target.destruct();
-    this.maxHeightsMaterial.destruct();
+    for (const material of this.maxHeightsMaterials) material.destruct();
     this.shadowHeightMaterial.destruct();
   }
 }
