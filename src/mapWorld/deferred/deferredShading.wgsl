@@ -98,7 +98,7 @@ struct Uniforms {
   reflectionUnseen : f32,
   reflectionBuildingAlbedo : vec3<f32>,
   reflectionTreeAlbedo : vec3<f32>,
-  // the lightmap levels the reflections read coarser, see getReflectionLevel
+  // the lightmap levels the reflections read coarser than the screen claims, see getReflectionLevel
   reflectionLevelBias : f32,
 };
 
@@ -615,7 +615,7 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
           let hit = getOcclusionHit(world, rd);
           if (hit.t >= 0.) {
             occluded = 1.;
-            reflected = getReflectionHitColor(world, rd, hit, d, LIGHTMAP_ENABLED, LIGHTMAP_ENABLED && SUN_SHADOWS == 2u);
+            reflected = getReflectionHitColor(world, rd, hit, LIGHTMAP_ENABLED, LIGHTMAP_ENABLED && SUN_SHADOWS == 2u);
           }
         } else {
           occluded = select(0., 1., isOccluded(world, rd));

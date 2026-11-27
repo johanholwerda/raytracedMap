@@ -121,7 +121,7 @@ fn fs_main(input : VertexOutput) -> @location(0) vec2<u32> {
   }
   let hit = getOcclusionHit(world, rd);
   if (hit.t >= 0.) {
-    let color = getReflectionHitColor(world, rd, hit, d, uniforms.lightmapEnabled != 0u, LIGHTMAP_SUN && uniforms.lightmapEnabled != 0u);
+    let color = getReflectionHitColor(world, rd, hit, uniforms.lightmapEnabled != 0u, LIGHTMAP_SUN && uniforms.lightmapEnabled != 0u);
     return vec2(pack4x8unorm(vec4(1., rd * .5 + .5)), packReflectionColor(color));
   }
   return vec2(pack4x8unorm(vec4(.5, rd * .5 + .5)), 0u);

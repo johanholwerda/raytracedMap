@@ -823,9 +823,9 @@ export default class MapWorld {
     // camera), a part of the open sky's: in place of the occlusion of the lightmap. Its sun is by the normal, see
     // getUnseenReflectionColor
     waterGroup.addParamFloat('reflectionUnseen', .5, 0, 1, params);
-    // the lightmap levels the reflections read coarser than a surface at their distance would: the ripples blur them,
-    // and the coarser levels have their tiles more often, see getReflectionLevel
-    waterGroup.addParamFloat('reflectionLevelBias', 1, 0, 4, params);
+    // the lightmap levels the reflections read coarser than the screen claims for the point they hit (within the
+    // ancestor levels of the lightmap), see getReflectionLevel
+    waterGroup.addParamFloat('reflectionLevelBias', 0, 0, 4, params);
     this.waterRipples = waterGroup.addParamBool('waterRipples', true, { callback: setDirty });
     const updateRipples = () => {
       // the bake scales the gradient by the height, which makes the slope of the ripples independent of their wavelength

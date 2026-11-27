@@ -5,15 +5,17 @@
 // a chart of the lightmap: the atlas words of the CityTraceBlock (cityLayout.ts). Needs skyVisibilityTrace.wgsl and
 // cityLightmapSurface.wgsl
 
-// what a ray hits: t -1 when it reaches the sky, record: the building or tree record (a vec4 index of cityBuffer). Not
+// what a ray hits: t -1 when it reaches the sky, record: the building or tree record (a vec4 index of cityBuffer), tie:
+// the record of a wall that coincides with the one hit (see addCityHit), else record too. Not
 // the normal: kept from the trace through the lookups on the screen it made the deferred shading .1 ms slower at 4K
 // with a ray per water pixel (registers), getCityHitSurface works out the face only for the hits that need it
 struct CityHit {
   t : f32,
   record : u32,
+  tie : u32,
 }
 
-const CITY_HIT_NONE = CityHit(-1., 0u);
+const CITY_HIT_NONE = CityHit(-1., 0u, 0u);
 
 // an atlas word of a wall that has no place in the wall atlas, see CityTraceBlock in cityLayout.ts
 const CITY_ATLAS_NONE = 0xFFFFFFFFu;
@@ -190,6 +192,30 @@ fn getRecordHitDistance(ro : vec3<f32>, rd : vec3<f32>, record : u32) -> f32 {
   return getBuildingHitDistance(ro, rd, r0);
 }
 
+// 2 hits this close (a part of their distance) are on the same wall: walls of 2 parts that coincide, see addCityHit
+const CITY_HIT_TIE = 1.002;
+
+// a hit of record at t (-1: none) added to the nearest so far. Walls of 2 parts that coincide are both drawn, and which
+// one the gBuffer shows at a pixel is up to the rounding of their depths: the hit keeps the other one as its tie, whose
+// atlas position the lightmap may have the texels of instead (getReflectionHitColor tries both). The trace kept the
+// first one it found only: the wall of the other part, at another place in the wall atlas, read no texels, or the
+// coarser texels around that place, of other walls
+fn addCityHit(nearest : CityHit, t : f32, record : u32) -> CityHit {
+  if (t < 0.) {
+    return nearest;
+  }
+  if (t * CITY_HIT_TIE < nearest.t) {
+    return CityHit(t, record, record);
+  }
+  if (t <= nearest.t * CITY_HIT_TIE) {
+    if (t < nearest.t) {
+      return CityHit(t, record, nearest.record);
+    }
+    return CityHit(nearest.t, nearest.record, record);
+  }
+  return nearest;
+}
+
 // the nearest building or tree along rd (normalized): t the distance, -1 when the ray reaches the sky
 fn getOcclusionHit(ro : vec3<f32>, rd : vec3<f32>) -> CityHit {
   if (uniforms.cityTileCount == 0u) {
@@ -200,8 +226,7 @@ fn getOcclusionHit(ro : vec3<f32>, rd : vec3<f32>) -> CityHit {
   var stack : array<u32, CITY_STACK_SIZE>;
   var stackSize = 0u;
   var node = uniforms.cityRoot;
-  var nearest = 1e30;
-  var nearestRecord = 0u;
+  var nearest = CityHit(1e30, 0u, 0u);
   loop {
     let n0 = cityBuffer[node];
     let n1 = cityBuffer[node + 1u];
@@ -212,22 +237,16 @@ fn getOcclusionHit(ro : vec3<f32>, rd : vec3<f32>) -> CityHit {
     let tA = intersectAABB(roInvRd, invRd, n0.xyz, n1.xyz);
     let tB = intersectAABB(roInvRd, invRd, n2.xyz, n3.xyz);
     // only the boxes the ray enters before the nearest hit so far
-    var visitA = tA.y >= max(tA.x, 0.) && tA.x < nearest;
-    var visitB = tB.y >= max(tB.x, 0.) && tB.x < nearest;
+    // (and the ones it enters at a tie with it, see addCityHit)
+    let reach = nearest.t * CITY_HIT_TIE;
+    var visitA = tA.y >= max(tA.x, 0.) && tA.x <= reach;
+    var visitB = tB.y >= max(tB.x, 0.) && tB.x <= reach;
     if (visitA && a >= CITY_LEAF) {
-      let t = getRecordHitDistance(ro, rd, a & ~CITY_LEAF);
-      if (t >= 0. && t < nearest) {
-        nearest = t;
-        nearestRecord = a & ~CITY_LEAF;
-      }
+      nearest = addCityHit(nearest, getRecordHitDistance(ro, rd, a & ~CITY_LEAF), a & ~CITY_LEAF);
       visitA = false;
     }
     if (visitB && b >= CITY_LEAF) {
-      let t = getRecordHitDistance(ro, rd, b & ~CITY_LEAF);
-      if (t >= 0. && t < nearest) {
-        nearest = t;
-        nearestRecord = b & ~CITY_LEAF;
-      }
+      nearest = addCityHit(nearest, getRecordHitDistance(ro, rd, b & ~CITY_LEAF), b & ~CITY_LEAF);
       visitB = false;
     }
     if (visitA && visitB) {
@@ -249,10 +268,10 @@ fn getOcclusionHit(ro : vec3<f32>, rd : vec3<f32>) -> CityHit {
     stackSize--;
     node = stack[stackSize];
   }
-  if (nearest >= 1e30) {
+  if (nearest.t >= 1e30) {
     return CITY_HIT_NONE;
   }
-  return CityHit(nearest, nearestRecord);
+  return nearest;
 }
 
 // whether the hit of getOcclusionHit is a tree
@@ -276,6 +295,11 @@ struct CityHitSurface {
   surface : Surface,
   normal : vec3<f32>,
   valid : bool,
+}
+
+// The same of the wall that coincides with the one hit (hit.tie), where there is one
+fn getCityHitTieSurface(ro : vec3<f32>, rd : vec3<f32>, hit : CityHit) -> CityHitSurface {
+  return getCityHitSurface(ro, rd, CityHit(hit.t, hit.tie, hit.tie));
 }
 
 fn getCityHitSurface(ro : vec3<f32>, rd : vec3<f32>, hit : CityHit) -> CityHitSurface {

@@ -72,16 +72,14 @@ fn getLinearFromDisplay(c : vec3<f32>, fog : f32) -> vec3<f32> {
   return min(l, vec3(4.)) / max(uniforms.exposure, 1e-4);
 }
 
-// The level of the lightmap texels of a hit, as getLevel of cityLightmap.wgsl for a point at the distance the camera
-// sees it in the mirror (distance: along the ray from the camera to the water, then to the hit), whose face (normal n)
-// the ray along rd hits, and with the tilt shift blur at the water point. reflectionLevelBias levels coarser: the
-// ripples blur the mirror, and a coarser level has its tiles more often (the pixels of the screen made those of the
-// finer ones, at their own distances)
-fn getReflectionLevel(water : vec3<f32>, n : vec3<f32>, rd : vec3<f32>, distance : f32) -> f32 {
-  let angleLevels = min(-log2(max(abs(dot(n, rd)), 1e-6)) * uniforms.levelAngle, LEVEL_ANGLE_MAX);
-  let texelPixels = max(1. / uniforms.texelsPerPixel, getBlurPixels(water) * uniforms.blurTexelScale);
-  let size = uniforms.pixelSize * distance * texelPixels;
-  return clamp(log2(size / uniforms.texelSizeMin) + angleLevels + uniforms.reflectionLevelBias, 0., f32(LEVEL_MAX));
+// The level of the lightmap texels of a hit at p (normal n): the one the pixels of the screen claim for p (getLevel, from
+// the camera to p), not one for the way through the mirror. A face in the mirror is mostly one the screen shows too, and
+// the lightmap only has the texels the screen claims: at the level of its pixels and ancestorLevels above it. A level
+// for the mirrored way (longer, at another angle to the face) was levels finer or coarser than those, which read no
+// texels, or the coarser ancestors around them, an average of other points. reflectionLevelBias levels coarser (within
+// the ancestors): smoother, the ripples blur the mirror anyway
+fn getReflectionLevel(p : vec3<f32>, n : vec3<f32>) -> f32 {
+  return min(getLevel(p, n) + uniforms.reflectionLevelBias, f32(LEVEL_MAX));
 }
 
 // The linear color of a face of a building or a tree at p (normal n, albedo as the map color params, not squared) that a
@@ -104,18 +102,35 @@ fn getUnseenReflectionColor(ro : vec3<f32>, p : vec3<f32>, n : vec3<f32>, albedo
   return shadeReflectionHit(ro, p, n, albedo, (n.y * .5 + .5) * uniforms.reflectionUnseen, 1.);
 }
 
-// The linear color of what the mirror ray from the water point ro along rd hit (getOcclusionHit), whose camera distance
-// is cameraDistance: lit by the lightmap at the hit where it has texels there, else getUnseenReflectionColor.
+// The lightmap at a hit surface (getCityHitSurface at p): the sky visibility and its paths, and with sun the sun
+// visibility and its paths (getLightmapChannels). Paths 0 where it has no texels, or is on no chart
+fn getReflectionLightmap(s : CityHitSurface, p : vec3<f32>, sun : bool) -> vec4<f32> {
+  if (!s.valid) {
+    return vec4(0.);
+  }
+  // a face away from the sun gets none of it: no sun lookup, as the shading's
+  return getLightmapChannels(s.surface, getReflectionLevel(p, s.normal), sun && dot(s.normal, uniforms.lightDirection) > 0.);
+}
+
+// The linear color of what the mirror ray from the water point ro along rd hit (getOcclusionHit): lit by the lightmap at
+// the hit where it has texels there, else getUnseenReflectionColor. Of 2 walls that coincide there (hit.tie) the one the
+// lightmap has the texels of: the one the screen shows.
 // lightmap: the lightmap can be read (its buffers are bound); sun: its texels hold the sun visibility too (see
 // SkyVisibilityLightmap.setSun), else the sun is not shadowed
-fn getReflectionHitColor(ro : vec3<f32>, rd : vec3<f32>, hit : CityHit, cameraDistance : f32, lightmap : bool, sun : bool) -> vec3<f32> {
-  let s = getCityHitSurface(ro, rd, hit);
+fn getReflectionHitColor(ro : vec3<f32>, rd : vec3<f32>, hit : CityHit, lightmap : bool, sun : bool) -> vec3<f32> {
+  var s = getCityHitSurface(ro, rd, hit);
   let p = ro + rd * hit.t;
   let albedo = select(uniforms.reflectionBuildingAlbedo, uniforms.reflectionTreeAlbedo, isCityHitTree(hit));
-  if (lightmap && s.valid) {
-    // a face away from the sun gets none of it: no sun lookup, as the shading's
-    let lookupSun = sun && dot(s.normal, uniforms.lightDirection) > 0.;
-    let l = getLightmapChannels(s.surface, getReflectionLevel(ro, s.normal, rd, cameraDistance + hit.t), lookupSun);
+  if (lightmap) {
+    var l = getReflectionLightmap(s, p, sun);
+    if (l.y == 0. && hit.tie != hit.record) {
+      let tie = getCityHitTieSurface(ro, rd, hit);
+      let lt = getReflectionLightmap(tie, p, sun);
+      if (lt.y > 0.) {
+        s = tie;
+        l = lt;
+      }
+    }
     if (l.y > 0.) {
       let sunVisibility = mix(1., select(1., l.z, l.w > 0.), uniforms.shadowStrength);
       return shadeReflectionHit(ro, p, s.normal, albedo, l.x, sunVisibility);
