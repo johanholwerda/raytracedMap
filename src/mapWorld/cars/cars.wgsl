@@ -256,7 +256,7 @@ fn isHidden(position : vec4<f32>, d : f32) -> bool {
 // d is the horizontal (xz) distance to the camera, not the 3d one: the map is loaded in a radius around the camera in
 // xz, and a camera that goes up and looks down gets no more fog (the far plane reaches past it, see
 // MapWorld.applyViewDistanceMax).
-// The same in deferredShading.wgsl, cars.wgsl, reprojectedSSAOComposite.wgsl and osm/shading.wgsl.
+// The same in deferredShading.wgsl, cars.wgsl, reprojectedSSAOComposite.wgsl and shading.wgsl.
 fn getFog(d : f32) -> f32 {
   let end = select(1., 1. - smoothstep(.7 * uniforms.viewDistanceMax, uniforms.viewDistanceMax, d), uniforms.viewDistanceMax > 0.);
   return 1. - exp(-d * uniforms.distanceFog) * end;

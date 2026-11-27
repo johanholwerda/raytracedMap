@@ -1,5 +1,5 @@
 // Times the load of the map tiles: builds the app as it is deployed (vite build), serves it, opens ?bench (see
-// src/mapWorld/MapWorldBench.ts) on a city and records, from the navigation on: when the app starts, the first tile
+// src/mapWorld/debug/MapWorldBench.ts) on a city and records, from the navigation on: when the app starts, the first tile
 // request, the first ground and buildings on screen, when the tiles of the view are in, and when the image converged.
 // Then jumps to other places with the app warm (no startup in it), for the streaming alone: the mean of the jumps.
 //

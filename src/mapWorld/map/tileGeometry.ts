@@ -1,13 +1,13 @@
 import type { VectorTileFeature } from '@mapbox/vector-tile';
 import type { PbfReader } from 'pbf';
-import type { TileCoord } from '../osm/PDOKTileService';
-import type MapProjection from '../osm/MapProjection';
+import type { TileCoord } from './geo';
+import type MapProjection from './MapProjection';
 
 /*
 The geometry of the features of a vector tile as flat numbers, for the map worker (see worldGeometryCore.ts): the rings
 of a feature are decoded from the tile into an array that is kept from feature to feature and from tile to tile, the
 rings are clipped to the tile into 2 more and projected into the arrays of the caller. VectorTileFeature.loadGeometry
-made a Point per vertex, classifyRings, clipRingToTile and clipLineToTile (pdokDecodeCore.ts) arrays and points per
+made a Point per vertex, classifyRings, clipRingToTile and clipLineToTile (the former pdokDecodeCore.ts) arrays and points per
 ring and per cut, and the projection a number[] per polygon: some 10 MB of garbage per tile of a city, which the
 scavenges of the worker had to copy around the data of the tile being built. Gives the same numbers as those, in the
 same order: the tiles are built the same (see video/tileBench.mjs --compare).
@@ -150,7 +150,7 @@ export function readRings(feature: VectorTileFeature, rings: FeatureRings): void
 }
 
 /**
- * The rings into polygons, as classifyRings (pdokDecodeCore.ts) has them: the first ring with an area fixes the winding
+ * The rings into polygons, as classifyRings (the former pdokDecodeCore.ts) had them: the first ring with an area fixes the winding
  * of the outer rings, a ring with it starts a polygon, the others are its holes. 1 ring or none: 1 polygon of them.
  */
 export function classifyPolygons(rings: FeatureRings): void {

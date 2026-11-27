@@ -68,7 +68,7 @@ globalThis.fetch = async (url) => {
   return new Response(entry.status === 204 ? null : fs.readFileSync(entry.file), { status: entry.status });
 };
 
-// the bounds MapWorld.boundsAround gives a place (the span of DEFAULT_BOUNDS of osm/layerDefs.ts)
+// the bounds MapWorld.boundsAround gives a place (the span of DEFAULT_BOUNDS of map/geo.ts)
 const boundsAround = (lat, lng) => ({ south: lat - .00814, north: lat + .00814, west: lng - .02311, east: lng + .02311 });
 const tileCenter = (z, x, y) => {
   const n = 2 ** z;

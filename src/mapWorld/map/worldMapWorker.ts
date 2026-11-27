@@ -2,8 +2,7 @@ import { buildWorldTile } from './worldGeometryCore';
 import type { WorldTileResult } from './worldGeometryCore';
 import { jobClock } from './jobTimes';
 import type { JobTimes } from './jobTimes';
-import type { LatLngBounds } from '../osm/osmGeometryCore';
-import type { TileCoord } from '../osm/PDOKTileService';
+import type { LatLngBounds, TileCoord } from './geo';
 
 /**
  * World map Web Worker: decodes one OpenMapTiles vector tile (.pbf) and builds its ground layers and/or extruded
@@ -63,7 +62,7 @@ export type WorldWorkerReply = {
   times: JobTimes;
 };
 
-// Minimal worker-scope typing (see osm/mapWorker.ts for why).
+// Minimal worker-scope typing, so the `webworker` lib (which clashes with the DOM lib of this project) isn't needed.
 type WorkerCtx = {
   onmessage: ((e: MessageEvent<WorldWorkerSetup>) => void) | null;
   postMessage(message: WorldWorkerReply, transfer?: Transferable[]): void;

@@ -1,7 +1,6 @@
 import LogGL from 'webGPU-framework/renderer/core/LogGL';
 import decodePngRgba8 from 'webGPU-framework/utils/image/decodePngRgba8';
-import { tileToLatLon } from '../osm/pdokDecodeCore';
-import type { TileCoord } from '../osm/PDOKTileService';
+import { tileToLatLon, type TileCoord } from './geo';
 import { demPixelMeters, removeDemSpikes } from './demSpikes';
 import { COARSE_ZOOM, correctArcticDem, mayBeArcticDem } from './arcticDem';
 

@@ -1,4 +1,4 @@
-import { LightmapResolution, LightmapView } from './skyVisibilityLightmap/SkyVisibilityLightmap';
+import { LightmapResolution, LightmapView } from './rendering/skyVisibilityLightmap/SkyVisibilityLightmap';
 
 // The quality param: the renderer (forward or deferred) and the settings of the sky visibility lightmap, the TAA and
 // the tilt-shift it sets.

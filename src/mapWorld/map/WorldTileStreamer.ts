@@ -12,19 +12,18 @@ import ParamGroup from 'webGPU-framework/utils/params/ParamGroup';
 import ParamFloat from 'webGPU-framework/utils/params/ParamFloat';
 import ParamBool from 'webGPU-framework/utils/params/ParamBool';
 import { isMobile } from 'webGPU-framework/renderer/utils/Browser';
-import MapProjection from '../osm/MapProjection';
-import type { LatLngBounds } from '../osm/osmGeometryCore';
-import type { TileCoord } from '../osm/PDOKTileService';
-import type { BuildingInfo } from '../osm/cityGlTFCore';
-import type { LayerRuntime } from '../osm/layerDefs';
+import MapProjection from './MapProjection';
+import type { LatLngBounds, TileCoord } from './geo';
+import type { BuildingInfo } from './worldGeometryCore';
+import type { LayerRuntime } from '../rendering/layerDefs';
 import type { WorldBuildingResult, WorldTileResult } from './worldGeometryCore';
-import type { WallAtlasMeshData } from '../city/WallAtlasView';
+import type { WallAtlasMeshData } from '../debug/WallAtlasView';
 import OpenFreeMapTileService from './OpenFreeMapTileService';
 import WorldWorkerPool from './WorldWorkerPool';
 import type ElevationClient from './ElevationClient';
 import type TerrainHeightField from './TerrainHeightField';
 import CityScene from '../city/CityScene';
-import type TerrainLayerBuffer from '../osm/TerrainLayerBuffer';
+import type TerrainLayerBuffer from '../rendering/TerrainLayerBuffer';
 import { jobClock } from './jobTimes';
 import type { JobTimes } from './jobTimes';
 
@@ -123,9 +122,8 @@ export type FrameTiming = { start: number; submitted: number; gpu: number; groun
  * Each z14 tile holds both ground layers and buildings, so a tile is fetched
  * once and the worker builds whatever is still missing for it (terrain and/or
  * buildings). Terrain goes into the shared per-layer {@link TerrainLayerBuffer}s;
- * buildings become one Mesh per tile with a recycled picking slot, exactly like
- * the 3DBAG tiles in mapOSM/TileStreamer, so picking/highlight/shadows/SSAO in
- * the host work unchanged.
+ * buildings become one Mesh per tile with a recycled picking slot (for the
+ * picking and the selection highlight).
  *
  * Requesting the tiles and building them (the fetches and the workers) needs no GPU: {@link prefetch} starts on the
  * tiles of the first view while the page still waits for its WebGPU device (half a second or more), {@link attach} then
@@ -199,7 +197,7 @@ export default class WorldTileStreamer {
   // FILL_BUDGET_SCALE times the budget per frame
   private filling = true;
 
-  // --- picking slots (see mapOSM/TileStreamer) ---
+  // --- picking slots ---
   private slotBuildings: (BuildingInfo[] | null)[] = [];
   private freeSlots: number[] = [];
   private nextSlot = 0;

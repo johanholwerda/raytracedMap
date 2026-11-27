@@ -55,7 +55,7 @@ export type FetchJobMessage =
  */
 export type FetchJobEvent = { id: number; error?: string; empty?: boolean };
 
-// Minimal worker-scope typing (see osm/mapWorker.ts for why).
+// Minimal worker-scope typing, so the `webworker` lib (which clashes with the DOM lib of this project) isn't needed.
 type WorkerCtx = {
   onmessage: ((e: MessageEvent<FetchWorkerMessage>) => void) | null;
   postMessage(message: FetchWorkerEvent): void;

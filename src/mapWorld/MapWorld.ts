@@ -15,15 +15,14 @@ import MapCamera from 'webGPU-framework/utils/camera/MapCamera';
 import RenderTexture from 'webGPU-framework/renderer/texture/RenderTexture';
 import { isMobile } from 'webGPU-framework/renderer/utils/Browser';
 import { clamp } from 'webGPU-framework/renderer/utils/MathUtils';
-import type { LatLngBounds } from './osm/osmGeometryCore';
-import { DEFAULT_BOUNDS } from './osm/layerDefs';
-import MapProjection from './osm/MapProjection';
-import ReprojectedSSAO, { SSAOMode } from './ssao/ReprojectedSSAO';
-import TAA from './taa/TAA';
-import MapGBuffer from './deferred/MapGBuffer';
-import DeferredShading from './deferred/DeferredShading';
-import WaterReflectionHalfRes from './deferred/WaterReflectionHalfRes';
-import WaterTerrainHorizon from './deferred/WaterTerrainHorizon';
+import { type LatLngBounds, DEFAULT_BOUNDS } from './map/geo';
+import MapProjection from './map/MapProjection';
+import ReprojectedSSAO, { SSAOMode } from './rendering/ssao/ReprojectedSSAO';
+import TAA from './rendering/taa/TAA';
+import MapGBuffer from './rendering/deferred/MapGBuffer';
+import DeferredShading from './rendering/deferred/DeferredShading';
+import WaterReflectionHalfRes from './rendering/deferred/WaterReflectionHalfRes';
+import WaterTerrainHorizon from './rendering/deferred/WaterTerrainHorizon';
 import { NOTABLE_BUILDINGS } from './map/notableBuildings';
 import { describeCity, findCity, pickRandomCity, pickStartCity } from './map/worldCities';
 import type { City } from './map/worldCities';
@@ -34,26 +33,26 @@ import WorldTileStreamer, { PreviewCamera } from './map/WorldTileStreamer';
 import ElevationClient from './map/ElevationClient';
 import { SNOW_SKIP_MARGIN_M, snowLineMeters, SnowParams } from './map/snowLine';
 import TerrainHeightField from './map/TerrainHeightField';
-import TiltShift from './tiltShift/TiltShift';
-import SkyVisibilityLightmap, { LightmapView } from './skyVisibilityLightmap/SkyVisibilityLightmap';
-import type { LightmapBlur } from './skyVisibilityLightmap/SkyVisibilityLightmap';
-import MapWorldBench, { MapWorldFrameState } from './MapWorldBench';
-import MapWorldVideo from './MapWorldVideo';
+import TiltShift from './rendering/tiltShift/TiltShift';
+import SkyVisibilityLightmap, { LightmapView } from './rendering/skyVisibilityLightmap/SkyVisibilityLightmap';
+import type { LightmapBlur } from './rendering/skyVisibilityLightmap/SkyVisibilityLightmap';
+import MapWorldBench, { MapWorldFrameState } from './debug/MapWorldBench';
+import MapWorldVideo from './debug/MapWorldVideo';
 import {
   DRAW_MODES, DrawMode, QUALITIES, Quality, qualitySettings, REFLECTION_BLOCKS, REFLECTION_RAYS, ReflectionRays, SHADOW_VIEWS,
   ShadowMode, SKY_VISIBILITY_VIEWS, randomTimeOfDay, TIMES_OF_DAY, TimeOfDay, timeOfDaySettings, timeOfDaySunAngles,
 } from './MapWorldSettings';
-import MapGeometry, { CityMeshes } from './MapGeometry';
-import SunShadows from './SunShadows';
-import WallAtlasView from './city/WallAtlasView';
-import type { ShadowMapAhead } from './osm/shadowMap/ShadowMap';
-import BuildingPicker from './BuildingPicker';
+import MapGeometry, { CityMeshes } from './rendering/MapGeometry';
+import SunShadows from './rendering/sun/SunShadows';
+import WallAtlasView from './debug/WallAtlasView';
+import type { ShadowMapAhead } from './rendering/sun/ShadowMap';
+import BuildingPicker from './ui/BuildingPicker';
 import CarTraffic from './cars/CarTraffic';
 import MapWorldUI from './ui/MapWorldUI';
-import AirplaneController from './AirplaneController';
-import OrbitKeyRotation from './OrbitKeyRotation';
+import AirplaneController from './camera/AirplaneController';
+import OrbitKeyRotation from './camera/OrbitKeyRotation';
 import { TREE_CROWN_COLORS, TREE_TRUNK_COLOR } from './map/worldTrees';
-import WaterRippleTexture from './deferred/waterRipples/WaterRippleTexture';
+import WaterRippleTexture from './rendering/deferred/waterRipples/WaterRippleTexture';
 import KeyListener from 'webGPU-framework/utils/input/KeyListener';
 import { KEY_P } from 'webGPU-framework/utils/input/Key';
 import { saveCanvasToDisk } from 'webGPU-framework/utils/image/ImageUtils';
@@ -134,8 +133,7 @@ function removeMobileConsole(): void {
  * sync, 2D region picker), but shaded deferred: 1 gBuffer pass with a jittered camera (MapGBuffer), shaded once per
  * pixel (DeferredShading) with the light of the sky visibility lightmap, the
  * reprojected SSAO over it, and TAA instead of
- * MSAA. Fed by worldwide OpenStreetMap data instead of the
- * Dutch PDOK / 3DBAG services:
+ * MSAA. Fed by worldwide OpenStreetMap data:
  *  - ground layers + extruded buildings from OpenFreeMap vector tiles
  *    (OpenMapTiles schema, one request per tile), and
  *  - street addresses for clicked buildings from Nominatim.
@@ -876,7 +874,7 @@ export default class MapWorld {
     this.skyLightmap.view = SKY_VISIBILITY_VIEWS[mode] ?? LightmapView.Shaded;
     const shadowView = SHADOW_VIEWS[mode] ?? 0;
     this.deferred.shadowView = shadowView;
-    // the forward shading (osm/shading.wgsl) only has the cascades view
+    // the forward shading (rendering/shaders/shading.wgsl) only has the cascades view
     for (const m of this.geometry.forwardMaterials) m.setFloat('shadowDebug', mode === DrawMode.ShadowMapCascades ? 1 : 0);
     this.dirty = true;
   }
