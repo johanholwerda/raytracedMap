@@ -47,7 +47,7 @@ export const REFLECTION_RAYS = ['per pixel', '1 per 2 pixels', '1 per 4 pixels']
 export const REFLECTION_BLOCKS: [number, number][] = [[1, 1], [2, 1], [2, 2]];
 
 export type QualitySettings = {
-  // where the map ends, in world units from the camera (the viewDistanceMax param of MapWorld): the fog is 1 there, the
+  // where the map ends, in world units from the camera (the viewDistanceMax param of MapRenderer): the fog is 1 there, the
   // ground tiles load that far and the pixels beyond skip the shading
   viewDistanceMax: number;
   // forward shaded (MapGeometry.drawForward) instead of the gBuffer and the deferred shading

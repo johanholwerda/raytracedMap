@@ -42,7 +42,7 @@ fn vs_main(input : VertexInput) -> VertexOutput {
 }
 
 // The distance fog: exponential (distanceFog per world unit), with a smoothstep from .7 of viewDistanceMax that takes
-// it to 1 at viewDistanceMax, where the loaded map ends (see MapWorld.viewDistanceMax). 0 (not set): only the exp.
+// it to 1 at viewDistanceMax, where the loaded map ends (see MapRenderer.viewDistanceMax). 0 (not set): only the exp.
 // The same in deferredShading.wgsl, cars.wgsl, reprojectedSSAOComposite.wgsl and shading.wgsl.
 fn getFog(d : f32) -> f32 {
   let end = select(1., 1. - smoothstep(.7 * uniforms.viewDistanceMax, uniforms.viewDistanceMax, d), uniforms.viewDistanceMax > 0.);

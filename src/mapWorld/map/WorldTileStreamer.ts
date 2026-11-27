@@ -334,7 +334,7 @@ export default class WorldTileStreamer {
     this.needsRestream = true;
   }
 
-  /** The distance from the camera where the map ends (world units, see MapWorld.viewDistanceMax): the tiles reload. */
+  /** The distance from the camera where the map ends (world units, see MapRenderer.viewDistanceMax): the tiles reload. */
   public setViewDistanceMax(distance: number): void {
     if (this.viewDistanceMax === distance) return;
     this.viewDistanceMax = distance;

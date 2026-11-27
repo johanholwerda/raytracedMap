@@ -177,7 +177,7 @@ export default class MapGeometry {
     this.setMaterialColor(this.layers[index].material, this.forwardLayerMaterials[index], color);
   }
 
-  /** The ground quad reaches distance (world units) around the camera, see MapWorld.viewDistanceMax. */
+  /** The ground quad reaches distance (world units) around the camera, see MapRenderer.viewDistanceMax. */
   public setViewDistanceMax(distance: number): void {
     this.groundQuad.size = distance * 2;
   }

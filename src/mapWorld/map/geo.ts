@@ -10,7 +10,7 @@ export type LatLngBounds = {
 export type TileCoord = { z: number; x: number; y: number };
 
 /**
- * The start region, and the span of the bounds MapWorld centers on a location (see MapWorld.boundsAround): its size
+ * The start region, and the span of the bounds MapWorld centers on a location (see MapManager.boundsAround): its size
  * fixes the world scale of the map (MapProjection).
  */
 //https://prochitecture.com/blender-osm/extent/?blender_version=5.1&addon=blosm&addon_version=2.7.27

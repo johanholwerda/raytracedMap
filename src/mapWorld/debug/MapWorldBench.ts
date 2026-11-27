@@ -3,7 +3,7 @@ import Profiler from 'webGPU-framework/renderer/render/Profiler';
 import MapCamera from 'webGPU-framework/utils/camera/MapCamera';
 import Vector3 from 'webGPU-framework/renderer/math/Vector3';
 
-/** What MapWorld.draw did in a frame, see MapWorldBench.afterFrame. */
+/** What MapRenderer.render did in a frame, see MapWorldBench.afterFrame. */
 export type MapWorldFrameState = {
   // a new jittered gBuffer was drawn (the map or the AO took a frame)
   newJitter: boolean;
@@ -81,17 +81,15 @@ export default class MapWorldBench {
   }
 
   /**
-   * ?set=skyLightmap.traceSamplesMax:1024,ssao.amount:0: param values for A/B runs, by the path of the param from the
-   * example (private fields too), set before the first frame.
+   * ?set=skyLightmap.traceSamplesMax:1024,ssao.amount:0: param values for A/B runs, by the path of the param (see
+   * MapWorld.findParam), set before the first frame.
    */
-  public applyParams(example: object): void {
+  public applyParams(findParam: (path: string) => any): void {
     const set = this.params.get('set');
     if (!set) return;
     for (const entry of set.split(',')) {
       const [path, value] = entry.split(':');
-      const keys = path.split('.');
-      let target: any = example;
-      for (const key of keys) target = target?.[key];
+      const target = findParam(path);
       if (!target?.setValue) {
         console.warn(`[MapWorldBench] no param ${path}`);
         continue;

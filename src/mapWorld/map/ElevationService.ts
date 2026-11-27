@@ -93,7 +93,7 @@ export default class ElevationService {
 
   /**
    * Starts loading the elevation tiles around lat/lng: the one it is in and rings of them around it. For a place whose
-   * map tiles are asked for soon (see MapWorld.setPlace): getTileGrid then finds them loading or loaded. On the first
+   * map tiles are asked for soon (see MapManager.setPlace): getTileGrid then finds them loading or loaded. On the first
    * load of the page the elevation tiles are what a map tile waits for longest (about 0.4 s each), and they can be
    * asked for before the URL of the map tiles is known (OpenFreeMapTileService.init, another 0.35 s).
    */

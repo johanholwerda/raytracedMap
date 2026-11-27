@@ -315,7 +315,7 @@ export default class ReprojectedSSAO {
    * Copies scene to destination with the accumulated visibility multiplied over it, or with {@link showOnly} draws the
    * visibility alone. False when there is no AO to draw (inactive, or no history yet): the caller copies the scene then.
    * @param distanceFog  fog coefficient matching shading.wgsl, the AO fades out with it
-   * @param viewDistanceMax  where that fog is 1, see MapWorld.viewDistanceMax
+   * @param viewDistanceMax  where that fog is 1, see MapRenderer.viewDistanceMax
    * @param scene  the scene the AO darkens, the size of the AO (the canvas)
    * @param destination  null is the screen
    */

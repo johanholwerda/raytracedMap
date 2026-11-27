@@ -16,14 +16,14 @@ export type VideoShot = {
   // the stick over the time of the shot, [seconds, turn (-1 left .. 1 right), climb (-1 down .. 1 up)], interpolated
   // linearly between the keys. Left out: straight and level
   stick?: [number, number, number][];
-  // param values of the shot by their path from MapWorld, see setParams
+  // param values of the shot by their path (see MapWorld.findParam), see setParams
   params?: Record<string, number | boolean>;
 };
 
 /** What MapWorld does for the video. */
 export type VideoHost = {
-  // the MapWorld, for the params by path
-  example: object;
+  // a param by its path, see MapWorld.findParam
+  findParam: (path: string) => any;
   // one frame: MapWorld.update()
   step: () => void;
   // recenters the map on a place and starts streaming its tiles
@@ -78,14 +78,13 @@ export default class MapWorldVideo {
   }
 
   /**
-   * Param values by the path of the param from MapWorld (private fields too), like ?set of MapWorldBench:
+   * Param values by the path of the param (see MapWorld.findParam), like ?set of MapWorldBench:
    * { quality: 0, animateWater: true, 'tiltShift.enabled': false }. A select takes the index of its option. In the
    * order of the object: quality first, it sets most of the others.
    */
   public setParams(params: Record<string, number | boolean>): void {
     for (const [path, value] of Object.entries(params)) {
-      let target: any = this.host.example;
-      for (const key of path.split('.')) target = target?.[key];
+      const target = this.host.findParam(path);
       if (!target?.setValue) throw new Error(`[MapWorldVideo] no param ${path}`);
       target.setValue(value);
     }

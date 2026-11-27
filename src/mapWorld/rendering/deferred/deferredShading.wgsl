@@ -452,7 +452,7 @@ fn getHalfResReflection(coord : vec2<u32>, rd : vec3<f32>) -> f32 {
 }
 
 // The distance fog: exponential (distanceFog per world unit), with a smoothstep from .7 of viewDistanceMax that takes
-// it to 1 at viewDistanceMax, where the loaded map ends (see MapWorld.viewDistanceMax). 0 (not set): only the exp.
+// it to 1 at viewDistanceMax, where the loaded map ends (see MapRenderer.viewDistanceMax). 0 (not set): only the exp.
 // d is the horizontal (xz) distance to the camera, not the 3d one: the map is loaded in a radius around the camera in
 // xz, and a camera that goes up and looks down gets no more fog (the far plane reaches past it, see
 // MapWorld.applyViewDistanceMax).

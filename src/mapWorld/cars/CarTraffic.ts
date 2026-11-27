@@ -150,7 +150,7 @@ export default class CarTraffic implements RoadTileSink {
   private readonly candidates: RoadEdge[] = [];
   private readonly weights: number[] = [];
   private _active = false;
-  // toward the sun, for the rays of lightingShader: set by MapWorld before the draw
+  // toward the sun, for the rays of lightingShader: set by MapRenderer before the draw
   public readonly lightDirection = new Vector3(0, 1, 0);
 
   public enabled!: ParamBool;
@@ -161,9 +161,9 @@ export default class CarTraffic implements RoadTileSink {
   private radiusScale!: ParamFloat;
   private speedScale!: ParamFloat;
   private driveOnLeft!: ParamBool;
-  // set by the quality of MapWorld: off where the map has no TAA either
+  // set by the quality (MapRenderer.applyQuality): off where the map has no TAA either
   public msaa!: ParamBool;
-  // set by the quality of MapWorld: the sun rays and the lightmap lookup per pixel instead of per car
+  // set by the quality (MapRenderer.applyQuality): the sun rays and the lightmap lookup per pixel instead of per car
   public perPixelLighting!: ParamBool;
   // the length of a car in pixels at the pivot below which there are no cars
   private minPixels!: ParamFloat;
