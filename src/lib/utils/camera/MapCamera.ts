@@ -43,6 +43,9 @@ export default class MapCamera extends PivotCamera {
   private ctrlDown: boolean = false;
   private wasRotating: boolean = false;
 
+  // Adjusts the view after the input moved it, before update() sees whether it changed (e.g. keeps it above the ground)
+  public constrainView: (() => void) | null = null;
+
   // Pinch twist state (mobile)
   private pinchPrev0: Vector2 = new Vector2();
   private pinchPrev1: Vector2 = new Vector2();
@@ -163,6 +166,7 @@ export default class MapCamera extends PivotCamera {
 
     this.updateZoom();
     this.applyControllerRotation();
+    this.constrainView?.();
 
     this.checkChanged();
   }

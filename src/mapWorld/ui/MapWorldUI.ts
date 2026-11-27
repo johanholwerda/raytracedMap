@@ -1,5 +1,5 @@
-import type { LatLngBounds } from '../osm/osmGeometryCore';
-import MapSelector from '../osm/MapSelector';
+import type { LatLngBounds } from '../map/geo';
+import MapSelector from './MapSelector';
 import { ATTRIBUTION } from '../map/OpenFreeMapTileService';
 import { ELEVATION_ATTRIBUTION } from '../map/ElevationService';
 import { searchCities } from '../map/worldCities';

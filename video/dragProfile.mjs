@@ -1,5 +1,5 @@
 // Profiles the main thread while the map is dragged onto new tiles: serves the app, opens ?bench (see
-// src/mapWorld/MapWorldBench.ts) with every drag the same way, and records a V8 CPU profile of the drags and the
+// src/mapWorld/debug/MapWorldBench.ts) with every drag the same way, and records a V8 CPU profile of the drags and the
 // settles, the long animation frames and the intervals between the frames (at vsync, not uncapped).
 //
 //   node video/dragProfile.mjs [--city Amsterdam] [--rounds 4] [--dragFrames 90] [--dragSpeed .03] [--out file.json]

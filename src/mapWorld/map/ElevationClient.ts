@@ -1,6 +1,6 @@
 import { ELEVATION_ZOOM } from './ElevationService';
 import type { FetchWorkerEvent, FetchWorkerMessage } from './tileFetchWorker';
-import type { TileCoord } from '../osm/PDOKTileService';
+import type { TileCoord } from './geo';
 
 /**
  * The main thread's side of the elevation: the elevation tiles are fetched, decoded and kept in the tile fetch worker

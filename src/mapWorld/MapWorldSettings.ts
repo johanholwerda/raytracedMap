@@ -1,4 +1,4 @@
-import { LightmapResolution, LightmapView } from './skyVisibilityLightmap/SkyVisibilityLightmap';
+import { LightmapResolution, LightmapView } from './rendering/skyVisibilityLightmap/SkyVisibilityLightmap';
 
 // The quality param: the renderer (forward or deferred) and the settings of the sky visibility lightmap, the TAA and
 // the tilt-shift it sets.
@@ -62,7 +62,7 @@ export enum ReflectionType {
 export const REFLECTION_TYPES = ['none', 'solid color', 'lit', 'lightmap'];
 
 export type QualitySettings = {
-  // where the map ends, in world units from the camera (the viewDistanceMax param of MapWorld): the fog is 1 there, the
+  // where the map ends, in world units from the camera (the viewDistanceMax param of MapRenderer): the fog is 1 there, the
   // ground tiles load that far and the pixels beyond skip the shading
   viewDistanceMax: number;
   // forward shaded (MapGeometry.drawForward) instead of the gBuffer and the deferred shading
@@ -205,7 +205,7 @@ export type TimeOfDaySettings = {
 export const timeOfDaySettings: Record<TimeOfDay, TimeOfDaySettings> = {
   [TimeOfDay.Sunrise]: { sunElevation: .12, sunSide: -1, skyColor: '#4f5663', sunColor: '#ff9466', backgroundColor: '#c9b8b0' },
   [TimeOfDay.Morning]: { sunElevation: .55, sunSide: -1, skyColor: '#657995', sunColor: '#d8b794', backgroundColor: '#bcd4ec' },
-  [TimeOfDay.Noon]: { sunElevation: 1., sunSide: 0, skyColor: '#b2c1d2', sunColor: '#60503d', backgroundColor: '#a9bbcc' },
+  [TimeOfDay.Noon]: { sunElevation: 1., sunSide: 0, skyColor: '#8998a9', sunColor: '#9b703b', backgroundColor: '#a9bbcc' },
   [TimeOfDay.Afternoon]: { sunElevation: .3, sunSide: 1, skyColor: '#596b80', sunColor: '#dfba9f', backgroundColor: '#b8dbff' },
   [TimeOfDay.Sunset]: { sunElevation: .1, sunSide: 1, skyColor: '#697398', sunColor: '#ff7e33', backgroundColor: '#d4a088' },
 };

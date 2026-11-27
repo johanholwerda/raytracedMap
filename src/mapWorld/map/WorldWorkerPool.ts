@@ -112,7 +112,7 @@ export default class WorldWorkerPool {
   }
 
   /**
-   * The most build workers that build at once: fewer than the pool while the page starts (see MapWorld.startTiles),
+   * The most build workers that build at once: fewer than the pool while the page starts (see MapManager.startTiles),
    * when the GPU process needs the cores. All of them by default, 0: none. The tiles are fetched whatever the limit:
    * when it goes up their data is there.
    */

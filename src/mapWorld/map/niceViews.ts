@@ -17,7 +17,13 @@ export const NICE_VIEWS: string[] = [
   'lat=38.897527&lng=-77.057341&dist=535&pitch=-26.20&yaw=83.70&time=sunset',
   'lat=37.589069&lng=126.974844&dist=961&pitch=-29.37&yaw=172.27&time=morning',
   'lat=22.275807&lng=114.164348&dist=1406&pitch=-30.30&yaw=-11.80&time=noon',
-  'lat=68.240545&lng=14.542637&dist=961&pitch=-17.13&yaw=-66.78&time=afternoon'
+  'lat=68.240545&lng=14.542637&dist=961&pitch=-17.13&yaw=-66.78&time=afternoon',
+  'lat=22.330710&lng=114.150867&dist=1060&pitch=-35.63&yaw=17.14&time=morning',
+  'lat=45.436168&lng=12.338629&dist=1812&pitch=-80.21&yaw=162.21&time=afternoon',
+  'lat=52.515823&lng=13.356575&dist=1812&pitch=-80.21&yaw=6.40&time=afternoon',
+  'lat=48.859109&lng=2.293544&dist=1288&pitch=-35.20&yaw=-25.59&time=sunrise',
+  'lat=46.006274&lng=7.731999&dist=921&pitch=-20.54&yaw=-63.60&time=afternoon',
+  'lat=3.144224&lng=101.697996&dist=1406&pitch=-29.92&yaw=35.95&time=sunset'
 ];
 
 export type NiceView = { lat: number; lng: number; dist: number; pitch: number; yaw: number; time?: string };
