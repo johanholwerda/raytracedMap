@@ -172,6 +172,7 @@ export default class MapWater {
     this.reflectionRays.setValue(settings.reflectionRays);
     this.waterRipples.setValue(settings.waterRipples);
     this.animateWater.setValue(settings.animateWater);
+    this.rippleDetail.setValue(settings.rippleDetail);
   }
 
   /**
