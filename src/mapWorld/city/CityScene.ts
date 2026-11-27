@@ -409,11 +409,11 @@ export default class CityScene {
   }
 
   /**
-   * The building the ray hits first, on the CPU (the building picking): the key of its tile and its feature id, null
-   * when it hits nothing. A tree in front hides the building behind it: then the feature id is -1, as for a building
-   * without one. Takes all tiles, also those without a place in the city buffer.
+   * The building the ray hits first, on the CPU (the building picking): the key of its tile, its feature id and the
+   * ray distance t (in lengths of rd), null when it hits nothing. A tree in front hides the building behind it: then
+   * the feature id is -1, as for a building without one. Takes all tiles, also those without a place in the city buffer.
    */
-  public pick(ro: Vector3, rd: Vector3): { key: string; featureId: number } | null {
+  public pick(ro: Vector3, rd: Vector3): { key: string; featureId: number; t: number } | null {
     const o = [ro.x, ro.y, ro.z], d = [rd.x, rd.y, rd.z];
     const inv = d.map(v => (v >= 0 ? 1 : -1) / Math.max(Math.abs(v), 1e-12));
     //the tiles the ray passes, nearest first, so the closest hit culls the tiles behind it
@@ -430,14 +430,14 @@ export default class CityScene {
     }
     candidates.sort((a, b) => a.near - b.near);
     let best = Infinity;
-    let hit: { key: string; featureId: number } | null = null;
+    let hit: { key: string; featureId: number; t: number } | null = null;
     for (const { key, tile, near } of candidates) {
       if (near >= best) break;
       const result = intersectTraceBlock(tile.block, o, d, best);
       if (!result) continue;
       best = result.t;
       const block = tile.block;
-      hit = { key, featureId: result.record < block.buildingCount ? block.ids[result.record] : -1 };
+      hit = { key, featureId: result.record < block.buildingCount ? block.ids[result.record] : -1, t: result.t };
     }
     return hit;
   }

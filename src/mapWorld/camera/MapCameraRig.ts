@@ -27,6 +27,10 @@ export const CAMERA_NEAR = .01;
 // CAMERA_GROUND_CLEARANCE_NEAR near planes (world units): the corners of the near plane reach ~1.3 of it from the eye.
 const CAMERA_GROUND_CLEARANCE_M = 25;
 const CAMERA_GROUND_CLEARANCE_NEAR = 2;
+// What a drag grabs is found by marching the ray over the ground in steps of this part of the distance, at least
+// PICK_GROUND_MIN_STEP_M (m), see groundDistance
+const PICK_GROUND_STEP = .01;
+const PICK_GROUND_MIN_STEP_M = 1;
 
 export type CameraView = { pitch: number; yaw: number; distance: number };
 
@@ -56,9 +60,10 @@ export default class MapCameraRig {
 
   /**
    * @param flatGround whether the elevation is off: the ground is flat at 0, the height field empty
+   * @param buildingDistance the distance along the (unit) ray to the first building or tree it hits, null for none
    */
   constructor(private renderer: Renderer, private projection: MapProjection, private heightField: TerrainHeightField,
-    private flatGround: () => boolean) {
+    private flatGround: () => boolean, private buildingDistance: (origin: Vector3, direction: Vector3) => number | null) {
     this.camera = new MapCamera(renderer, {
       fov: CAMERA_FOV,
       nearPlane: CAMERA_NEAR,
@@ -70,6 +75,8 @@ export default class MapCameraRig {
     this.camera.rotationController.rotationLimitX = new Vector2(CAMERA_PITCH_MIN, CAMERA_PITCH_MAX);
     this.camera.setDistanceLimit(CAMERA_DISTANCE_MIN, CAMERA_DISTANCE_MAX);
     this.camera.constrainView = () => this.keepAboveGround();
+    // a drag keeps the building or the ground it grabs under the cursor
+    this.camera.pickPoint = (origin, direction) => this.pickPoint(origin, direction);
     // Geometry is projected relative to the bounds center (world origin).
     this.camera.pivot.position = new Vector3(0, 0, 0);
     this.airplane = new AirplaneController(renderer, this.camera);
@@ -142,6 +149,43 @@ export default class MapCameraRig {
     if (focus < 1e-6) return null;
     forward.normalize();
     return { origin, forward, focus };
+  }
+
+  /** Where the (unit) ray first hits a building, a tree or the ground, up to the far plane: null for none. */
+  private pickPoint(origin: Vector3, direction: Vector3): Vector3 | null {
+    const building = this.buildingDistance(origin, direction);
+    const t = this.groundDistance(origin, direction, building ?? this.camera.projection.far) ?? building;
+    return t === null ? null : Vector3.add(origin, Vector3.multiplyScalar(direction, t));
+  }
+
+  /**
+   * The distance along the (unit) ray to the ground, up to maxT, null where it doesn't hit it before. Marched in steps
+   * of PICK_GROUND_STEP of the distance (a few hundred, once per grab), then halved down to the crossing. Where no
+   * tile is loaded there is no ground; with the elevation off it is flat at 0.
+   */
+  private groundDistance(origin: Vector3, direction: Vector3, maxT: number): number | null {
+    const above = (t: number): boolean | null => {
+      const x = origin.x + direction.x * t, z = origin.z + direction.z * t;
+      const ground = this.heightField.heightAt(x, z) ?? (this.flatGround() ? 0 : null);
+      return ground === null ? null : origin.y + direction.y * t > ground;
+    };
+    const minStep = PICK_GROUND_MIN_STEP_M * this.projection.metersToNorm;
+    let prev = CAMERA_NEAR;
+    if (above(prev) === false) return prev;
+    while (prev < maxT) {
+      const t = Math.min(prev + Math.max(prev * PICK_GROUND_STEP, minStep), maxT);
+      if (above(t) === false) {
+        let lo = prev, hi = t;
+        for (let i = 0; i < 16; i++) {
+          const mid = (lo + hi) * .5;
+          if (above(mid) === false) hi = mid;
+          else lo = mid;
+        }
+        return hi;
+      }
+      prev = t;
+    }
+    return null;
   }
 
   /**

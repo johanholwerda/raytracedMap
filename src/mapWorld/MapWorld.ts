@@ -162,7 +162,8 @@ export default class MapWorld {
     if (urlParams.has('video')) this.video = this.createVideo();
     this.renderer.setClearColor(0, 0, 0, 1);
 
-    this.cameraRig = new MapCameraRig(this.renderer, map.projection, map.heightField, () => !map.elevationEnabled);
+    this.cameraRig = new MapCameraRig(this.renderer, map.projection, map.heightField, () => !map.elevationEnabled,
+      (origin, direction) => map.buildingsEnabled ? this.mapRenderer.skyLightmap.cityScene.pick(origin, direction)?.t ?? null : null);
     this.mapRenderer = new MapRenderer(this.renderer, preloader, this.camera, map.projection, map.heightField);
     this.mapRenderer.onViewDistanceMaxChange = (distance) => {
       this.cameraRig.updateFarPlane(distance);
