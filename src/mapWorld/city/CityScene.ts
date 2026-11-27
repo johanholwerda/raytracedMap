@@ -153,13 +153,15 @@ export default class CityScene {
         words[w] = child >= CITY_LEAF ? (((child & ~CITY_LEAF) + offset) | CITY_LEAF) >>> 0 : child + offset;
       }
     }
-    //the starts of the edges and tree shapes of the records, of their atlas words (a word index) and their header
+    //the starts of the edges and tree shapes of the records, of their atlas words (a word index), their header and
+    //their wall bottoms (a half word index)
     const recordStart = block.nodeCount * 4;
     for (let r = 0; r < block.buildingCount + block.treeCount; r++) {
       const w = (recordStart + r * CITY_RECORD_VEC4S) * 4;
       words[w + 2] += offset;
       words[w + 4] += offset * 4;
       words[w + 6] += offset;
+      words[w + 7] += offset * 8;
     }
     this.renderer.device.queue.writeBuffer(this.buffer!, offset * 16, words.buffer, words.byteOffset, words.byteLength);
     this.tlasDirty = true;

@@ -305,7 +305,8 @@ fn getCityHitTieSurface(ro : vec3<f32>, rd : vec3<f32>, hit : CityHit) -> CityHi
 fn getCityHitSurface(ro : vec3<f32>, rd : vec3<f32>, hit : CityHit) -> CityHitSurface {
   let face = getCityHitFace(ro, rd, hit);
   let p = ro + rd * hit.t;
-  // the second vec4 of the record: its first atlas word, its roof chart and its header, see CityTraceBlock
+  // the second vec4 of the record: its first atlas word, its roof chart, its header and its first wall bottom, see
+  // CityTraceBlock
   let r1 = bitcast<vec4<u32>>(cityBuffer[hit.record + 1u]);
   var result = CityHitSurface(Surface(SURFACE_NONE, vec2(0.)), face.normal, false);
   if (face.face == CITY_FACE_ROOF) {
@@ -313,9 +314,13 @@ fn getCityHitSurface(ro : vec3<f32>, rd : vec3<f32>, hit : CityHit) -> CityHitSu
     result.valid = true;
   } else if (face.face != CITY_FACE_NONE) {
     let word = getCityWord(r1.x + face.face);
-    if (word != CITY_ATLAS_NONE) {
-      // the step of the words and the offset of their v, and the surface of the wall atlas of the tile
-      let header = cityBuffer[r1.z];
+    // the step of the words and the offset of their v, and the surface of the wall atlas of the tile
+    let header = cityBuffer[r1.z];
+    // how far above the base of the record the wall is drawn: below it the wall is inside another part, and has no
+    // place in the atlas (a v there is in another chunk)
+    let bottomIndex = r1.w + face.face;
+    let bottom = f32((getCityWord(bottomIndex >> 1u) >> ((bottomIndex & 1u) * 16u)) & 0xFFFFu) * header.y;
+    if (word != CITY_ATLAS_NONE && p.y >= cityBuffer[hit.record].x + bottom - header.y) {
       let start = vec2(f32(word & 0xFFFFu), f32(word >> 16u)) * header.y + vec2(0., header.z);
       result.surface = Surface(bitcast<u32>(header.x), start + vec2(face.along, p.y));
       result.valid = true;
