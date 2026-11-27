@@ -272,11 +272,9 @@ export default class MapRenderer {
     pgShading.addParamFloat('contrast', .2, 0, 1, params);
     const toneMap = pgShading.addParamBool('toneMap', true, { callback: (v) => {
       this.deferred.toneMap = v;
-      this.water.toneMap = v;
       this.dirty = true;
     } });
     this.deferred.toneMap = toneMap.value;
-    this.water.toneMap = toneMap.value;
     pgShading.addParamFloat('exposure', 1.5, 0, 4, params);
 
     this.water.initParams(pgShading, params, setDirty);
@@ -362,8 +360,7 @@ export default class MapRenderer {
   }
 
   // the materials the sun and sky params go to by their names: with the one that shades the ground in the water
-  // reflections, and the reduced pass of the reflections (the light of what its rays hit, and the fog, the contrast and
-  // the exposure the background color is turned back from)
+  // reflections, and the reduced pass of the reflections (the light of what its rays hit, and the fog on the way to it)
   private get shadingMaterials() {
     return [...this.materials, ...this.water.materials, ...this.water.reflectionMaterials];
   }

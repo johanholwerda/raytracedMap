@@ -48,3 +48,18 @@ override REFLECTION_BLOCK_Y : u32 = 2u;
 fn getReflectionSampleOffset(phase : u32) -> vec2<u32> {
   return vec2(phase % REFLECTION_BLOCK_X, phase / REFLECTION_BLOCK_X);
 }
+
+// The first word of a sample of the reduced pass, 4 x 8 bits (pack4x8unorm). Its first: 0 no water (no sample), else
+// REFLECTION_SAMPLE_SKY to 255 for the part of the ray that hits a building (hit, 0 to 1: less than 1 where the fog
+// takes a part of the hit, see waterReflectionColor.wgsl). Then the ray rd (* .5 + .5): the shading weighs a sample by
+// how alike its ray and the ray of the pixel are
+const REFLECTION_SAMPLE_SKY = 64.;
+
+fn packReflectionSample(hit : f32, rd : vec3<f32>) -> u32 {
+  return pack4x8unorm(vec4((REFLECTION_SAMPLE_SKY + (255. - REFLECTION_SAMPLE_SKY) * hit) / 255., rd * .5 + .5));
+}
+
+// the part of the ray of a sample that hits a building. s: its first word unpacked (unpack4x8unorm), not 0
+fn getReflectionSampleHit(s : vec4<f32>) -> f32 {
+  return saturate((s.x * 255. - REFLECTION_SAMPLE_SKY) / (255. - REFLECTION_SAMPLE_SKY));
+}

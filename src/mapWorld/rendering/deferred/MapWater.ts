@@ -93,16 +93,11 @@ export default class MapWater {
 
   /**
    * The materials of the reduced pass of the reflections: they read the lightmap (with its sun) for the light of what
-   * the rays hit, take the shading params by name (the light, the fog, the contrast, the exposure) and the albedos of
-   * the buildings and trees (reflectionBuildingAlbedo, reflectionTreeAlbedo).
+   * the rays hit, take the shading params by name (the light, the fog) and the albedos of the buildings and trees
+   * (reflectionBuildingAlbedo, reflectionTreeAlbedo).
    */
   public get reflectionMaterials(): VertexFragmentShader[] {
     return this.waterReflection.materials;
-  }
-
-  /** The tone map of the shading, which the background color of the fog in the reflections is turned back from. */
-  public set toneMap(value: boolean) {
-    this.waterReflection.toneMap = value;
   }
 
   // the buildings are in the water (a reflectionType that shows them)

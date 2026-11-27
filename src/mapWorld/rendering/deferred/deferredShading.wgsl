@@ -181,8 +181,9 @@ struct ShadowMapData {
 @group(0) @binding(22) var blueNoiseTexture : texture_2d<f32>;
 // the SSAO of this frame (SSAO_SKY): (visibility, sample count, camera distance, 0), see reprojectedSSAO.wgsl
 @group(0) @binding(23) var ssaoTexture : texture_2d<f32>;
-// the reflection rays of the water at half resolution (REFLECTIONS_HALF_RES): x 4 x 8 bits, 0 no water, .5 the ray reaches
-// the sky, 1 it hits a building, then the ray. y the color of what it hits (REFLECTION_COLORS), see waterReflectionHalfRes.wgsl
+// the reflection rays of the water at half resolution (REFLECTIONS_HALF_RES): x whether there is a sample, the part of
+// the ray that hits a building and the ray (packReflectionSample), y the color of what it hits (REFLECTION_COLORS), see
+// waterReflectionHalfRes.wgsl
 @group(0) @binding(24) var reflectionTexture : texture_2d<u32>;
 // the ground as the sun sees it (TerrainSunMap.ts): the hills for the ray traced sun shadows, see terrainSun.wgsl
 @group(0) @binding(25) var terrainSunMap : texture_2d<f32>;
@@ -212,15 +213,12 @@ struct VertexInput {
 
 struct VertexOutput {
   @builtin(position) position : vec4<f32>,
-  // the color the water reflections are fogged to, the same for every pixel: see getReflectionBackground
-  @location(0) @interpolate(flat) reflectionBackground : vec3<f32>,
 }
 
 @vertex
 fn vs_main(input : VertexInput) -> VertexOutput {
   var output : VertexOutput;
   output.position = vec4<f32>(input.position, 1.0);
-  output.reflectionBackground = getReflectionBackground();
   return output;
 }
 
@@ -438,7 +436,7 @@ const REFLECTION_RAY_MATCH = 256.;
 // water (no sample), else by how alike the 2 rays are. Never 0 on the water, so samples that all differ still count
 fn getReflectionSampleWeight(s : vec4<f32>, rd : vec3<f32>) -> f32 {
   let difference = s.yzw * 2. - 1. - rd;
-  return step(.25, s.x) * (exp(-REFLECTION_RAY_MATCH * dot(difference, difference)) + 1e-6);
+  return step(.5 / 255., s.x) * (exp(-REFLECTION_RAY_MATCH * dot(difference, difference)) + 1e-6);
 }
 
 // REFLECTIONS_HALF_RES: the part of the reflection of the water pixel (its ray rd) that hits a building, 0 to 1, from the
@@ -446,8 +444,9 @@ fn getReflectionSampleWeight(s : vec4<f32>, rd : vec3<f32>) -> f32 {
 // getReflectionSampleOffset of each block, so a pixel is on a sample or between 2 or 4 of them. Bilinearly, times
 // how alike the ray of the sample and rd are: the ripples turn the rays of neighbouring pixels degrees apart, and what a
 // ray hits follows its direction more than its pixel. Without it the reflections are a pixel softer. Only the samples on
-// the water count, none: no building. The colors of the samples (0 where a ray hit no building) with
-// the same weights: the rgb of the result, its a the part that hits
+// the water count, none: no building. A sample hits by the part of its hit the fog leaves (getReflectionSampleHit). The
+// colors of the samples (times that part, 0 where a ray hit no building) with the same weights: the rgb of the result,
+// its a the part that hits
 fn getHalfResReflection(coord : vec2<u32>, rd : vec3<f32>) -> vec4<f32> {
   let last = vec2<i32>(textureDimensions(reflectionTexture)) - 1;
   let block = vec2<i32>(vec2(REFLECTION_BLOCK_X, REFLECTION_BLOCK_Y));
@@ -477,7 +476,8 @@ fn getHalfResReflection(coord : vec2<u32>, rd : vec3<f32>) -> vec4<f32> {
   if (sum <= 0.) {
     return vec4(0.);
   }
-  let occluded = dot(w, step(vec4(.75), vec4(s00.x, s10.x, s01.x, s11.x))) / sum;
+  let occluded = dot(w, vec4(getReflectionSampleHit(s00), getReflectionSampleHit(s10), getReflectionSampleHit(s01),
+    getReflectionSampleHit(s11))) / sum;
   if (!REFLECTION_COLORS) {
     return vec4(0., 0., 0., occluded);
   }
@@ -611,9 +611,10 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
   if (WATER_REFLECTIONS && ((uniforms.waterMaterials >> materialIndex) & 1u) != 0u) {
     let rd = getWaterReflectionRay(n, world, d);
     // the part of the reflection that hits a building: the ray of the pixel (0 or 1), or the rays of the half resolution
-    // pass around it. With REFLECTION_COLORS the trace gives where it hits, which is lit by the lightmap there
+    // pass around it. With REFLECTION_COLORS the trace gives where it hits, which is lit by the lightmap there, and
+    // fades with the fog on the way to it: the part the fog leaves, the rest of the mirror is the sky's as without a hit
     var occluded = 0.;
-    // the color of the buildings in the mirror (REFLECTION_COLORS), linear
+    // the color of the buildings in the mirror (REFLECTION_COLORS), linear, times the part of them the fog leaves
     var reflected = vec3<f32>(0.);
     if (REFLECT_BUILDINGS) {
       if (REFLECTIONS_HALF_RES) {
@@ -624,9 +625,9 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
         if (REFLECTION_COLORS) {
           let hit = getOcclusionHit(world, rd);
           if (hit.t >= 0.) {
-            occluded = 1.;
-            reflected = getReflectionHitColor(world, rd, hit, LIGHTMAP_ENABLED && SUN_SHADOWS == 2u,
-              input.reflectionBackground);
+            let color = getReflectionHitColor(world, rd, hit, LIGHTMAP_ENABLED && SUN_SHADOWS == 2u);
+            occluded = color.a;
+            reflected = color.rgb;
           }
         } else {
           occluded = select(0., 1., isOccluded(world, rd));

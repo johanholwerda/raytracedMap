@@ -5,10 +5,10 @@
 // water pixel, which was more than half of its time at 4K.
 // With REFLECTION_COLORS the trace gives where the ray hits, which is lit by the lightmap there (see
 // waterReflectionColor.wgsl).
-// Out, rg32uint. x: 4 x 8 bits (pack4x8unorm), its first 0 no water (no sample), .5 the ray reaches the sky, 1 it hits a
-// building, then the ray (* .5 + .5): the shading weighs a sample by how alike its ray and the ray of the pixel are.
-// y: the color of the building the ray hits (linear like the shading, packReflectionColor), 0 without one. Without
-// REFLECTION_COLORS the target is r32uint, which keeps the x only.
+// Out, rg32uint. x: whether there is a sample, the part of the ray that hits a building and the ray, see
+// packReflectionSample of waterReflection.wgsl. y: the color of the building the ray hits (linear like the shading,
+// packReflectionColor) times the part of the hit the fog leaves, 0 without one. Without REFLECTION_COLORS the target is
+// r32uint, which keeps the x only.
 // 1 target: the shading has a texture less to bind, it has the 16 sampled textures a stage has by default
 // Needs cameraRay.wgsl, the includes of the lightmap resolve (SkyVisibilityLightmap.resolveIncludes, its uniforms are set
 // with the deferred shading's: SkyVisibilityLightmap.setResolveUniforms), waterReflection.wgsl,
@@ -36,13 +36,9 @@ struct Uniforms {
   // the city the rays trace, see CityScene.bind
   cityTileCount : u32,
   cityRoot : u32,
-  // the end of the shading, which the background color the colors are fogged to is turned back from (see
-  // getLinearFromDisplay)
-  backgroundColor : vec3<f32>,
+  // the fog between the water and what its rays hit, and the light and the albedos of what they hit, see
+  // waterReflectionColor.wgsl
   distanceFog : f32,
-  contrast : f32,
-  exposure : f32,
-  // the light and the albedos of what the rays hit, see waterReflectionColor.wgsl
   skyColor : vec3<f32>,
   reflectionUnseen : f32,
   sunColor : vec3<f32>,
@@ -72,8 +68,6 @@ struct Uniforms {
 
 // the rays are mirrored on the ripples of rippleTexture, else on the flat water: as the shading's
 override WATER_RIPPLES : bool = false;
-// the tone map of the shading (deferredShading.wgsl), for getLinearFromDisplay
-override TONE_MAP : bool = true;
 
 @group(0) @binding(0) var<uniform> uniforms : Uniforms;
 // the surface id, the normal and the material of the gBuffer, and its depth, see mapGBufferPacking.wgsl
@@ -95,15 +89,12 @@ struct VertexInput {
 
 struct VertexOutput {
   @builtin(position) position : vec4<f32>,
-  // the color the reflections are fogged to, the same for every pixel: see getReflectionBackground
-  @location(0) @interpolate(flat) reflectionBackground : vec3<f32>,
 }
 
 @vertex
 fn vs_main(input : VertexInput) -> VertexOutput {
   var output : VertexOutput;
   output.position = vec4<f32>(input.position, 1.0);
-  output.reflectionBackground = getReflectionBackground();
   return output;
 }
 
@@ -121,12 +112,12 @@ fn fs_main(input : VertexOutput) -> @location(0) vec2<u32> {
   let world = depthToPosition(d, uv * 2. - 1.);
   let rd = getWaterReflectionRay(getGBufferNormal(g), world, d);
   if (!REFLECTION_COLORS) {
-    return vec2(pack4x8unorm(vec4(select(.5, 1., isOccluded(world, rd)), rd * .5 + .5)), 0u);
+    return vec2(packReflectionSample(select(0., 1., isOccluded(world, rd)), rd), 0u);
   }
   let hit = getOcclusionHit(world, rd);
   if (hit.t >= 0.) {
-    let color = getReflectionHitColor(world, rd, hit, LIGHTMAP_SUN, input.reflectionBackground);
-    return vec2(pack4x8unorm(vec4(1., rd * .5 + .5)), packReflectionColor(color));
+    let color = getReflectionHitColor(world, rd, hit, LIGHTMAP_SUN);
+    return vec2(packReflectionSample(color.a, rd), packReflectionColor(color.rgb));
   }
-  return vec2(pack4x8unorm(vec4(.5, rd * .5 + .5)), 0u);
+  return vec2(packReflectionSample(0., rd), 0u);
 }

@@ -66,14 +66,9 @@ export default class WaterReflectionHalfRes {
     this.target.setSize(1, 1);
   }
 
-  /** The materials that take the params of the shading by name (the light, the fog, the contrast, the exposure), see waterReflectionColor.wgsl. */
+  /** The materials that take the params of the shading by name (the light, the fog), see waterReflectionColor.wgsl. */
   public get materials(): VertexFragmentShader[] {
     return [this.material];
-  }
-
-  /** The tone map of the shading (DeferredShading.toneMap), which the background color of the fog is turned back from. */
-  public set toneMap(value: boolean) {
-    this.material.setConstant('TONE_MAP', value);
   }
 
   /** The city the rays trace: CityScene sets its buffer and root on the material. */

@@ -6,12 +6,17 @@
 // camera, one behind another, a part off the screen) is shaded from its normal instead, see getUnseenReflectionColor.
 // The colors came from the image of the frame before (the TAA history at the hit point) before: a frame late, and only
 // where the screen showed the hit.
+// A hit fades with the fog on the way from it to the water (getReflectionFog): the colors come with the part of the hit
+// the fog leaves, and the rest of the mirror is the sky's, as where a ray hits nothing. The fog has the color of the
+// background, which is what the sky in the water is. The colors were mixed to the background color before, as the
+// linear color the shading turns into it (the contrast, the gamma and the tone map backwards): of a light sky that is
+// many times brighter than any face (a channel near 1 is at the end of the tone map), and at the part of it the
+// water takes it came out as a saturated color: far woods in the water were bright blue under an afternoon sky.
 // For the deferred shading (a ray per water pixel) and the reduced pass (waterReflectionHalfRes.wgsl, a ray per block).
 // Needs cityTraceDistance.wgsl, the lightmap resolve (SkyVisibilityLightmap.resolveIncludes, with its uniforms and
-// bindings) and the uniforms backgroundColor, distanceFog, contrast, exposure (see getLinearFromDisplay), skyColor,
-// sunColor, lightDirection, shadowStrength (see deferredShading.wgsl), reflectionUnseen, reflectionBuildingAlbedo,
-// reflectionTreeAlbedo (see getUnseenReflectionColor), reflectionLevelBias (see getReflectionLevel), and the override
-// TONE_MAP
+// bindings) and the uniforms distanceFog, skyColor, sunColor, lightDirection, shadowStrength (see deferredShading.wgsl),
+// reflectionUnseen, reflectionBuildingAlbedo, reflectionTreeAlbedo (see getUnseenReflectionColor) and
+// reflectionLevelBias (see getReflectionLevel)
 
 // the colors of what the rays hit. Else the buildings only darken the water
 override REFLECTION_COLORS : bool = false;
@@ -33,49 +38,6 @@ fn unpackReflectionColor(bits : u32) -> vec3<f32> {
   return vec3(rg, unpack2x16float(((bits >> 22u) & 0x3FFu) << 5u).x);
 }
 
-// The inverse of acesTonemap (toneMap.wgsl): its curve per channel between its 2 matrices is a ratio of 2 quadratics,
-// solved for its input. Exact up to the clamp to 1 of its output
-fn getInverseAcesTonemap(c : vec3<f32>) -> vec3<f32> {
-  let m1Inverse = mat3x3(
-    1.764741, -0.147028, -0.036337,
-    -0.675778, 1.160252, -0.162436,
-    -0.088963, -0.013224, 1.198773
-  );
-  let m2Inverse = mat3x3(
-    0.643038, 0.059269, 0.005962,
-    0.311187, 0.931436, 0.063929,
-    0.045775, 0.009295, 0.930118
-  );
-  // below the asymptote of the curve (1.0165)
-  let r = min(m2Inverse * c, vec3(1.));
-  // v * (v + .0245786) - .000090537 = r * (v * (.983729 * v + .432951) + .238081)
-  let a = 1. - .983729 * r;
-  let b = .0245786 - .432951 * r;
-  let k = -(.000090537 + .238081 * r);
-  let v = (-b + sqrt(max(b * b - 4. * a * k, vec3(0.)))) / (2. * a);
-  return max(m1Inverse * v, vec3(0.));
-}
-
-// The linear color of the shading (before the exposure) that it turned into the color c of the image, of a pixel that is
-// fogged by fog: the end of the shading (deferredShading.wgsl) backwards. The fog, the contrast (a smoothstep mixed in,
-// increasing: a few Newton steps), the gamma, the tone map and the exposure. For the background color the reflections
-// are fogged to, see getReflectionBackground
-fn getLinearFromDisplay(c : vec3<f32>, fog : f32) -> vec3<f32> {
-  let x = clamp((c - uniforms.backgroundColor * fog) / max(1. - fog, .01), vec3(0.), vec3(1.));
-  var y = x;
-  for (var i = 0; i < 3; i++) {
-    let f = mix(y, y * y * (3. - 2. * y), uniforms.contrast) - x;
-    let slope = mix(vec3(1.), 6. * y * (1. - y), uniforms.contrast);
-    y = clamp(y - f / slope, vec3(0.), vec3(1.));
-  }
-  var l = y * y;
-  if (TONE_MAP) {
-    l = getInverseAcesTonemap(l);
-  }
-  // a clamped bright pixel would come back far too bright
-  return min(l, vec3(4.)) / max(uniforms.exposure, 1e-4);
-}
-
 // The level of the lightmap texels of a hit at p (normal n): the one the pixels of the screen claim for p (getLevel, from
 // the camera to p), not one for the way through the mirror. A face in the mirror is mostly one the screen shows too, and
 // the lightmap only has the texels the screen claims: at the level of its pixels and ancestorLevels above it. A level
@@ -86,35 +48,28 @@ fn getReflectionLevel(p : vec3<f32>, n : vec3<f32>) -> f32 {
   return min(getLevel(p, n) + uniforms.reflectionLevelBias, f32(LEVEL_MAX));
 }
 
-// The linear color the reflections are fogged to: the one the shading turns into the background color. The same for
-// every pixel of a frame (the Newton steps and the inverse of the tone map of getLinearFromDisplay): the vertex stage
-// works it out and hands it to the fragments flat (the reflectionBackground of their input), instead of every hit
-// working it out again. 0 without REFLECTION_COLORS, nothing reads it then
-fn getReflectionBackground() -> vec3<f32> {
-  if (!REFLECTION_COLORS) {
-    return vec3(0.);
-  }
-  return getLinearFromDisplay(uniforms.backgroundColor, 0.);
+// The part of a hit at p the fog leaves in the mirror of the water point ro: by the way between them across the ground,
+// as getFog of the shading fogs a pixel by its distance to the camera
+fn getReflectionFog(ro : vec3<f32>, p : vec3<f32>) -> f32 {
+  return exp(-distance(p.xz, ro.xz) * uniforms.distanceFog);
 }
 
 // The linear color of a face of a building or a tree at p (normal n, albedo as the map color params, not squared) that a
 // mirror ray from the water point ro hit: lit as the deferred shading lights it, the sky by sky (the part of it the
-// point sees, cosine weighted) and the sun by n.l times sun (its visibility). Then fogged by the way from p to ro to
-// background (getReflectionBackground), as the shading fogs the water pixel by its own distance after
-fn shadeReflectionHit(ro : vec3<f32>, p : vec3<f32>, n : vec3<f32>, albedo : vec3<f32>, sky : f32, sun : f32,
-  background : vec3<f32>) -> vec3<f32> {
+// point sees, cosine weighted) and the sun by n.l times sun (its visibility). a: the part of the hit the fog leaves
+// (getReflectionFog), the color is times that
+fn shadeReflectionHit(ro : vec3<f32>, p : vec3<f32>, n : vec3<f32>, albedo : vec3<f32>, sky : f32, sun : f32) -> vec4<f32> {
   let skyLight = uniforms.skyColor * uniforms.skyColor * sky;
   let sunLight = uniforms.sunColor * uniforms.sunColor * (max(dot(n, uniforms.lightDirection), 0.) * sun);
   let surface = albedo * albedo * (skyLight + sunLight);
-  let way = 1. - exp(-distance(p.xz, ro.xz) * uniforms.distanceFog);
-  return mix(surface, background, way);
+  return vec4(surface, 1.) * getReflectionFog(ro, p);
 }
 
 // The color of a face the lightmap has no texels of (normal n, albedo as shadeReflectionHit): the sky of the open sky
 // the normal faces (n.y * .5 + .5, the shading's without the lightmap) times reflectionUnseen, which stands in for the
 // occlusion of the lightmap, and the sun by n.l, without its shadows
-fn getUnseenReflectionColor(ro : vec3<f32>, p : vec3<f32>, n : vec3<f32>, albedo : vec3<f32>, background : vec3<f32>) -> vec3<f32> {
-  return shadeReflectionHit(ro, p, n, albedo, (n.y * .5 + .5) * uniforms.reflectionUnseen, 1., background);
+fn getUnseenReflectionColor(ro : vec3<f32>, p : vec3<f32>, n : vec3<f32>, albedo : vec3<f32>) -> vec4<f32> {
+  return shadeReflectionHit(ro, p, n, albedo, (n.y * .5 + .5) * uniforms.reflectionUnseen, 1.);
 }
 
 // The lightmap at a surface (getCityFaceSurface of a face with normal n at p): the sky visibility and its paths, and
@@ -130,10 +85,10 @@ fn getReflectionLightmap(s : CityHitSurface, p : vec3<f32>, n : vec3<f32>, sun :
 // The linear color of what the mirror ray from the water point ro along rd hit (getOcclusionHit): lit by the lightmap at
 // the hit where it has texels there (REFLECTION_LIGHTMAP), else getUnseenReflectionColor: then only the face of the
 // hit is worked out, not where it is on the charts. Of 2 walls that coincide there (hit.tie) the one the lightmap has
-// the texels of: the one the screen shows.
+// the texels of: the one the screen shows. With the part of the hit the fog leaves in its a, see shadeReflectionHit.
 // sun: the texels of the lightmap hold the sun visibility too (see SkyVisibilityLightmap.setSun), else the sun is not
-// shadowed. background: getReflectionBackground
-fn getReflectionHitColor(ro : vec3<f32>, rd : vec3<f32>, hit : CityHit, sun : bool, background : vec3<f32>) -> vec3<f32> {
+// shadowed
+fn getReflectionHitColor(ro : vec3<f32>, rd : vec3<f32>, hit : CityHit, sun : bool) -> vec4<f32> {
   var face = getCityHitFace(ro, rd, hit);
   let p = ro + rd * hit.t;
   let albedo = select(uniforms.reflectionBuildingAlbedo, uniforms.reflectionTreeAlbedo, isCityHitTree(hit));
@@ -149,8 +104,8 @@ fn getReflectionHitColor(ro : vec3<f32>, rd : vec3<f32>, hit : CityHit, sun : bo
     }
     if (l.y > 0.) {
       let sunVisibility = mix(1., select(1., l.z, l.w > 0.), uniforms.shadowStrength);
-      return shadeReflectionHit(ro, p, face.normal, albedo, l.x, sunVisibility, background);
+      return shadeReflectionHit(ro, p, face.normal, albedo, l.x, sunVisibility);
     }
   }
-  return getUnseenReflectionColor(ro, p, face.normal, albedo, background);
+  return getUnseenReflectionColor(ro, p, face.normal, albedo);
 }
