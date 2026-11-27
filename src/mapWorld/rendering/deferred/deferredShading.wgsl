@@ -64,6 +64,8 @@ struct Uniforms {
   cityRoot : u32,
   // the size of the tile of rippleTexture in world units (WATER_RIPPLES), see getRippleNormal
   rippleTile : f32,
+  // the strength of the ripples 4 times smaller that fade in close up (WATER_RIPPLES), see getRippleNormal
+  rippleDetail : f32,
   // the brightness of the sun reflected in the water, times the sun color
   sunReflection : f32,
   // the phong exponent of the reflection of the sun: higher is a smaller, sharper glint per ripple

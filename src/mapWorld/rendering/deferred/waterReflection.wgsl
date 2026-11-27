@@ -1,12 +1,24 @@
 // The mirror ray of the water of MapWorld, for the deferred shading (deferredShading.wgsl) and the half resolution pass
 // of its reflections (waterReflectionHalfRes.wgsl): both trace the same ray for a pixel.
-// Needs uniforms.inverseProjection, resolution (of the gBuffer), cameraPosition and rippleTile, the bindings
+// Needs uniforms.inverseProjection, resolution (of the gBuffer), cameraPosition, rippleTile and rippleDetail, the bindings
 // rippleTexture and rippleSampler, and the override WATER_RIPPLES
 
 // The ripples are sampled over this many pixels, see getRippleNormal. Over 1 they change from pixel to pixel far away,
 // and what a mirror ray hits with them: the edge of a reflection is single pixels there, which flicker when the camera
 // moves (the TAA only averages them in a static view). Over 3 the ripples of a few pixels are left, the edge wobbles
 const RIPPLE_FOOTPRINT = 3.;
+
+// The texture holds ripples down to a fifth of its wavelength: close up they are many pixels wide and the water gets
+// smooth. There the texture is laid over itself again, this many times smaller and turned by RIPPLE_DETAIL_TURN (so the
+// two layers don't line up), with the same slopes: 4 times the ripples. It fades in between these pixels per smallest
+// ripple of the texture (its wavelength / 60, see WaterRippleTexture.ts), scaled by uniforms.rippleDetail
+const RIPPLE_DETAIL_SCALE = 4.;
+const RIPPLE_DETAIL_FADE = vec2(4., 12.);
+// a rotation of about 37 degrees
+const RIPPLE_DETAIL_TURN = mat2x2<f32>(.8, .6, -.6, .8);
+// the smallest ripple of the texture, in tiles: TILE_CELLS of WaterRippleTexture.ts, the finest of its three octaves
+// sqrt(5)^2 smaller
+const RIPPLE_SMALLEST = 1. / 60.;
 
 // the normal n of the water tilted by the ripples at world, d from the eye along view. Sampled over the footprint of the
 // pixel on the water, with explicit gradients (the branch of the water isn't uniform control flow): its side across the
@@ -17,12 +29,22 @@ const RIPPLE_FOOTPRINT = 3.;
 fn getRippleNormal(n : vec3<f32>, world : vec3<f32>, view : vec3<f32>, d : f32) -> vec3<f32> {
   let pixelAngle = 2. * uniforms.inverseProjection[1][1] / uniforms.resolution.y;
   // the size of a pixel at the water, in tiles
-  let pixel = RIPPLE_FOOTPRINT * d * pixelAngle / uniforms.rippleTile;
+  let screenPixel = d * pixelAngle / uniforms.rippleTile;
+  let pixel = RIPPLE_FOOTPRINT * screenPixel;
   let across = length(view.xz);
   // straight down: no direction along the view, and both sides the same
   let along = select(vec2(1., 0.), view.xz / max(across, 1e-6), across > 1e-4);
-  let g = textureSampleGrad(rippleTexture, rippleSampler, world.xz / uniforms.rippleTile, vec2(-along.y, along.x) * pixel,
-    along * (pixel / max(abs(view.y), .02))).xy;
+  let uv = world.xz / uniforms.rippleTile;
+  let sideAcross = vec2(-along.y, along.x) * pixel;
+  let sideAlong = along * (pixel / max(abs(view.y), .02));
+  var g = textureSampleGrad(rippleTexture, rippleSampler, uv, sideAcross, sideAlong).xy;
+  let detail = uniforms.rippleDetail * smoothstep(RIPPLE_DETAIL_FADE.x, RIPPLE_DETAIL_FADE.y, RIPPLE_SMALLEST / screenPixel);
+  if (detail > 0.) {
+    // h(4 R x) / 4: its gradient is R^T times the gradient of the texture there, the same slopes
+    let toDetail = RIPPLE_DETAIL_TURN * RIPPLE_DETAIL_SCALE;
+    let gd = textureSampleGrad(rippleTexture, rippleSampler, toDetail * uv + .37, toDetail * sideAcross, toDetail * sideAlong).xy;
+    g += (gd * RIPPLE_DETAIL_TURN) * detail;
+  }
   //the normal of the height field y = h(x, z) is (-dh/dx, 1, -dh/dz)
   return normalize(n + vec3(-g.x, 0., -g.y));
 }

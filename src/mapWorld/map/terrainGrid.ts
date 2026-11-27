@@ -95,6 +95,8 @@ export default class TerrainGrid {
   public readonly heights: Float32Array;
   // the unit normal of each grid point, xyz in engine space (y up, z south)
   private readonly normals: Float32Array;
+  // the heights with the ring of the neighbour tiles' around them, see the constructor and minHeight
+  private readonly bordered: Float32Array;
   private readonly dx: number;
   private readonly dy: number;
 
@@ -107,6 +109,7 @@ export default class TerrainGrid {
     public readonly x0: number, public readonly y0: number, public readonly x1: number, public readonly y1: number,
     bordered: Float32Array,
   ) {
+    this.bordered = bordered;
     const outer = Math.round(Math.sqrt(bordered.length));
     const n = this.cells = outer - 3;
     this.dx = (x1 - x0) / n;
@@ -189,28 +192,47 @@ export default class TerrainGrid {
 
   /**
    * The lowest ground under a footprint (ring [start, end) of coords): at its points and at the grid points inside it
-   * (the ground under a large building can dip below all its corners).
+   * (the ground under a large building can dip below all its corners). The footprint may reach a cell past the tile:
+   * there the ring of the neighbour tiles' heights is read, so a building the edge of 2 tiles cuts, whose whole
+   * footprint each tile has (the buffer of the vector tile, 1/64 of it: one cell at z14), stands on the same ground in
+   * both. Farther out the cell of the ring goes on.
    */
   public minHeight(coords: ArrayLike<number>, start: number, end: number): number {
+    const n = this.cells, outer = n + 3, b = this.bordered;
     let min = Infinity;
     let bx0 = Infinity, by0 = Infinity, bx1 = -Infinity, by1 = -Infinity;
     for (let k = start; k < end; k++) {
       const x = coords[k * 2], y = coords[k * 2 + 1];
-      min = Math.min(min, this.heightAt(x, y));
       bx0 = Math.min(bx0, x); bx1 = Math.max(bx1, x);
       by0 = Math.min(by0, y); by1 = Math.max(by1, y);
+      // heightAt on the cells from -1 to cells (the ring), see its sums
+      const i = Math.min(Math.max(Math.floor((x - this.x0) / this.dx), -1), n);
+      const j = Math.min(Math.max(Math.floor((y - this.y0) / this.dy), -1), n);
+      const u = (x - this.ringX(i)) / this.dx, v = (y - this.ringY(j)) / this.dy;
+      const o = (j + 1) * outer + i + 1;
+      const sw = b[o], ne = b[o + outer + 1];
+      const h = u >= v ? sw + u * (b[o + 1] - sw) + v * (ne - b[o + 1]) : sw + v * (b[o + outer] - sw) + u * (ne - b[o + outer]);
+      if (h < min) min = h;
     }
-    const side = this.cells + 1;
-    const i0 = Math.max(Math.ceil((bx0 - this.x0) / this.dx), 0), i1 = Math.min(Math.floor((bx1 - this.x0) / this.dx), this.cells);
-    const j0 = Math.max(Math.ceil((by0 - this.y0) / this.dy), 0), j1 = Math.min(Math.floor((by1 - this.y0) / this.dy), this.cells);
+    const i0 = Math.max(Math.ceil((bx0 - this.x0) / this.dx), -1), i1 = Math.min(Math.floor((bx1 - this.x0) / this.dx), n + 1);
+    const j0 = Math.max(Math.ceil((by0 - this.y0) / this.dy), -1), j1 = Math.min(Math.floor((by1 - this.y0) / this.dy), n + 1);
     for (let j = j0; j <= j1; j++) {
-      const y = this.gridY(j);
+      const y = this.ringY(j);
       for (let i = i0; i <= i1; i++) {
-        const h = this.heights[j * side + i];
-        if (h < min && insideRing(coords, start, end, this.gridX(i), y)) min = h;
+        const h = b[(j + 1) * outer + i + 1];
+        if (h < min && insideRing(coords, start, end, this.ringX(i), y)) min = h;
       }
     }
     return min;
+  }
+
+  // gridX and gridY on the ring too: column and row -1 and cells + 1, a cell out
+  private ringX(i: number): number {
+    return i < 0 ? this.x0 - this.dx : i > this.cells ? this.x1 + this.dx : this.gridX(i);
+  }
+
+  private ringY(j: number): number {
+    return j < 0 ? this.y0 - this.dy : j > this.cells ? this.y1 + this.dy : this.gridY(j);
   }
 
   /**
