@@ -19,8 +19,7 @@ import { ShadowMode } from '../MapWorldSettings';
 import ReprojectedSSAO, { SSAO_FADE_COUNT } from '../ssao/ReprojectedSSAO';
 import WaterReflectionHalfRes from './WaterReflectionHalfRes';
 import waterReflection from './waterReflection.wgsl?raw';
-import waterScreenReflection from './waterScreenReflection.wgsl?raw';
-import ScreenReflections from './ScreenReflections';
+import waterReflectionColor from './waterReflectionColor.wgsl?raw';
 import terrainSun from '../terrainSun.wgsl?raw';
 import terrainReflection from './terrainReflection.wgsl?raw';
 import terrainHorizonLookup from './terrainHorizonLookup.wgsl?raw';
@@ -31,8 +30,8 @@ import WaterTerrainHorizon from './WaterTerrainHorizon';
  * the shading params (sky, sun, fog, shadows) by name and read the sky visibility lightmap
  * (SkyVisibilityLightmap.addResolveMaterial).
  * The water reflections trace the city of the lightmap (CityScene), mirrored on the ripples of WaterRippleTexture, see
- * setWaterReflections: a ray per water pixel here, or the rays of WaterReflectionHalfRes. Over the screen first, with the
- * colors of what they hit there, see ScreenReflections and setScreenReflections. The sun shadows are the VSM cascades of SunShadows, or rays traced against the same city (per pixel
+ * setWaterReflections: a ray per water pixel here, or the rays of WaterReflectionHalfRes. What they hit is lit by the
+ * lightmap there, see setReflectionColors. The sun shadows are the VSM cascades of SunShadows, or rays traced against the same city (per pixel
  * or the texels of the lightmap), see setSunShadows.
  */
 export default class DeferredShading {
@@ -48,7 +47,7 @@ export default class DeferredShading {
   constructor(renderer: Renderer) {
     this.renderer = renderer;
     this.material = new VertexFragmentShader(renderer, 'mapDeferredShading', shader, {
-      includes: [toneMap, r2, cameraRay, ...SkyVisibilityLightmap.resolveIncludes, waterReflection, waterScreenReflection, skyVisibilityTrace, cityTraceDistance, terrainSun,
+      includes: [toneMap, r2, cameraRay, ...SkyVisibilityLightmap.resolveIncludes, waterReflection, waterReflectionColor, skyVisibilityTrace, cityTraceDistance, terrainSun,
         terrainReflection, terrainHorizonLookup],
       defines: CityScene.traceDefines,
       // about 600 ms to compile on a cold shader cache: the first frames are empty instead of stalled
@@ -177,12 +176,12 @@ export default class DeferredShading {
   }
 
   /**
-   * The rays of the buildings in the water over the screen first, with the colors of what they hit there
-   * (SCREEN_REFLECTIONS). Every frame before draw, with the state ScreenReflections.update made: the ray per water pixel
-   * here, and the samples of WaterReflectionHalfRes (setWaterReflections) only blend their colors with it.
+   * The buildings and trees in the water in their colors, lit by the lightmap where the rays hit them
+   * (REFLECTION_COLORS, see waterReflectionColor.wgsl), else they only darken it. For the ray per water pixel here, and
+   * the colors of the samples of WaterReflectionHalfRes (setWaterReflections), which it blends.
    */
-  public setScreenReflections(screen: ScreenReflections): void {
-    for (const m of this.materials) screen.bind(m);
+  public setReflectionColors(enabled: boolean): void {
+    for (const m of this.materials) m.setConstant('REFLECTION_COLORS', enabled);
   }
 
   /**

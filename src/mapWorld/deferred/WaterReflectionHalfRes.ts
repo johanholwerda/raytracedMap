@@ -4,16 +4,15 @@ import VertexFragmentShader from 'webGPU-framework/renderer/material/VertexFragm
 import Camera from 'webGPU-framework/renderer/camera/Camera';
 import Vector2 from 'webGPU-framework/renderer/math/Vector2';
 import cameraRay from '../cameraRay.wgsl?raw';
-import cityLightmapSurface from '../city/cityLightmapSurface.wgsl?raw';
 import skyVisibilityTrace from '../skyVisibilityLightmap/skyVisibilityTrace.wgsl?raw';
 import cityTraceDistance from './cityTraceDistance.wgsl?raw';
 import CityScene from '../city/CityScene';
 import WaterRippleTexture from './waterRipples/WaterRippleTexture';
 import MapGBuffer from './MapGBuffer';
 import waterReflection from './waterReflection.wgsl?raw';
-import waterScreenReflection from './waterScreenReflection.wgsl?raw';
+import waterReflectionColor from './waterReflectionColor.wgsl?raw';
 import shader from './waterReflectionHalfRes.wgsl?raw';
-import ScreenReflections from './ScreenReflections';
+import SkyVisibilityLightmap from '../skyVisibilityLightmap/SkyVisibilityLightmap';
 
 /**
  * The buildings in the water reflections of MapWorld with fewer rays (waterReflectionHalfRes.wgsl): the reflection ray
@@ -23,8 +22,8 @@ import ScreenReflections from './ScreenReflections';
  * The rays were more than half of the deferred shading at 4K with a quarter of the screen water (1.05 of 1.7 ms on an
  * RTX 3080). This pass takes .7 ms for half of them and .4 for a quarter: a ray costs about 1.4x as much here as in the
  * shading, whose other work overlaps with it.
- * The colors of what the rays hit, from the screen (ScreenReflections), go into the samples too,
- * which the shading blends with the same weights.
+ * The colors of what the rays hit, lit by the lightmap there (waterReflectionColor.wgsl), go into the samples too,
+ * which the shading blends with the same weights. The material reads the lightmap: SkyVisibilityLightmap.addResolveMaterial.
  * The traced pixel of the blocks rotates per frame (rotate, with the TAA): its history averages them, which in a static
  * view is every pixel traced. Without it the sample is always the first pixel of the block.
  */
@@ -44,7 +43,7 @@ export default class WaterReflectionHalfRes {
   constructor(renderer: Renderer) {
     this.renderer = renderer;
     this.material = new VertexFragmentShader(renderer, 'waterReflectionHalfRes', shader, {
-      includes: [cameraRay, cityLightmapSurface, ...MapGBuffer.readIncludes, waterReflection, waterScreenReflection, skyVisibilityTrace, cityTraceDistance],
+      includes: [cameraRay, ...SkyVisibilityLightmap.resolveIncludes, waterReflection, waterReflectionColor, skyVisibilityTrace, cityTraceDistance],
       defines: CityScene.traceDefines,
     });
     this.material.depthWriteEnabled = false;
@@ -54,12 +53,12 @@ export default class WaterReflectionHalfRes {
     this.target = new RenderTexture(renderer, 1, 1, { formats: ['rg32uint'], sampleCount: 1 });
   }
 
-  /** The materials that take the params of the shading by name (the fog, the contrast, the exposure), see ScreenReflections. */
+  /** The materials that take the params of the shading by name (the light, the fog, the contrast, the exposure), see waterReflectionColor.wgsl. */
   public get materials(): VertexFragmentShader[] {
     return [this.material];
   }
 
-  /** The tone map of the shading (DeferredShading.toneMap), which the colors of the screen are turned back from. */
+  /** The tone map of the shading (DeferredShading.toneMap), which the background color of the fog is turned back from. */
   public set toneMap(value: boolean) {
     this.material.setConstant('TONE_MAP', value);
   }
@@ -118,9 +117,10 @@ export default class WaterReflectionHalfRes {
   /**
    * The samples of the gBuffer of this frame, before the shading. waterMaterials and rippleTile: as
    * DeferredShading.setWaterReflections takes them. rotate: another pixel of the blocks every frame, for a TAA to average.
-   * screen: the colors of what the rays hit, see ScreenReflections.
+   * colors: the colors of what the rays hit (REFLECTION_COLORS, see DeferredShading.setReflectionColors). After
+   * SkyVisibilityLightmap.setResolveUniforms, which sets the lightmap's.
    */
-  public draw(camera: Camera, gBuffer: MapGBuffer, waterMaterials: number, rippleTile: number, rotate: boolean, screen: ScreenReflections): void {
+  public draw(camera: Camera, gBuffer: MapGBuffer, waterMaterials: number, rippleTile: number, rotate: boolean, colors: boolean): void {
     const size = gBuffer.target.size;
     // rounded up: the samples cover every pixel
     this.target.setSize(Math.ceil(size.x / this._blockX), Math.ceil(size.y / this._blockY));
@@ -140,7 +140,7 @@ export default class WaterReflectionHalfRes {
     m.setTexture('gBufferTexture', gBuffer.view);
     m.setTexture('gBufferDepth', gBuffer.depthView);
     m.setMatrix('viewProjection', camera.viewProjection);
-    screen.bind(m);
+    m.setConstant('REFLECTION_COLORS', colors);
     this.renderer.blit(null, this.target, m);
   }
 

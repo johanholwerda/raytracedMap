@@ -117,6 +117,8 @@ export default class SkyVisibilityLightmap {
   private resolveMaterials: ShaderBase[] = [];
   //the ones of them with the debug views and the switches as overrides (deferredShading.wgsl), see setResolveUniforms
   private viewMaterials = new Set<ShaderBase>();
+  //the ones of them with the override LIGHTMAP_SUN, see setSun
+  private sunMaterials: ShaderBase[] = [];
   //the includes of a material that reads the lightmap (deferredShading.wgsl)
   public static readonly resolveIncludes = [hash, cityLightmapSurface, gBufferPacking, cityLightmap, skyVisibilityTexel, skyVisibilityResolve];
 
@@ -405,7 +407,7 @@ export default class SkyVisibilityLightmap {
     if (enabled !== this.sunEnabled) {
       this.sunEnabled = enabled;
       //the half resolution pass looks up the sun with the sky
-      for (const s of [...this.updateShaders, ...this.halfResPass.materials]) s.setConstant('LIGHTMAP_SUN', enabled);
+      for (const s of [...this.updateShaders, ...this.halfResPass.materials, ...this.sunMaterials]) s.setConstant('LIGHTMAP_SUN', enabled);
       //made again at the size with or without the sun half in the next update
       this.size = 0;
       this.markChanged();
@@ -428,10 +430,14 @@ export default class SkyVisibilityLightmap {
   /**
    * A material (with resolveIncludes) that reads the lightmap, see deferredShading.wgsl. views: it has the debug views,
    * the overrides LIGHTMAP_VIEW (see view) and HALF_RES_BILINEAR (LightmapResolution.HalfBilinear): a change of them makes its pipeline
-   * again
+   * again. sun: it has the override LIGHTMAP_SUN, whether the texels hold the sun visibility too (see setSun)
    */
-  public addResolveMaterial(material: ShaderBase, views = false): void {
+  public addResolveMaterial(material: ShaderBase, views = false, sun = false): void {
     this.resolveMaterials.push(material);
+    if (sun) {
+      this.sunMaterials.push(material);
+      material.setConstant('LIGHTMAP_SUN', this.sunEnabled);
+    }
     if (views) {
       this.viewMaterials.add(material);
       material.setConstant('LIGHTMAP_VIEW', this._view);

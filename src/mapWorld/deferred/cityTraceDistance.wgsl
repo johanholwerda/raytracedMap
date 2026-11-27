@@ -1,19 +1,40 @@
-// isOccluded of skyVisibilityTrace.wgsl with the distance to the hit, for the water reflections: the color of what a
-// ray hits is looked up on the screen at that point (see waterScreenReflection.wgsl). The nearest hit: the traversal
-// goes on after a hit, through the boxes the ray enters before it. The first hit found (as isOccluded) was often a part
-// of a building behind another part of it (their boxes overlap), whose point the screen doesn't show. With the record
-// it hits, whose normal there (getCityHitNormal) shades a hit the screen doesn't show (getUnseenReflectionColor of
-// waterScreenReflection.wgsl). Needs skyVisibilityTrace.wgsl
+// isOccluded of skyVisibilityTrace.wgsl with the distance to the hit, for the water reflections: what a ray hits is
+// lit by the lightmap at that point (see waterReflectionColor.wgsl). The nearest hit: the traversal goes on after a
+// hit, through the boxes the ray enters before it. The first hit found (as isOccluded) was often a part of a building
+// behind another part of it (their boxes overlap). With the record it hits, whose face there (getCityHitSurface) is on
+// a chart of the lightmap: the atlas words of the CityTraceBlock (cityLayout.ts). Needs skyVisibilityTrace.wgsl and
+// cityLightmapSurface.wgsl
 
 // what a ray hits: t -1 when it reaches the sky, record: the building or tree record (a vec4 index of cityBuffer). Not
 // the normal: kept from the trace through the lookups on the screen it made the deferred shading .1 ms slower at 4K
-// with a ray per water pixel (registers), getCityHitNormal works it out only for the hits that need it
+// with a ray per water pixel (registers), getCityHitSurface works out the face only for the hits that need it
 struct CityHit {
   t : f32,
   record : u32,
 }
 
 const CITY_HIT_NONE = CityHit(-1., 0u);
+
+// an atlas word of a wall that has no place in the wall atlas, see CityTraceBlock in cityLayout.ts
+const CITY_ATLAS_NONE = 0xFFFFFFFFu;
+// the face of CityFace that is the roof of a building (the top of the crown of a tree), and a face that is on no chart
+// of the lightmap: a floor, the underside of a crown, the top of a trunk (inside the crown)
+const CITY_FACE_ROOF = 0xFFFFFFFEu;
+const CITY_FACE_NONE = 0xFFFFFFFFu;
+
+// The face of a building or tree a ray enters: its normal (against the ray), which face it is (a wall: the index of its
+// atlas word from the first one of the record, see CityTraceBlock; or CITY_FACE_ROOF or CITY_FACE_NONE), and on a wall
+// how far the point is from where the wall starts, in world units: its u from the u of the wall's atlas word
+struct CityFace {
+  normal : vec3<f32>,
+  face : u32,
+  along : f32,
+}
+
+// a word of cityBuffer, at a word index (4 per vec4)
+fn getCityWord(index : u32) -> u32 {
+  return bitcast<u32>(cityBuffer[index >> 2u][index & 3u]);
+}
 
 // where the ray enters the building of r0 (its walls, or its roof or floor plane inside the footprint), -1 when it
 // misses: as hitsBuilding, the nearest of the walls instead of the first
@@ -89,13 +110,15 @@ fn getTreeHitDistance(ro : vec3<f32>, rd : vec3<f32>, r0 : vec4<f32>) -> f32 {
   return select(-1., t, t < 1e30);
 }
 
-// The normal of the building of r0 at p, a point on it where the ray along rd enters it (getBuildingHitDistance): of
-// its roof or floor plane, or of the wall nearest to p, whichever p is closer to. Against the ray
-fn getBuildingNormal(p : vec3<f32>, rd : vec3<f32>, r0 : vec4<f32>) -> vec3<f32> {
+// The face of the building of r0 at p, a point on it where the ray along rd enters it (getBuildingHitDistance): its
+// roof or floor plane, or the wall nearest to p, whichever p is closer to. A wall is its edge, whose atlas word has the
+// same index
+fn getBuildingFace(p : vec3<f32>, rd : vec3<f32>, r0 : vec4<f32>) -> CityFace {
   let edgeStart = bitcast<u32>(r0.z);
   let edgeCount = bitcast<u32>(r0.w);
   var nearest = min(abs(p.y - r0.y), abs(p.y - r0.x));
-  var normal = vec3(0., -sign(rd.y), 0.);
+  // a cap: the roof when the ray comes down on it
+  var face = CityFace(vec3(0., -sign(rd.y), 0.), select(CITY_FACE_NONE, CITY_FACE_ROOF, rd.y < 0.), 0.);
   for (var i = 0u; i < edgeCount; i++) {
     let e = cityBuffer[edgeStart + i];
     let d = e.zw - e.xy;
@@ -104,15 +127,17 @@ fn getBuildingNormal(p : vec3<f32>, rd : vec3<f32>, r0 : vec4<f32>) -> vec3<f32>
     if (distance < nearest) {
       nearest = distance;
       let n = normalize(vec3(d.y, 0., -d.x));
-      normal = select(n, -n, dot(n, rd) > 0.);
+      face = CityFace(select(n, -n, dot(n, rd) > 0.), i, length(w));
     }
   }
-  return normal;
+  return face;
 }
 
-// The normal of the tree of r0 where the ray enters it at distance t (getTreeHitDistance): of the face of the crown or
-// trunk box it enters, on the axis it enters last. Against the ray
-fn getTreeNormal(ro : vec3<f32>, rd : vec3<f32>, t : f32, r0 : vec4<f32>) -> vec3<f32> {
+// The face of the tree of r0 where the ray enters it at distance t (getTreeHitDistance): the face of the crown or trunk
+// box it enters, on the axis it enters last. Its walls are the edges of square in worldTrees.ts, which go around the
+// corners (-1, 1), (1, 1), (1, -1), (-1, -1) of the box (x on u, z on v, in half widths of the crown): +z, +x, -z, -x.
+// Their atlas words are those of the trunk (0 to 3), then of the crown (4 to 7)
+fn getTreeFace(ro : vec3<f32>, rd : vec3<f32>, t : f32, r0 : vec4<f32>) -> CityFace {
   let shape = bitcast<u32>(r0.z);
   let s0 = cityBuffer[shape];
   let s1 = cityBuffer[shape + 1u];
@@ -134,7 +159,27 @@ fn getTreeNormal(ro : vec3<f32>, rd : vec3<f32>, t : f32, r0 : vec4<f32>) -> vec
   let local = -sign(d) * axis;
   // the x and z axes of the boxes are u and v divided by their length squared: back along their directions
   let uDir = normalize(u);
-  return vec3(local.x * uDir.x - local.z * uDir.y, local.y, local.x * uDir.y + local.z * uDir.x);
+  let normal = vec3(local.x * uDir.x - local.z * uDir.y, local.y, local.x * uDir.y + local.z * uDir.x);
+  // the point in the box, and the half width of the box in world units (u has the length 1 / the crown half width)
+  let q = p + d * t;
+  let halfWidth = select(k, 1., crown);
+  let scale = 1. / length(u);
+  var face = CityFace(normal, CITY_FACE_NONE, 0.);
+  if (axis.y > 0.) {
+    if (crown && local.y > 0.) {
+      face.face = CITY_FACE_ROOF;
+    }
+    return face;
+  }
+  if (axis.x > 0.) {
+    face.face = select(3u, 1u, local.x > 0.);
+    face.along = select(q.z + halfWidth, halfWidth - q.z, local.x > 0.) * scale;
+  } else {
+    face.face = select(2u, 0u, local.z > 0.);
+    face.along = select(halfWidth - q.x, q.x + halfWidth, local.z > 0.) * scale;
+  }
+  face.face += select(0u, 4u, crown);
+  return face;
 }
 
 fn getRecordHitDistance(ro : vec3<f32>, rd : vec3<f32>, record : u32) -> f32 {
@@ -215,11 +260,42 @@ fn isCityHitTree(hit : CityHit) -> bool {
   return bitcast<u32>(cityBuffer[hit.record].w) == CITY_TREE;
 }
 
-// the normal of the face the ray from ro along rd enters at the hit of getOcclusionHit, against the ray
-fn getCityHitNormal(ro : vec3<f32>, rd : vec3<f32>, hit : CityHit) -> vec3<f32> {
+// the face the ray from ro along rd enters at the hit of getOcclusionHit
+fn getCityHitFace(ro : vec3<f32>, rd : vec3<f32>, hit : CityHit) -> CityFace {
   let r0 = cityBuffer[hit.record];
   if (bitcast<u32>(r0.w) == CITY_TREE) {
-    return getTreeNormal(ro, rd, hit.t, r0);
+    return getTreeFace(ro, rd, hit.t, r0);
   }
-  return getBuildingNormal(ro + rd * hit.t, rd, r0);
+  return getBuildingFace(ro + rd * hit.t, rd, r0);
+}
+
+// where the hit of getOcclusionHit is on the charts of the lightmap (the surfaces of getAttributeSurface, the same the
+// gBuffer has there), and the normal of its face. valid false: a face on no chart (CITY_FACE_NONE, a wall without a
+// place in the atlas)
+struct CityHitSurface {
+  surface : Surface,
+  normal : vec3<f32>,
+  valid : bool,
+}
+
+fn getCityHitSurface(ro : vec3<f32>, rd : vec3<f32>, hit : CityHit) -> CityHitSurface {
+  let face = getCityHitFace(ro, rd, hit);
+  let p = ro + rd * hit.t;
+  // the second vec4 of the record: its first atlas word, its roof chart and its header, see CityTraceBlock
+  let r1 = bitcast<vec4<u32>>(cityBuffer[hit.record + 1u]);
+  var result = CityHitSurface(Surface(SURFACE_NONE, vec2(0.)), face.normal, false);
+  if (face.face == CITY_FACE_ROOF) {
+    result.surface = getRoofSurface(r1.y, p);
+    result.valid = true;
+  } else if (face.face != CITY_FACE_NONE) {
+    let word = getCityWord(r1.x + face.face);
+    if (word != CITY_ATLAS_NONE) {
+      // the step of the words and the offset of their v, and the surface of the wall atlas of the tile
+      let header = cityBuffer[r1.z];
+      let start = vec2(f32(word & 0xFFFFu), f32(word >> 16u)) * header.y + vec2(0., header.z);
+      result.surface = Surface(bitcast<u32>(header.x), start + vec2(face.along, p.y));
+      result.valid = true;
+    }
+  }
+  return result;
 }

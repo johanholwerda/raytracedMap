@@ -93,11 +93,6 @@ export default class TAA {
     this.staticFrames = 0;
   }
 
-  /** Whether output holds an image of the canvas size, resolved for the camera of viewProjectionOldNoJitter until the next resolve. */
-  public get hasHistory(): boolean {
-    return this.historyValid && this.sizeValid;
-  }
-
   /** The latest resolved image. */
   public get output(): RenderTexture {
     return this.histories[this.historyIndex];

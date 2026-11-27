@@ -4,7 +4,7 @@ import LogGL from 'webGPU-framework/renderer/core/LogGL';
 import Vector3 from 'webGPU-framework/renderer/math/Vector3';
 import { isMobile } from 'webGPU-framework/renderer/utils/Browser';
 import ModelBVH from './ModelBVH';
-import { CITY_LEAF, TOP_DEPTH_MAX } from './cityLayout';
+import { CITY_LEAF, CITY_RECORD_VEC4S, TOP_DEPTH_MAX } from './cityLayout';
 import type { CityTraceBlock } from './cityLayout';
 import { intersectTraceBlock } from './cityPick';
 
@@ -153,9 +153,14 @@ export default class CityScene {
         words[w] = child >= CITY_LEAF ? (((child & ~CITY_LEAF) + offset) | CITY_LEAF) >>> 0 : child + offset;
       }
     }
-    //the starts of the edges and tree shapes of the records
+    //the starts of the edges and tree shapes of the records, of their atlas words (a word index) and their header
     const recordStart = block.nodeCount * 4;
-    for (let r = 0; r < block.buildingCount + block.treeCount; r++) words[(recordStart + r) * 4 + 2] += offset;
+    for (let r = 0; r < block.buildingCount + block.treeCount; r++) {
+      const w = (recordStart + r * CITY_RECORD_VEC4S) * 4;
+      words[w + 2] += offset;
+      words[w + 4] += offset * 4;
+      words[w + 6] += offset;
+    }
     this.renderer.device.queue.writeBuffer(this.buffer!, offset * 16, words.buffer, words.byteOffset, words.byteLength);
     this.tlasDirty = true;
     this.addChange(block);

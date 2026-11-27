@@ -1,4 +1,4 @@
-import { CITY_LEAF, CITY_TREE } from './cityLayout';
+import { CITY_LEAF, CITY_RECORD_VEC4S, CITY_TREE } from './cityLayout';
 import type { CityTraceBlock } from './cityLayout';
 
 /*
@@ -107,7 +107,7 @@ export function intersectTraceBlock(block: CityTraceBlock, ro: number[], rd: num
         const t = u[record * 4 + 3] === CITY_TREE ? intersectTree(f, u, record, ro, rd) : intersectBuilding(f, u, record, ro, rd);
         if (t < best) {
           best = t;
-          bestRecord = record - recordStart;
+          bestRecord = (record - recordStart) / CITY_RECORD_VEC4S;
         }
       } else if (nearChild < 0) {
         nearChild = child;

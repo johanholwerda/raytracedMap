@@ -822,7 +822,8 @@ export function buildBuildings(
   // The ground plane of the ray tracing is the ground quad (y 0), the layers lie a few cm over it (see LAYER_GAP). On
   // the terrain the bases are on the ground already
   const buildingFootprints = footprints.slice(0, treeStart);
-  const trace = buildTraceBlock(buildingFootprints, traceTrees, terrain ? null : 0, buildingFootprints.map((fp) => fp.id));
+  const trace = buildTraceBlock(buildingFootprints, traceTrees, terrain ? null : 0,
+    { layout, pointStarts, edgeBottoms, treeFootprints: footprints.slice(treeStart), treeStart }, buildingFootprints.map((fp) => fp.id));
   const { interleaved, quantization } = interleaveVertices(verts, min, max);
   return {
     vertexCount: verts.count, quantization, interleaved,

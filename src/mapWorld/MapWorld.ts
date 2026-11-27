@@ -23,7 +23,6 @@ import TAA from './taa/TAA';
 import MapGBuffer from './deferred/MapGBuffer';
 import DeferredShading from './deferred/DeferredShading';
 import WaterReflectionHalfRes from './deferred/WaterReflectionHalfRes';
-import ScreenReflections from './deferred/ScreenReflections';
 import WaterTerrainHorizon from './deferred/WaterTerrainHorizon';
 import { NOTABLE_BUILDINGS } from './map/notableBuildings';
 import { describeCity, findCity, pickRandomCity, pickStartCity } from './map/worldCities';
@@ -190,9 +189,8 @@ export default class MapWorld {
   private reflectionRays!: ParamSelect;
   // traces them when that is more than 1 pixel, before the shading
   private waterReflection!: WaterReflectionHalfRes;
-  // the colors of the buildings in the water from the screen (see ScreenReflections), and its param
-  private screenReflections!: ScreenReflections;
-  private screenReflectionsParam!: ParamBool;
+  // the buildings in the water in their colors, lit by the lightmap (see waterReflectionColor.wgsl)
+  private reflectionColors!: ParamBool;
   // the ground in the reflections of the buildings, where it is in reach: see updateTerrainReflection. From its horizon
   // over the water, per block of pixels
   private terrainHorizon!: WaterTerrainHorizon;
@@ -364,7 +362,8 @@ export default class MapWorld {
     this.waterReflection = new WaterReflectionHalfRes(this.renderer);
     this.waterReflection.bindCity(this.skyLightmap.cityScene);
     this.waterReflection.bindWaterRipples(this.ripples);
-    this.screenReflections = new ScreenReflections(this.renderer);
+    // the colors of what its rays hit are lit by the lightmap
+    for (const material of this.waterReflection.materials) this.skyLightmap.addResolveMaterial(material, false, true);
     this.terrainHorizon = new WaterTerrainHorizon(this.renderer, this.gBuffer);
     this.deferred.bindTerrainHorizon(this.terrainHorizon);
     for (const layer of this.geometry.layers) {
@@ -742,8 +741,7 @@ export default class MapWorld {
         this.dirty = true;
       } });
     };
-    // the albedo of a building or tree in the water reflections that the screen doesn't show, see
-    // getUnseenReflectionColor in waterScreenReflection.wgsl
+    // the albedo of a building or tree in the water reflections, see shadeReflectionHit in waterReflectionColor.wgsl
     const setReflectionAlbedo = (name: string, v: Vector3) => {
       for (const m of [...this.deferred.materials, ...this.waterReflection.materials]) m.setVector3(name, v);
     };
@@ -816,13 +814,18 @@ export default class MapWorld {
     this.reflectTerrain = waterGroup.addParamBool('reflectTerrain', true, { callback: setDirty });
     this.reflectionRays = waterGroup.addParamSelect('reflectionRays', ReflectionRays.PerPixel, REFLECTION_RAYS, { callback: setDirty });
     this.reflectionDarkening = waterGroup.addParamFloat('reflectionDarkening', .5, 0, 1, { callback: setDirty });
-    // the buildings and trees in the water in their colors from the screen, else they only darken it
-    this.screenReflectionsParam = waterGroup.addParamBool('screenReflections', true, { callback: setDirty });
-    // how much of the darkening the color of a building on the screen gives back, see deferredShading.wgsl
+    // the buildings and trees in the water in their colors, lit by the lightmap where the rays hit them, else they only
+    // darken it
+    this.reflectionColors = waterGroup.addParamBool('reflectionColors', true, { callback: setDirty });
+    // how much of the darkening the color of a building gives back, see deferredShading.wgsl
     waterGroup.addParamFloat('reflectionColor', 1, 0, 1, params);
-    // the sky light of a building in the water that the screen doesn't show (an underside), a part of the open sky's: in
-    // place of the occlusion of the lightmap. Its sun is by the normal, see getUnseenReflectionColor
+    // the sky light of a building in the water that the lightmap has no texels of (an underside, a side away from the
+    // camera), a part of the open sky's: in place of the occlusion of the lightmap. Its sun is by the normal, see
+    // getUnseenReflectionColor
     waterGroup.addParamFloat('reflectionUnseen', .5, 0, 1, params);
+    // the lightmap levels the reflections read coarser than a surface at their distance would: the ripples blur them,
+    // and the coarser levels have their tiles more often, see getReflectionLevel
+    waterGroup.addParamFloat('reflectionLevelBias', 1, 0, 4, params);
     this.waterRipples = waterGroup.addParamBool('waterRipples', true, { callback: setDirty });
     const updateRipples = () => {
       // the bake scales the gradient by the height, which makes the slope of the ripples independent of their wavelength
@@ -998,8 +1001,8 @@ export default class MapWorld {
   }
 
   // the materials the sun and sky params go to by their names: with the one that shades the ground in the water
-  // reflections, and the reduced pass of the reflections (the fog, the contrast and the exposure the colors of the
-  // screen are turned back from)
+  // reflections, and the reduced pass of the reflections (the light of what its rays hit, and the fog, the contrast and
+  // the exposure the background color is turned back from)
   private get shadingMaterials() {
     return [...this.materials, ...this.terrainHorizon.materials, ...this.waterReflection.materials];
   }
@@ -1359,12 +1362,12 @@ export default class MapWorld {
       const reflectionPass = reflections && reflectBuildings && blockX * blockY > 1 ? this.waterReflection : null;
       // the ground in them: its horizon over the water, which the rays are compared with
       if (reflections && reflectBuildings && this.reflectTerrainInWater) this.terrainHorizon.draw(this.camera, this.gBuffer, this.waterMaterials);
-      // their colors from the image of the frame before (the TAA has not resolved this one yet)
-      this.screenReflections.update(reflections && reflectBuildings && this.screenReflectionsParam.value, this.taa);
-      this.deferred.setScreenReflections(this.screenReflections);
+      // their colors, lit by the lightmap where they hit
+      const reflectionColors = reflections && reflectBuildings && this.reflectionColors.value;
+      this.deferred.setReflectionColors(reflectionColors);
       if (reflectionPass) {
         reflectionPass.setBlock(blockX, blockY);
-        reflectionPass.draw(this.camera, this.gBuffer, this.waterMaterials, rippleTile, this.taa.enabled.value && isStatic, this.screenReflections);
+        reflectionPass.draw(this.camera, this.gBuffer, this.waterMaterials, rippleTile, this.taa.enabled.value && isStatic, reflectionColors);
       }
       this.deferred.setWaterReflections(reflections ? this.waterMaterials : 0, reflectBuildings, this.reflectionDarkening.value, rippleTile,
         this.sunReflection.value, this.sunReflectionPower.value, reflectionPass);
