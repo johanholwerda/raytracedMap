@@ -33,6 +33,8 @@ struct Uniforms {
   phase : u32,
   // the size of the tile of rippleTexture in world units (WATER_RIPPLES)
   rippleTile : f32,
+  // the strength of the ripples 4 times smaller that fade in close up, see getRippleNormal
+  rippleDetail : f32,
   // the city the rays trace, see CityScene.bind
   cityTileCount : u32,
   cityRoot : u32,

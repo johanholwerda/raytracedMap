@@ -60,6 +60,8 @@ export default class MapWater {
   // the slope of the ripples, 0 is a flat mirror (and no animation)
   private rippleSlope!: ParamFloat;
   private rippleSpeed!: ParamFloat;
+  // the strength of the ripples 4 times smaller laid over them close up, see getRippleNormal of waterReflection.wgsl
+  private rippleDetail!: ParamFloat;
   // the ripples move: the map is drawn every frame. Off, they are frozen and a still view stops being drawn
   private animateWater!: ParamBool;
   // seconds the ripples moved, only counts while animateWater is on
@@ -152,6 +154,7 @@ export default class MapWater {
       updateRipples();
     } });
     this.rippleSpeed = waterGroup.addParamFloat('rippleSpeed', .5, 0, 2, { callback: updateRipples });
+    this.rippleDetail = waterGroup.addParamFloat('rippleDetail', .8, 0, 1, shadingParams);
     this.animateWater = waterGroup.addParamBool('animateWater', true, { callback: setDirty });
     updateRipples();
     this.sunReflection = waterGroup.addParamFloat('sunReflection', 8, 0, 16, { callback: setDirty });
