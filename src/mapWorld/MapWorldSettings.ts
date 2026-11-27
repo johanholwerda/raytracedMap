@@ -46,6 +46,21 @@ export const REFLECTION_RAYS = ['per pixel', '1 per 2 pixels', '1 per 4 pixels']
 // the block of pixels of a ray along x and y, per ReflectionRays
 export const REFLECTION_BLOCKS: [number, number][] = [[1, 1], [2, 1], [2, 2]];
 
+// what the buildings and trees in the water look like (the reflectionType param of MapWorld)
+export enum ReflectionType {
+  // not reflected: only the sky, the sun and the ripples
+  None,
+  // only darkening the water (no REFLECTION_COLORS)
+  SolidColor,
+  // in their colors, all shaded as a face the lightmap has no texels of (getUnseenReflectionColor in
+  // waterReflectionColor.wgsl)
+  Lit,
+  // in their colors, lit by the lightmap where the rays hit them
+  Lightmap,
+}
+
+export const REFLECTION_TYPES = ['none', 'solid color', 'lit', 'lightmap'];
+
 export type QualitySettings = {
   // where the map ends, in world units from the camera (the viewDistanceMax param of MapWorld): the fog is 1 there, the
   // ground tiles load that far and the pixels beyond skip the shading
@@ -81,12 +96,12 @@ export type QualitySettings = {
   // texel covers about 3 pixels or more (texelsPerPixel .3 and less) the half resolution samples are closer together
   // than the texels
   lightmapResolution: LightmapResolution;
-  // the water darker where it reflects a building, ray traced against the city of the lightmap (needs skyVisibility)
-  waterReflections: boolean;
+  // the buildings in the water, ray traced against the city of the lightmap (needs skyVisibility), see ReflectionType
+  reflectionType: ReflectionType;
   // the water pixels per ray of those reflections, see ReflectionRays
   reflectionRays: ReflectionRays;
   // the water mirrored on animated ripples, with the sun reflected in it (no skyVisibility needed). The buildings are
-  // only reflected with waterReflections
+  // only reflected with a reflectionType other than None
   waterRipples: boolean;
   // the ripples move, which draws the map every frame. Off, they're frozen and a still view stops being drawn
   animateWater: boolean;
@@ -101,15 +116,15 @@ export type QualitySettings = {
 };
 
 export const qualitySettings: Record<Quality, QualitySettings> = {
-  [Quality.VeryHigh]: { viewDistanceMax: 8, forward: false, skyVisibility: true, TAAEnabled: true, tiltShiftEnabled: true, tiltShiftHalfRes: true, lightMapSize: 6144, texelsPerPixel: 1, traceSamplesMax: 4096, sampleCount: 32, referenceCellSize: 1.5, searchCount: 16,lightmapResolution: LightmapResolution.Full, waterReflections: true, reflectionRays: ReflectionRays.PerPixel, waterRipples: true, animateWater: false, pixelRatioMax: -1, carsMSAA: true, carsPerPixelLighting: true, shadowMode: ShadowMode.LightmapRaytrace },
-  [Quality.High]: { viewDistanceMax: 8, forward: false, skyVisibility: true, TAAEnabled: true, tiltShiftEnabled: true, tiltShiftHalfRes: true, lightMapSize: 4096, texelsPerPixel: .6, traceSamplesMax: 1536, sampleCount: 16, referenceCellSize: 2, searchCount: 8,lightmapResolution: LightmapResolution.Full, waterReflections: true, reflectionRays: ReflectionRays.Half, waterRipples: true, animateWater: false, pixelRatioMax: -1, carsMSAA: true, carsPerPixelLighting: true, shadowMode: ShadowMode.LightmapRaytrace },
-  [Quality.Medium]: { viewDistanceMax: 6, forward: false, skyVisibility: true, TAAEnabled: true, tiltShiftEnabled: true, tiltShiftHalfRes: true, lightMapSize: 3072, texelsPerPixel: .3, traceSamplesMax: 256, sampleCount: 8, referenceCellSize: 4, searchCount: 8,lightmapResolution: LightmapResolution.Half, waterReflections: false, reflectionRays: ReflectionRays.Quarter, waterRipples: true, animateWater: false, pixelRatioMax: 2, carsMSAA: false, carsPerPixelLighting: false, shadowMode: ShadowMode.LightmapRaytrace },
-  [Quality.Low]: { viewDistanceMax: 4, forward: false, skyVisibility: true, TAAEnabled: true, tiltShiftEnabled: true, tiltShiftHalfRes: true, lightMapSize: 2048, texelsPerPixel: .15, traceSamplesMax: 256, sampleCount: 8, referenceCellSize: 4, searchCount: 8,lightmapResolution: LightmapResolution.HalfBilinear, waterReflections: false, reflectionRays: ReflectionRays.Quarter, waterRipples: false, animateWater: false, pixelRatioMax: 1, carsMSAA: false, carsPerPixelLighting: false, shadowMode: ShadowMode.ShadowMap },
+  [Quality.VeryHigh]: { viewDistanceMax: 8, forward: false, skyVisibility: true, TAAEnabled: true, tiltShiftEnabled: true, tiltShiftHalfRes: true, lightMapSize: 6144, texelsPerPixel: 1, traceSamplesMax: 4096, sampleCount: 32, referenceCellSize: 1.5, searchCount: 16,lightmapResolution: LightmapResolution.Full, reflectionType: ReflectionType.Lightmap, reflectionRays: ReflectionRays.PerPixel, waterRipples: true, animateWater: false, pixelRatioMax: -1, carsMSAA: true, carsPerPixelLighting: true, shadowMode: ShadowMode.LightmapRaytrace },
+  [Quality.High]: { viewDistanceMax: 8, forward: false, skyVisibility: true, TAAEnabled: true, tiltShiftEnabled: true, tiltShiftHalfRes: true, lightMapSize: 4096, texelsPerPixel: .6, traceSamplesMax: 1536, sampleCount: 16, referenceCellSize: 2, searchCount: 8,lightmapResolution: LightmapResolution.Full, reflectionType: ReflectionType.SolidColor, reflectionRays: ReflectionRays.Half, waterRipples: true, animateWater: false, pixelRatioMax: -1, carsMSAA: true, carsPerPixelLighting: true, shadowMode: ShadowMode.LightmapRaytrace },
+  [Quality.Medium]: { viewDistanceMax: 6, forward: false, skyVisibility: true, TAAEnabled: true, tiltShiftEnabled: true, tiltShiftHalfRes: true, lightMapSize: 3072, texelsPerPixel: .3, traceSamplesMax: 256, sampleCount: 8, referenceCellSize: 4, searchCount: 8,lightmapResolution: LightmapResolution.Half, reflectionType: ReflectionType.SolidColor, reflectionRays: ReflectionRays.Quarter, waterRipples: true, animateWater: false, pixelRatioMax: 2, carsMSAA: false, carsPerPixelLighting: false, shadowMode: ShadowMode.LightmapRaytrace },
+  [Quality.Low]: { viewDistanceMax: 4, forward: false, skyVisibility: true, TAAEnabled: true, tiltShiftEnabled: true, tiltShiftHalfRes: true, lightMapSize: 2048, texelsPerPixel: .15, traceSamplesMax: 256, sampleCount: 8, referenceCellSize: 4, searchCount: 8,lightmapResolution: LightmapResolution.HalfBilinear, reflectionType: ReflectionType.None, reflectionRays: ReflectionRays.Quarter, waterRipples: false, animateWater: false, pixelRatioMax: 1, carsMSAA: false, carsPerPixelLighting: false, shadowMode: ShadowMode.ShadowMap },
   // the lightmap settings only count when skyVisibility is turned on by hand
-  [Quality.VeryLow]: { viewDistanceMax: 4, forward: false, skyVisibility: false, TAAEnabled: false, tiltShiftEnabled: true, tiltShiftHalfRes: true, lightMapSize: 1024, texelsPerPixel: .1, traceSamplesMax: 256, sampleCount: 8, referenceCellSize: 4, searchCount: 8,lightmapResolution: LightmapResolution.HalfBilinear, waterReflections: false, reflectionRays: ReflectionRays.Quarter, waterRipples: false, animateWater: false, pixelRatioMax: 1, carsMSAA: false, carsPerPixelLighting: false, shadowMode: ShadowMode.ShadowMap },
+  [Quality.VeryLow]: { viewDistanceMax: 4, forward: false, skyVisibility: false, TAAEnabled: false, tiltShiftEnabled: true, tiltShiftHalfRes: true, lightMapSize: 1024, texelsPerPixel: .1, traceSamplesMax: 256, sampleCount: 8, referenceCellSize: 4, searchCount: 8,lightmapResolution: LightmapResolution.HalfBilinear, reflectionType: ReflectionType.None, reflectionRays: ReflectionRays.Quarter, waterRipples: false, animateWater: false, pixelRatioMax: 1, carsMSAA: false, carsPerPixelLighting: false, shadowMode: ShadowMode.ShadowMap },
   // no SSAO, sky visibility, AA or tilt-shift: they need the gBuffer. The lightmap settings are those of very low
   // no cars either: they're drawn over the deferred image
-  [Quality.Forward]: { viewDistanceMax: 4, forward: true, skyVisibility: false, TAAEnabled: false, tiltShiftEnabled: false, tiltShiftHalfRes: false, lightMapSize: 1024, texelsPerPixel: .1, traceSamplesMax: 256, sampleCount: 8, referenceCellSize: 4, searchCount: 8,lightmapResolution: LightmapResolution.HalfBilinear, waterReflections: false, reflectionRays: ReflectionRays.Quarter, waterRipples: false, animateWater: false, pixelRatioMax: 1, carsMSAA: false, carsPerPixelLighting: false, shadowMode: ShadowMode.ShadowMap },
+  [Quality.Forward]: { viewDistanceMax: 4, forward: true, skyVisibility: false, TAAEnabled: false, tiltShiftEnabled: false, tiltShiftHalfRes: false, lightMapSize: 1024, texelsPerPixel: .1, traceSamplesMax: 256, sampleCount: 8, referenceCellSize: 4, searchCount: 8,lightmapResolution: LightmapResolution.HalfBilinear, reflectionType: ReflectionType.None, reflectionRays: ReflectionRays.Quarter, waterRipples: false, animateWater: false, pixelRatioMax: 1, carsMSAA: false, carsPerPixelLighting: false, shadowMode: ShadowMode.ShadowMap },
 };
 
 // The drawMode param: the full shading, or a debug view.

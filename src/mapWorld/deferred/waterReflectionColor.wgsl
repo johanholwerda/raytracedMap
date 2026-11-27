@@ -15,7 +15,7 @@
 
 // the colors of what the rays hit. Else the buildings only darken the water
 override REFLECTION_COLORS : bool = false;
-// what the rays hit is lit by the lightmap (the litReflections param), else every hit has the color of a face the
+// what the rays hit is lit by the lightmap (reflectionType lightmap), else every hit has the color of a face the
 // lightmap has no texels of (getUnseenReflectionColor): no lookup, no tie, no wall bottoms read
 override REFLECTION_LIGHTMAP : bool = true;
 

@@ -39,7 +39,7 @@ import type { LightmapBlur } from './skyVisibilityLightmap/SkyVisibilityLightmap
 import MapWorldBench, { MapWorldFrameState } from './MapWorldBench';
 import MapWorldVideo from './MapWorldVideo';
 import {
-  DRAW_MODES, DrawMode, QUALITIES, Quality, qualitySettings, REFLECTION_BLOCKS, REFLECTION_RAYS, ReflectionRays, SHADOW_VIEWS,
+  DRAW_MODES, DrawMode, QUALITIES, Quality, qualitySettings, REFLECTION_BLOCKS, REFLECTION_RAYS, REFLECTION_TYPES, ReflectionRays, ReflectionType, SHADOW_VIEWS,
   ShadowMode, SKY_VISIBILITY_VIEWS, randomTimeOfDay, TIMES_OF_DAY, TimeOfDay, timeOfDaySettings, timeOfDaySunAngles,
 } from './MapWorldSettings';
 import MapGeometry, { CityMeshes } from './MapGeometry';
@@ -184,22 +184,19 @@ export default class MapWorld {
   // up to 2 (setDistanceLimit) from the camera and stays out of the fog
   private viewDistanceMax!: ParamFloat;
   // the water darker where it reflects a building, see deferredShading.wgsl
-  private waterReflections!: ParamBool;
   // the water pixels per ray of those reflections, see ReflectionRays
   private reflectionRays!: ParamSelect;
   // traces them when that is more than 1 pixel, before the shading
   private waterReflection!: WaterReflectionHalfRes;
-  // the buildings in the water in their colors, lit by the lightmap (see waterReflectionColor.wgsl)
-  private reflectionColors!: ParamBool;
-  // and lit by the lightmap where the rays hit them, else all in the color of a face it has no texels of
-  private litReflections!: ParamBool;
+  // what the buildings in the water look like, see ReflectionType (and waterReflectionColor.wgsl)
+  private reflectionType!: ParamSelect;
   // the ground in the reflections of the buildings, where it is in reach: see updateTerrainReflection. From its horizon
   // over the water, per block of pixels
   private terrainHorizon!: WaterTerrainHorizon;
   private reflectTerrain!: ParamBool;
   private reflectTerrainInWater = false;
   private reflectionDarkening!: ParamFloat;
-  // the water mirrored on the ripples with the sun in it, also without waterReflections (the buildings)
+  // the water mirrored on the ripples with the sun in it, also with reflectionType None (no buildings)
   private waterRipples!: ParamBool;
   // The animated micro normal the reflections are mirrored on, redrawn every frame. Its wavelength is in meters.
   private ripples!: WaterRippleTexture;
@@ -811,16 +808,13 @@ export default class MapWorld {
 
     const waterGroup = pgShading.addGroup('Water');
 
-    // Only with the sky visibility lightmap: it keeps the BVH of the buildings up to date
-    this.waterReflections = waterGroup.addParamBool('waterReflections', false, { callback: setDirty });
     this.reflectTerrain = waterGroup.addParamBool('reflectTerrain', true, { callback: setDirty });
     this.reflectionRays = waterGroup.addParamSelect('reflectionRays', ReflectionRays.PerPixel, REFLECTION_RAYS, { callback: setDirty });
     this.reflectionDarkening = waterGroup.addParamFloat('reflectionDarkening', .5, 0, 1, { callback: setDirty });
-    // the buildings and trees in the water in their colors, lit by the lightmap where the rays hit them, else they only
-    // darken it
-    this.reflectionColors = waterGroup.addParamBool('reflectionColors', true, { callback: setDirty });
-    // lit by the lightmap at the hit, else all shaded as a face the lightmap has no texels of (reflectionUnseen)
-    this.litReflections = waterGroup.addParamBool('litReflections', true, { callback: setDirty });
+    // Only with the sky visibility lightmap: it keeps the BVH of the buildings up to date.
+    // the buildings and trees in the water: none, only darkening it, in their colors shaded as a face the lightmap has
+    // no texels of (reflectionUnseen), or lit by the lightmap where the rays hit them
+    this.reflectionType = waterGroup.addParamSelect('reflectionType', ReflectionType.Lightmap, REFLECTION_TYPES, { callback: setDirty });
     // how much of the darkening the color of a building gives back, see deferredShading.wgsl
     waterGroup.addParamFloat('reflectionColor', 1, 0, 1, params);
     // the sky light of a building in the water that the lightmap has no texels of (an underside, a side away from the
@@ -903,7 +897,7 @@ export default class MapWorld {
     this.traffic.msaa.setValue(settings.carsMSAA);
     this.traffic.perPixelLighting.setValue(settings.carsPerPixelLighting);
     this.sun.mode.setValue(settings.shadowMode);
-    this.waterReflections.setValue(settings.waterReflections);
+    this.reflectionType.setValue(settings.reflectionType);
     this.reflectionRays.setValue(settings.reflectionRays);
     this.waterRipples.setValue(settings.waterRipples);
     this.animateWater.setValue(settings.animateWater);
@@ -1133,6 +1127,11 @@ export default class MapWorld {
     return { origin, forward, focus };
   }
 
+  // the buildings are in the water (a reflectionType that shows them)
+  private get reflectsBuildings(): boolean {
+    return this.reflectionType.value !== ReflectionType.None;
+  }
+
   /**
    * Whether the water reflections can have ground in them, into their shaders (reflectTerrainInWater): the rays of the
    * water march the height map of the ground only where the loaded ground has relief, which most cities on the water
@@ -1140,7 +1139,7 @@ export default class MapWorld {
    */
   private updateTerrainReflection(): void {
     const field = this.heightField;
-    const enabled = this.reflectTerrain.value && this.waterReflections.value && this.skyLightmap.active && this.geometry.elevation &&
+    const enabled = this.reflectTerrain.value && this.reflectsBuildings && this.skyLightmap.active && this.geometry.elevation &&
       field.reliefM > TERRAIN_REFLECTION_RELIEF_M;
     if (enabled !== this.reflectTerrainInWater) this.dirty = true;
     this.reflectTerrainInWater = enabled;
@@ -1268,7 +1267,7 @@ export default class MapWorld {
     // The water reflections mirrored on moving ripples change every frame: the map is drawn every frame, and the TAA
     // blends it like motion instead of averaging it into a static image.
     // the buildings in the water need the BVH of the lightmap, the ripples and the sun don't
-    const reflectBuildings = this.waterReflections.value && lightmap.active;
+    const reflectBuildings = this.reflectsBuildings && lightmap.active;
     const reflections = useSceneColor && (reflectBuildings || this.waterRipples.value);
     const rippling = reflections && this.waterRipples.value && this.rippleSlope.value > 0;
     const waterAnimating = rippling && this.animateWater.value && this.rippleSpeed.value > 0;
@@ -1367,12 +1366,14 @@ export default class MapWorld {
       // the ground in them: its horizon over the water, which the rays are compared with
       if (reflections && reflectBuildings && this.reflectTerrainInWater) this.terrainHorizon.draw(this.camera, this.gBuffer, this.waterMaterials);
       // their colors, lit by the lightmap where they hit
-      const reflectionColors = reflections && reflectBuildings && this.reflectionColors.value;
-      this.deferred.setReflectionColors(reflectionColors, this.litReflections.value);
+      const reflectionType = this.reflectionType.value as ReflectionType;
+      const reflectionColors = reflections && reflectBuildings && reflectionType !== ReflectionType.SolidColor;
+      const litReflections = reflectionType === ReflectionType.Lightmap;
+      this.deferred.setReflectionColors(reflectionColors, litReflections);
       if (reflectionPass) {
         reflectionPass.setBlock(blockX, blockY);
         reflectionPass.draw(this.camera, this.gBuffer, this.waterMaterials, rippleTile, this.taa.enabled.value && isStatic, reflectionColors,
-          this.litReflections.value);
+          litReflections);
       }
       this.deferred.setWaterReflections(reflections ? this.waterMaterials : 0, reflectBuildings, this.reflectionDarkening.value, rippleTile,
         this.sunReflection.value, this.sunReflectionPower.value, reflectionPass);
