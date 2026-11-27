@@ -38,10 +38,24 @@ export default class MapCamera extends PivotCamera {
   // grabbed point under the cursor would move it far more, so the drag speed is capped there.
   private readonly panMaxSpeed: number = 1;
   private panPrevScreen: Vector2 = new Vector2();
+  // The drag plane stays this far below the eye (in camera distances): on a horizontal plane at or above the eye, a
+  // drag down would push the camera back, and the hits blow up where the cursor ray turns level.
+  private readonly panEyeMargin: number = .1;
+  // From the cursor to where the anchor is on screen: zero, unless the grabbed point is above the drag plane, see startPan
+  private panOffset: Vector2 = new Vector2();
+
+  /**
+   * The point the ray hits (the terrain, a building), null for none: what a drag grabs, so it stays under the cursor.
+   * Without it, or where it hits nothing, the drag grabs the plane at the height of the pivot.
+   */
+  public pickPoint: ((origin: Vector3, direction: Vector3) => Vector3 | null) | null = null;
 
   // Ctrl state
   private ctrlDown: boolean = false;
   private wasRotating: boolean = false;
+
+  // Adjusts the view after the input moved it, before update() sees whether it changed (e.g. keeps it above the ground)
+  public constrainView: (() => void) | null = null;
 
   // Pinch twist state (mobile)
   private pinchPrev0: Vector2 = new Vector2();
@@ -74,32 +88,57 @@ export default class MapCamera extends PivotCamera {
     const dy = ray.direction.y;
     if (Math.abs(dy) < 1e-6) return null;
     const t = (this.panPlaneY - ray.origin.y) / dy;
-    // behind the camera, or so close to the horizon that a pixel would move the map by miles
-    if (t <= 0 || t > this.distance * 50) return null;
+    // behind the camera (near the horizon the hit is far away, the speed cap of pan() keeps the move in check)
+    if (!(t > 0) || !Number.isFinite(t)) return null;
     return new Vector3(ray.origin.x + ray.direction.x * t, this.panPlaneY, ray.origin.z + ray.direction.z * t);
   }
 
-  /** Grabs the ground under the cursor; pan() then keeps it under the cursor. */
+  /**
+   * Grabs what is under the cursor (see pickPoint); pan() then keeps it under the cursor by moving the camera
+   * horizontally, on the horizontal plane through it. A point above the eye (a mountain top) is grabbed by the point
+   * under it on a plane a bit below the eye, which keeps its offset to the cursor on screen: a drag down then still
+   * pulls the mountain closer.
+   */
   private startPan(screenPosition: Vector2): void {
-    this.panPlaneY = this.pivot.position.y;
-    const hit = this.groundPoint(screenPosition);
-    this.panAnchorValid = hit !== null;
-    if (hit) this.panAnchor.copy(hit);
     this.panPrevScreen.copy(screenPosition);
+    this.panOffset.setValues(0, 0);
+    const ray = this.getRay(screenPosition, this.panRay);
+    const picked = this.pickPoint?.(ray.origin, ray.direction) ?? null;
+    if (!picked) {
+      this.panPlaneY = this.pivot.position.y;
+      const hit = this.groundPoint(screenPosition);
+      this.panAnchorValid = hit !== null;
+      if (hit) this.panAnchor.copy(hit);
+      return;
+    }
+    this.panPlaneY = Math.min(picked.y, this.worldPosition.y - this.panEyeMargin * this.distance);
+    this.panAnchor.setValues(picked.x, this.panPlaneY, picked.z);
+    this.panAnchorValid = true;
+    if (this.panPlaneY < picked.y) {
+      // in front of the camera: the camera looks down, and the anchor is under the picked point
+      const anchorScreen = this.worldToScreen(this.panAnchor);
+      this.panOffset.setValues(anchorScreen.x - screenPosition.x, anchorScreen.y - screenPosition.y);
+    }
   }
 
   private pan(screenPosition: Vector2): void {
-    // the anchor was above the horizon: grab again once the cursor is on the ground
+    // the cursor was on the sky: grab again once it is on something
     if (!this.panAnchorValid) {
       this.startPan(screenPosition);
       return;
     }
-    const hit = this.groundPoint(screenPosition);
-    if (!hit) return;
+    const hit = this.groundPoint(Vector2.add(screenPosition, this.panOffset));
+    if (!hit) {
+      // the ray of the anchor no longer reaches its plane: grab what is under the cursor on the next frame
+      this.panAnchorValid = false;
+      return;
+    }
     // moving the camera by the offset puts the anchor back under the cursor
     let dx = this.panAnchor.x - hit.x;
     let dz = this.panAnchor.z - hit.z;
-    const screenMove = Vector2.distance(screenPosition, this.panPrevScreen);
+    // in half screen heights: a pixel to the side counts as much as one up
+    const screenMove = Math.hypot((screenPosition.x - this.panPrevScreen.x) * this.projection.aspectRatio,
+      screenPosition.y - this.panPrevScreen.y);
     this.panPrevScreen.copy(screenPosition);
     const maxMove = this.panMaxSpeed * this.distance * screenMove;
     const move = Math.hypot(dx, dz);
@@ -163,6 +202,7 @@ export default class MapCamera extends PivotCamera {
 
     this.updateZoom();
     this.applyControllerRotation();
+    this.constrainView?.();
 
     this.checkChanged();
   }

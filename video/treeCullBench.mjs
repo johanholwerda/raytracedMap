@@ -1,5 +1,5 @@
 // The GPU time of the passes with and without the trees of the far tiles (the treeCullPixels param of MapWorld, see
-// WorldTileStreamer.cullTrees): serves the app, opens ?bench (see src/mapWorld/MapWorldBench.ts) at a view per
+// WorldTileStreamer.cullTrees): serves the app, opens ?bench (see src/mapWorld/debug/MapWorldBench.ts) at a view per
 // variant, the variants in turns (other Chrome runs load the GPU too: compare the medians), and prints the mean GPU ms
 // per frame of the drags per pass, and how many city meshes had their trees left out.
 //

@@ -12,14 +12,14 @@ import ParamGroup from 'webGPU-framework/utils/params/ParamGroup';
 import ParamBool from 'webGPU-framework/utils/params/ParamBool';
 import ParamFloat from 'webGPU-framework/utils/params/ParamFloat';
 import { isMobile } from 'webGPU-framework/renderer/utils/Browser';
-import MapProjection from '../osm/MapProjection';
-import SkyVisibilityLightmap from '../skyVisibilityLightmap/SkyVisibilityLightmap';
-import MapGBuffer from '../deferred/MapGBuffer';
+import MapProjection from '../map/MapProjection';
+import SkyVisibilityLightmap from '../rendering/skyVisibilityLightmap/SkyVisibilityLightmap';
+import MapGBuffer from '../rendering/deferred/MapGBuffer';
 import type { RoadTileSink } from '../map/WorldTileStreamer';
 import RoadGraph, { RoadEdge } from './RoadGraph';
 import { GROUND_TOP_Y, LAYER_GAP } from '../map/worldGeometryCore';
-import skyVisibilityTrace from '../skyVisibilityLightmap/skyVisibilityTrace.wgsl?raw';
-import terrainSun from '../terrainSun.wgsl?raw';
+import skyVisibilityTrace from '../rendering/skyVisibilityLightmap/skyVisibilityTrace.wgsl?raw';
+import terrainSun from '../rendering/sun/terrainSun.wgsl?raw';
 import CityScene from '../city/CityScene';
 import type TerrainHeightField from '../map/TerrainHeightField';
 import carsShader from './cars.wgsl?raw';
@@ -150,7 +150,7 @@ export default class CarTraffic implements RoadTileSink {
   private readonly candidates: RoadEdge[] = [];
   private readonly weights: number[] = [];
   private _active = false;
-  // toward the sun, for the rays of lightingShader: set by MapWorld before the draw
+  // toward the sun, for the rays of lightingShader: set by MapRenderer before the draw
   public readonly lightDirection = new Vector3(0, 1, 0);
 
   public enabled!: ParamBool;
@@ -161,9 +161,9 @@ export default class CarTraffic implements RoadTileSink {
   private radiusScale!: ParamFloat;
   private speedScale!: ParamFloat;
   private driveOnLeft!: ParamBool;
-  // set by the quality of MapWorld: off where the map has no TAA either
+  // set by the quality (MapRenderer.applyQuality): off where the map has no TAA either
   public msaa!: ParamBool;
-  // set by the quality of MapWorld: the sun rays and the lightmap lookup per pixel instead of per car
+  // set by the quality (MapRenderer.applyQuality): the sun rays and the lightmap lookup per pixel instead of per car
   public perPixelLighting!: ParamBool;
   // the length of a car in pixels at the pivot below which there are no cars
   private minPixels!: ParamFloat;

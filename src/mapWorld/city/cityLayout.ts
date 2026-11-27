@@ -42,7 +42,15 @@ const ROOF_CHART_STEP_M = .25;
 const ROOF_CHART_OFFSET_M = 10000;
 //a child of a BVH node that is a record, see isOccluded in skyVisibilityTrace.wgsl
 export const CITY_LEAF = 0x80000000;
-//the count of a tree record, see CityTraceBlock
+//the vec4s of a building record of the CityTraceBlock: the shape (r0) and where its lightmap surfaces are (r1), and of
+//a tree record: its shape (r0, r1) and its lightmap surfaces (r2)
+export const CITY_RECORD_VEC4S = 2;
+export const CITY_TREE_VEC4S = 3;
+//an atlas word of a wall that has no place in the wall atlas (inside another part, see findWallBottoms)
+export const CITY_ATLAS_NONE = 0xFFFFFFFF;
+//the largest u and v of an atlas word, 16 bits each: below the 0xFFFF of CITY_ATLAS_NONE
+const CITY_ATLAS_STEPS = 0xFFFE;
+//the bit of the last word of r0 that a tree record has set, see CityTraceBlock
 export const CITY_TREE = 0x80000000;
 //the most depth of the BVH of a tile, and of the top level BVH over the tiles (1024 tiles at most): together within
 //CITY_STACK_SIZE of skyVisibilityTrace.wgsl
@@ -61,20 +69,44 @@ export type BuildingPolygon = {
 };
 
 /**
- * The ray tracing data of a tile, in vec4s (4 words each), as one block of the city buffer (see CityScene.ts). Only the
- * any hit rays of skyVisibilityTrace.wgsl read it, so it holds the shapes and nothing about the surfaces:
+ * The ray tracing data of a tile, in vec4s (4 words each), as one block of the city buffer (see CityScene.ts). The any
+ * hit rays of skyVisibilityTrace.wgsl read the shapes, the water reflections also where the point a ray hits is on the
+ * charts of the lightmap (getCityFaceSurface of cityTraceDistance.wgsl):
  * -nodeCount BVH nodes over the buildings and trees, 4 vec4s each: aMin.xyz, a, aMax.xyz, b, bMin.xyz, 0, bMax.xyz, 0
  *  (the layout of ModelBVH). A child is the vec4 index of a node, or of a record | CITY_LEAF
- * -buildingCount building records, then treeCount tree records, 1 vec4 each: (base, top, start, count). The base is the
- *  one of the ray tracing: down to the ground for a building on it, see groundY. start is a vec4 index. On a building
- *  count is its number of edges, on a tree it is CITY_TREE
+ * -buildingCount building records, CITY_RECORD_VEC4S each:
+ *  r0 (base, top, start, count). The base is the one of the ray tracing: down to the ground for a building on it, see
+ *  groundY. start is the vec4 index of its first edge, count the number of its edges
+ *  r1 (atlas, roof chart, header, bottoms): the word index of its first atlas word, the roof chart of its roof (see
+ *  getRoofChart), the vec4 index of the header and the half word index of its first wall bottom. Only read for the
+ *  lightmap of a hit (the water reflections)
+ * -treeCount tree records, CITY_TREE_VEC4S each, see TraceTree:
+ *  r0 (base, top, crown base, -k). k is the trunk half width / the crown half width, negative: its sign is the bit
+ *  CITY_TREE, which the count of a building never has
+ *  r1 (center.x, center.z, u.x, u.z). u is the half axis of the crown divided by its length squared: the crown is
+ *  [-1, 1] on u and on u turned by 90 degrees, the trunk [-k, k]
+ *  r2 (trunk atlas word, crown atlas word, roof chart, header): where the first wall of the trunk and of the crown
+ *  start in the wall atlas (as the atlas words below), the roof chart of the crown and the vec4 index of the header.
+ *  Only read for the lightmap of a hit. The 4 walls of a box are 1 strip of the atlas, each a side of the box after
+ *  the one before it (see layoutWalls: a ring under CHUNK_LENGTH_M around is 1 chunk), in the order of the corners of
+ *  square in worldTrees.ts, and they are drawn from their base: 1 word per box, no wall bottoms.
+ *  The shape was 2 vec4s of its own that the record pointed at, and every wall had a word and a bottom like a
+ *  building's: 7 vec4s per tree and a load more per ray that tests it
  * -edgeCount edges, 1 vec4 each: (a.x, a.z, b.x, b.z)
- * -treeCount tree shapes, 2 vec4s each, see TraceTree: (center.x, center.z, u.x, u.z), (crown base, trunk half width /
- *  crown half width, 0, 0). u is the half axis of the crown divided by its length squared: the crown is [-1, 1] on u
- *  and on u turned by 90 degrees, the trunk [-k, k]
+ * -the header, 1 vec4: (the surface id of the wall atlas of the tile, see getWallSurfaceId, the step of the atlas words
+ *  and their v offset in world units, 0)
+ * -the atlas words, 1 u32 each (4 per vec4): 1 per edge of a building, in the order of its edges. Where the wall
+ *  starts in the wall atlas: u in the low 16 bits, its v at world height 0 (the v of the atlas is the height over the
+ *  base) in the high 16, as u * step and v * step + the v offset of the header. CITY_ATLAS_NONE: the wall has no place
+ *  in the atlas. 4 bytes instead of 2 floats: an atlas is at most 5.24 km (GBUFFER_ATLAS_MAX), a step of 8 cm at
+ *  worst and some 1-3 cm in a city tile, under the 20 cm of the finest texels
+ * -the wall bottoms, 16 bits each (2 per word), in the order of the atlas words: how far above the base of the record
+ *  (r0) its wall is drawn, in steps of the header (see findWallBottoms: a wall is cut off at the bottom where another
+ *  part covers it). The ray tracing has the whole wall, and a hit below its drawn part was at a v below the place of
+ *  the wall in the atlas, in another chunk of it, whose texels (of another wall) the lightmap may have
  * The indices are from the start of the block, CityScene adds where the block is. A forest tile has some 12000 trees:
  * as 2 extruded footprints each (2 records of 2 vec4s, 8 edges of 2 vec4s, 2 BVH leaves) they took about 5 MB, as tree
- * records some 1.4 MB
+ * records 1.3 MB (a BVH node and 3 vec4s each)
  */
 export type CityTraceBlock = {
   words: Uint32Array;
@@ -87,6 +119,8 @@ export type CityTraceBlock = {
   edgeCount: number;
   //the most nodes from the root to a leaf, see CITY_STACK_SIZE in skyVisibilityTrace.wgsl
   depth: number;
+  //the vec4 index of the header, see CityTraceBlock
+  headerStart: number;
   min: [number, number, number];
   max: [number, number, number];
 };
@@ -105,6 +139,19 @@ export type TraceTree = {
   crownHalf: number;
   crownBase: number;
   top: number;
+};
+
+/**
+ * The wall atlas of a tile for the atlas words of buildTraceBlock: the layout of layoutWalls and the arrays per point of
+ * all footprints it was made of (pointStarts, edgeBottoms, see layoutWalls). The footprints of the trunks and crowns of
+ * the trees (the trunk of tree i at 2 i, its crown at 2 i + 1) are footprint treeStart and up in them
+ */
+export type TraceAtlas = {
+  layout: CityLayout;
+  pointStarts: Int32Array;
+  edgeBottoms: Float32Array;
+  treeFootprints: BuildingPolygon[];
+  treeStart: number;
 };
 
 export type CityLayout = {
@@ -367,12 +414,14 @@ function setBox(boxes: Float64Array, i: number, x0: number, y0: number, z0: numb
 }
 
 /**
- * The BVH, records, edges and tree shapes of the tile (see CityTraceBlock). groundY: the height of the ground plane of the
+ * The BVH, records and edges of the tile (see CityTraceBlock). groundY: the height of the ground plane of the
  * ray tracing, a building or tree that stands on the ground (base 0) goes down to it, so no ray passes under its walls
  * between the ground layers. Null on the terrain: the bases are on the ground already (see terrainGrid.ts). ids: per
- * polygon its feature id, see CityTraceBlock (-1 for all without). Null without buildings and trees
+ * polygon its feature id, see CityTraceBlock (-1 for all without). atlas: where the walls are in the wall atlas, for
+ * the atlas words; the polygons are its first footprints. Null without buildings and trees
  */
-export function buildTraceBlock(polygons: BuildingPolygon[], trees: TraceTree[], groundY: number | null, ids?: ArrayLike<number>): CityTraceBlock | null {
+export function buildTraceBlock(polygons: BuildingPolygon[], trees: TraceTree[], groundY: number | null, atlas: TraceAtlas,
+  ids?: ArrayLike<number>): CityTraceBlock | null {
   const buildingCount = polygons.length;
   const treeCount = trees.length;
   if (buildingCount + treeCount === 0) return null;
@@ -410,12 +459,20 @@ export function buildTraceBlock(polygons: BuildingPolygon[], trees: TraceTree[],
   const bvh = new ModelBVH(boxes, null, BLOCK_DEPTH_MAX);
   const nodeCount = bvh.nodeCount;
   const recordStart = nodeCount * 4;
-  const edgeStart = recordStart + buildingCount + treeCount;
-  const shapeStart = edgeStart + edgeCount;
-  const vec4Count = shapeStart + treeCount * 2;
+  const treeStart = recordStart + buildingCount * CITY_RECORD_VEC4S;
+  const edgeStart = treeStart + treeCount * CITY_TREE_VEC4S;
+  const headerStart = edgeStart + edgeCount;
+  const atlasStart = headerStart + 1;
+  //the word index of the wall bottoms, after the atlas words of the edges
+  const bottomStart = atlasStart * 4 + edgeCount;
+  const vec4Count = atlasStart + Math.ceil((edgeCount + Math.ceil(edgeCount / 2)) / 4);
   const data = new ArrayBuffer(vec4Count * 16);
   const u = new Uint32Array(data);
   const f = new Float32Array(data);
+  //the vec4 index of the record of a box: the buildings, then the trees
+  const getRecord = (box: number) => box < buildingCount
+    ? recordStart + box * CITY_RECORD_VEC4S
+    : treeStart + (box - buildingCount) * CITY_TREE_VEC4S;
 
   //the nodes (at the start of the block), with the children as vec4 indices of the block. The records are in the order
   //of the boxes
@@ -423,16 +480,29 @@ export function buildTraceBlock(polygons: BuildingPolygon[], trees: TraceTree[],
   for (let n = 0; n < nodeCount; n++) {
     for (let w = n * 16 + 3; w < n * 16 + 8; w += 4) {
       const child = u[w];
-      u[w] = child >= ModelBVH.leafFlag
-        ? ((recordStart + (child & ~ModelBVH.leafFlag)) | CITY_LEAF) >>> 0
-        : child * 4;
+      u[w] = child >= ModelBVH.leafFlag ? (getRecord(child & ~ModelBVH.leafFlag) | CITY_LEAF) >>> 0 : child * 4;
     }
   }
 
+  //per atlas word the atlas position of the start of its wall: u, and the v at world height 0. NaN: no place. And how
+  //far above the base of the record (recordBase, r0) the wall is drawn. The words of the edges, then 2 per tree (its
+  //trunk and its crown)
+  const atlasWords = edgeCount + treeCount * 2;
+  const atlasU = new Float64Array(atlasWords).fill(NaN), atlasV = new Float64Array(atlasWords).fill(NaN);
+  const atlasBottom = new Float64Array(atlasWords);
+  const {layout, pointStarts, edgeBottoms} = atlas;
+  const setAtlas = (word: number, p: BuildingPolygon, point: number, recordBase: number) => {
+    if (Number.isNaN(edgeBottoms[point])) return;
+    atlasU[word] = layout.edgeAtlas[point * 2];
+    atlasV[word] = layout.edgeAtlas[point * 2 + 1] - p.base;
+    atlasBottom[word] = Math.max(edgeBottoms[point] - recordBase, 0);
+  };
+
   let edge = 0;
   polygons.forEach((p, pi) => {
-    const record = (recordStart + pi) * 4;
+    const record = (recordStart + pi * CITY_RECORD_VEC4S) * 4;
     const first = edge;
+    const ps = pointStarts[pi];
     for (let r = 0; r < p.ringStarts.length; r++) {
       const s = p.ringStarts[r], e = p.ringEnds[r];
       const n = e - s;
@@ -443,6 +513,7 @@ export function buildTraceBlock(polygons: BuildingPolygon[], trees: TraceTree[],
         if (ax === bx && ay === by) continue;
         const o = (edgeStart + edge) * 4;
         f[o] = ax; f[o + 1] = -ay; f[o + 2] = bx; f[o + 3] = -by;
+        setAtlas(edge, p, ps + ia, boxes[pi * 6 + 1]);
         edge++;
       }
     }
@@ -450,22 +521,60 @@ export function buildTraceBlock(polygons: BuildingPolygon[], trees: TraceTree[],
     f[record + 1] = p.top;
     u[record + 2] = edgeStart + first;
     u[record + 3] = edge - first;
+    u[record + 4] = atlasStart * 4 + first;
+    u[record + 5] = p.roofChart;
+    u[record + 6] = headerStart;
+    u[record + 7] = bottomStart * 2 + first;
   });
   trees.forEach((t, ti) => {
-    const record = (recordStart + buildingCount + ti) * 4;
-    const shape = shapeStart + ti * 2;
+    const record = (treeStart + ti * CITY_TREE_VEC4S) * 4;
     f[record] = groundY ?? t.base;
     f[record + 1] = t.top;
-    u[record + 2] = shape;
-    u[record + 3] = CITY_TREE;
-    const o = shape * 4;
-    f[o] = t.x;
-    f[o + 1] = -t.y;
-    f[o + 2] = Math.cos(t.angle) / t.crownHalf;
-    f[o + 3] = -Math.sin(t.angle) / t.crownHalf;
-    f[o + 4] = t.crownBase;
-    f[o + 5] = t.trunkHalf / t.crownHalf;
+    f[record + 2] = t.crownBase;
+    //negative (-0 without a trunk): the bit CITY_TREE
+    f[record + 3] = -(t.trunkHalf / t.crownHalf);
+    f[record + 4] = t.x;
+    f[record + 5] = -t.y;
+    f[record + 6] = Math.cos(t.angle) / t.crownHalf;
+    f[record + 7] = -Math.sin(t.angle) / t.crownHalf;
+    //the first wall of the trunk, then of the crown, whose roof is the one of the tree: their words are quantized
+    //with those of the edges, below
+    for (let b = 0; b < 2; b++) {
+      const footprint = ti * 2 + b, p = atlas.treeFootprints[footprint];
+      setAtlas(edgeCount + ti * 2 + b, p, pointStarts[atlas.treeStart + footprint], f[record]);
+      u[record + 10] = p.roofChart;
+    }
+    u[record + 11] = headerStart;
   });
+
+  //the atlas words: 1 step for u and v (the atlas is about square, see layoutWalls), v from the lowest
+  let uMax = 0, vMin = Infinity, vMax = -Infinity;
+  for (let i = 0; i < atlasWords; i++) {
+    if (Number.isNaN(atlasU[i])) continue;
+    uMax = Math.max(uMax, atlasU[i]);
+    vMin = Math.min(vMin, atlasV[i]);
+    vMax = Math.max(vMax, atlasV[i]);
+  }
+  if (vMin > vMax) vMin = vMax = 0;
+  const step = Math.max(uMax, vMax - vMin, 1e-9) / CITY_ATLAS_STEPS;
+  const wordStart = atlasStart * 4;
+  for (let i = 0; i < atlasWords; i++) {
+    //of an edge, or in the record of a tree (r2)
+    const word = i < edgeCount ? wordStart + i : (treeStart + ((i - edgeCount) >> 1) * CITY_TREE_VEC4S + 2) * 4 + ((i - edgeCount) & 1);
+    if (Number.isNaN(atlasU[i])) {
+      u[word] = CITY_ATLAS_NONE;
+      continue;
+    }
+    const qu = Math.min(Math.round(atlasU[i] / step), CITY_ATLAS_STEPS);
+    const qv = Math.min(Math.round((atlasV[i] - vMin) / step), CITY_ATLAS_STEPS);
+    u[word] = (qu | (qv << 16)) >>> 0;
+    if (i >= edgeCount) continue;
+    const qb = Math.min(Math.round(atlasBottom[i] / step), 0xFFFF);
+    u[bottomStart + (i >> 1)] |= qb << ((i & 1) * 16);
+  }
+  u[headerStart * 4] = layout.wallSurface;
+  f[headerStart * 4 + 1] = step;
+  f[headerStart * 4 + 2] = vMin;
 
   const min: [number, number, number] = [Infinity, Infinity, Infinity];
   const max: [number, number, number] = [-Infinity, -Infinity, -Infinity];
@@ -475,5 +584,5 @@ export function buildTraceBlock(polygons: BuildingPolygon[], trees: TraceTree[],
   }
   const recordIds = new Int32Array(buildingCount).fill(-1);
   if (ids) recordIds.set(Array.from(ids).slice(0, buildingCount));
-  return {words: u, ids: recordIds, nodeCount, buildingCount, treeCount, edgeCount, depth: bvh.depth, min, max};
+  return {words: u, ids: recordIds, nodeCount, buildingCount, treeCount, edgeCount, depth: bvh.depth, headerStart, min, max};
 }

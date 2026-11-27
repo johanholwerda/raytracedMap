@@ -12,19 +12,18 @@ import ParamGroup from 'webGPU-framework/utils/params/ParamGroup';
 import ParamFloat from 'webGPU-framework/utils/params/ParamFloat';
 import ParamBool from 'webGPU-framework/utils/params/ParamBool';
 import { isMobile } from 'webGPU-framework/renderer/utils/Browser';
-import MapProjection from '../osm/MapProjection';
-import type { LatLngBounds } from '../osm/osmGeometryCore';
-import type { TileCoord } from '../osm/PDOKTileService';
-import type { BuildingInfo } from '../osm/cityGlTFCore';
-import type { LayerRuntime } from '../osm/layerDefs';
+import MapProjection from './MapProjection';
+import type { LatLngBounds, TileCoord } from './geo';
+import type { BuildingInfo } from './worldGeometryCore';
+import type { LayerRuntime } from '../rendering/layerDefs';
 import type { WorldBuildingResult, WorldTileResult } from './worldGeometryCore';
-import type { WallAtlasMeshData } from '../city/WallAtlasView';
+import type { WallAtlasMeshData } from '../debug/WallAtlasView';
 import OpenFreeMapTileService from './OpenFreeMapTileService';
 import WorldWorkerPool from './WorldWorkerPool';
 import type ElevationClient from './ElevationClient';
 import type TerrainHeightField from './TerrainHeightField';
-import CityScene from '../city/CityScene';
-import type TerrainLayerBuffer from '../osm/TerrainLayerBuffer';
+import CityScene, { type TileRect } from '../city/CityScene';
+import type TerrainLayerBuffer from '../rendering/TerrainLayerBuffer';
 import { jobClock } from './jobTimes';
 import type { JobTimes } from './jobTimes';
 
@@ -123,9 +122,8 @@ export type FrameTiming = { start: number; submitted: number; gpu: number; groun
  * Each z14 tile holds both ground layers and buildings, so a tile is fetched
  * once and the worker builds whatever is still missing for it (terrain and/or
  * buildings). Terrain goes into the shared per-layer {@link TerrainLayerBuffer}s;
- * buildings become one Mesh per tile with a recycled picking slot, exactly like
- * the 3DBAG tiles in mapOSM/TileStreamer, so picking/highlight/shadows/SSAO in
- * the host work unchanged.
+ * buildings become one Mesh per tile with a recycled picking slot (for the
+ * picking and the selection highlight).
  *
  * Requesting the tiles and building them (the fetches and the workers) needs no GPU: {@link prefetch} starts on the
  * tiles of the first view while the page still waits for its WebGPU device (half a second or more), {@link attach} then
@@ -199,7 +197,7 @@ export default class WorldTileStreamer {
   // FILL_BUDGET_SCALE times the budget per frame
   private filling = true;
 
-  // --- picking slots (see mapOSM/TileStreamer) ---
+  // --- picking slots ---
   private slotBuildings: (BuildingInfo[] | null)[] = [];
   private freeSlots: number[] = [];
   private nextSlot = 0;
@@ -336,7 +334,7 @@ export default class WorldTileStreamer {
     this.needsRestream = true;
   }
 
-  /** The distance from the camera where the map ends (world units, see MapWorld.viewDistanceMax): the tiles reload. */
+  /** The distance from the camera where the map ends (world units, see MapRenderer.viewDistanceMax): the tiles reload. */
   public setViewDistanceMax(distance: number): void {
     if (this.viewDistanceMax === distance) return;
     this.viewDistanceMax = distance;
@@ -546,6 +544,15 @@ export default class WorldTileStreamer {
     const dx = Math.max(Math.min(sw.x, ne.x) - p.x, 0, p.x - Math.max(sw.x, ne.x));
     const dz = Math.max(Math.min(sw.z, ne.z) - p.z, 0, p.z - Math.max(sw.z, ne.z));
     return Math.sqrt(dx * dx + dz * dz);
+  }
+
+  // the ground of the city tile x, y in world x and z, for the grid of CityScene
+  private tileRect(x: number, y: number): TileRect {
+    const bounds = this.tiles.tileBounds({ z: this.tiles.maxZoom, x, y });
+    const sw = this.swScratch, ne = this.neScratch;
+    this.projection.latLngToWorldInto(bounds.south, bounds.west, sw);
+    this.projection.latLngToWorldInto(bounds.north, bounds.east, ne);
+    return [Math.min(sw.x, ne.x), Math.min(sw.z, ne.z), Math.max(sw.x, ne.x), Math.max(sw.z, ne.z)];
   }
 
   private tileVisible(tile: TileCoord, bounds: LatLngBounds, maxHeightMeters: number, frustum: Frustum = this.frustum): boolean {
@@ -887,7 +894,7 @@ export default class WorldTileStreamer {
       this.loadedCityTiles.set(key, {
         mesh, slot, wallTile: result.wallTile, quantization: result.quantization, treeIndexStart: result.treeIndexStart, treeSize: result.treeSize,
       });
-      this.cityScene?.addTile(key, result.trace);
+      this.cityScene?.addTile(key, result.trace, this.tileRect(result.wallTile[0], result.wallTile[1]));
       // A tile ahead of the view whose buildings change nothing in it: the image goes on converging (the lightmap resets
       // the texels around it when it updates next, see CityScene). Else the accumulation of the image starts over
       if (!margin || this.reachesView(result.min, result.max)) this.cityTilesChanged = true;

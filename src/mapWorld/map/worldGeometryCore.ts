@@ -1,13 +1,10 @@
 import { VectorTile } from '@mapbox/vector-tile';
 import { PbfReader } from 'pbf';
 import { hypot2 } from 'webGPU-framework/renderer/utils/MathUtils';
-import MapProjection from '../osm/MapProjection';
-import { tileToLatLon } from '../osm/pdokDecodeCore';
-import type { LatLngBounds } from '../osm/osmGeometryCore';
+import MapProjection from './MapProjection';
+import { tileToLatLon, type LatLngBounds, type TileCoord } from './geo';
 import { classifyPolygons, readRings, TileFeatures, TileProjector } from './tileGeometry';
 import { triangulate, Triangles } from './triangulate';
-import type { TileCoord } from '../osm/PDOKTileService';
-import type { BuildingInfo } from '../osm/cityGlTFCore';
 import { buildTraceBlock, GBUFFER_ATLAS_MAX, GBUFFER_ATLAS_STEP_M, getRoofChart, layoutWalls } from '../city/cityLayout';
 import type { TraceTree } from '../city/cityLayout';
 import type { BuildingPolygon, CityTraceBlock } from '../city/cityLayout';
@@ -24,8 +21,7 @@ import { flattenSea } from './seaMask';
  *  - with the heights of the ground (see ElevationService), the ground mesh, with
  *    the layers draped on it and the buildings and trees standing on it, and
  *  - extruded 3D buildings as one stride-4 `(x, up, -y, featureId)` soup plus
- *    per-building attributes, the same layout the 3DBAG path produces, so the
- *    shared osm shader / GPU picking / highlight work unchanged.
+ *    per-building attributes (BuildingInfo, for the info panel of a picked building).
  *
  * Runs inside {@link worldMapWorker}; keep it free of Mesh/Renderer imports.
  *
@@ -35,10 +31,26 @@ import { flattenSea } from './seaMask';
  * normalised to CCW outers / CW holes so their faces point outward too.
  */
 
-// Mirrors cityGlTFCore.NO_FEATURE_ID / VERTEX_FLOATS. Re-declared so this
-// worker-side module doesn't pull the meshopt decoder in via cityGlTFCore.
-const NO_FEATURE_ID = -1;
-const VERTEX_FLOATS = 4;
+/**
+ * The `.w` of a vertex without a building id (the ground layers, the ground quad, buildings past MAX_FEATURE_ID):
+ * negative, so it never resolves to a building.
+ */
+export const NO_FEATURE_ID = -1;
+/** Floats per vertex of the unified position layout: x, up, -y, featureId. */
+export const VERTEX_FLOATS = 4;
+
+/** The attributes of a building, shown in the info panel when it's picked (see InformationOverlay). */
+export type BuildingInfo = {
+  /** The centroid of the footprint, "lat, lng": the key of its address (see nominatimAddress.ts). */
+  id: string;
+  /** Year of construction, -1 when unknown (not in OpenMapTiles): hides the row in the info panel. */
+  year: number;
+  /** Footprint area in m². */
+  groundArea: number;
+  /** Building height in meters. */
+  height?: number;
+};
+
 // Picking packs `slot * 65536 + featureId`; ids beyond that can't be encoded. The building vertices store the id plus
 // FEATURE_ID_BIAS (the trees are negative) in 16 bits, see interleaveVertices
 const FEATURE_ID_BIAS = 16;
@@ -480,7 +492,7 @@ function packRoad(roads: number[], line: Float64Array, length: number, width: nu
 const MITER_LIMIT = 2;
 
 /**
- * Flat ribbon along a projected polyline (same winding as osmGeometryCore): 2 points (left, right) per point, shared
+ * Flat ribbon along a projected polyline (the winding of the ground layers): 2 points (left, right) per point, shared
  * by the segments on both sides of it, offset along the miter so the ribbon keeps its width around the bend. A closed
  * line (first point = last) is mitered where it closes too.
  */
@@ -672,8 +684,6 @@ export function buildBuildings(
           id: `${lat.toFixed(6)}, ${lng.toFixed(6)}`,
           year: -1, // not in OpenMapTiles; hides the row in the info panel
           groundArea: Math.abs(area) / (metersToNorm * metersToNorm),
-          status: '',
-          roofType: '',
           height: top,
         });
       }
@@ -835,7 +845,8 @@ export function buildBuildings(
   // The ground plane of the ray tracing is the ground quad (y 0), the layers lie a few cm over it (see LAYER_GAP). On
   // the terrain the bases are on the ground already
   const buildingFootprints = footprints.slice(0, treeStart);
-  const trace = buildTraceBlock(buildingFootprints, traceTrees, terrain ? null : 0, buildingFootprints.map((fp) => fp.id));
+  const trace = buildTraceBlock(buildingFootprints, traceTrees, terrain ? null : 0,
+    { layout, pointStarts, edgeBottoms, treeFootprints: footprints.slice(treeStart), treeStart }, buildingFootprints.map((fp) => fp.id));
   const { interleaved, quantization } = interleaveVertices(verts, min, max);
   if (treeIndexStart < 0) treeIndexStart = indices.length;
   return {

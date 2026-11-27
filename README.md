@@ -21,7 +21,7 @@ The frame
 1. gBuffer, 1 pass with a jittered camera: the lightmap surface id, the normal (octahedral, 2 x 10 bits), a material index, and on walls the position in the wall atlas. 12 bytes per pixel plus the depth.
 2. The lightmap update, 3 compute passes: claim, select, trace. See below.
 3. Optional: the lightmap lookup at half resolution, and the water reflection rays at half or quarter resolution.
-4. Deferred shading: `albedo * (sunColor * n.l * sunVisibility + skyColor * skyVisibility)`, water reflections, tone map, fog.
+4. Deferred shading: `albedo * (sunColor * n.l * sunVisibility + skyColor * skyVisibility)`, water reflections, tone map, fog. A reflection ray traced through the city gives its nearest hit; where the screen shows that point, the water mirrors its color from the TAA history of the frame before.
 5. TAA, tilt shift blur, cars.
 
 Charts

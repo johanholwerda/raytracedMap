@@ -10,7 +10,7 @@ export const video = {
   leadIn: .5,
   // of the joined video (x264): lower is better and larger, 16 is close to lossless to the eye. X encodes it again
   crf: 16,
-  // The params of the GUI by their path from MapWorld (see MapWorldVideo.setParams), in this order: the quality sets
+  // The params of the GUI by their path (see MapWorld.findParam), in this order: the quality sets
   // most of the others. A select takes the index of its option: quality 0 is very high, 1 high, 2 medium.
   params: {
     quality: 0,

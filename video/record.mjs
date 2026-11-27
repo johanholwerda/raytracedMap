@@ -1,5 +1,5 @@
 // Records the video of shots.mjs: serves the app, opens it with ?video in Chrome (which needs WebGPU, so a window and
-// not headless) and steps it a frame at a time (see src/mapWorld/MapWorldVideo.ts). The frames are the canvas itself,
+// not headless) and steps it a frame at a time (see src/mapWorld/debug/MapWorldVideo.ts). The frames are the canvas itself,
 // without the UI, at the size and frame rate of shots.mjs however fast the machine is.
 //
 //   npm run video                           all shots, then joined into video/out/raytracedMap.mp4

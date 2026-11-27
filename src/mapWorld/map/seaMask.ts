@@ -1,6 +1,5 @@
 import type { VectorTileLayer } from '@mapbox/vector-tile';
-import { tileToLatLon } from '../osm/pdokDecodeCore';
-import type { TileCoord } from '../osm/PDOKTileService';
+import { tileToLatLon, type TileCoord } from './geo';
 import { FeatureRings, readRings } from './tileGeometry';
 
 /*
