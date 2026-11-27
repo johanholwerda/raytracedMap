@@ -117,10 +117,11 @@ export default class WaterReflectionHalfRes {
   /**
    * The samples of the gBuffer of this frame, before the shading. waterMaterials and rippleTile: as
    * DeferredShading.setWaterReflections takes them. rotate: another pixel of the blocks every frame, for a TAA to average.
-   * colors: the colors of what the rays hit (REFLECTION_COLORS, see DeferredShading.setReflectionColors). After
+   * colors and lit: the colors of what the rays hit, lit by the lightmap (REFLECTION_COLORS and REFLECTION_LIGHTMAP,
+   * see DeferredShading.setReflectionColors). After
    * SkyVisibilityLightmap.setResolveUniforms, which sets the lightmap's.
    */
-  public draw(camera: Camera, gBuffer: MapGBuffer, waterMaterials: number, rippleTile: number, rotate: boolean, colors: boolean): void {
+  public draw(camera: Camera, gBuffer: MapGBuffer, waterMaterials: number, rippleTile: number, rotate: boolean, colors: boolean, lit: boolean): void {
     const size = gBuffer.target.size;
     // rounded up: the samples cover every pixel
     this.target.setSize(Math.ceil(size.x / this._blockX), Math.ceil(size.y / this._blockY));
@@ -141,6 +142,7 @@ export default class WaterReflectionHalfRes {
     m.setTexture('gBufferDepth', gBuffer.depthView);
     m.setMatrix('viewProjection', camera.viewProjection);
     m.setConstant('REFLECTION_COLORS', colors);
+    m.setConstant('REFLECTION_LIGHTMAP', lit);
     this.renderer.blit(null, this.target, m);
   }
 

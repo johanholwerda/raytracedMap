@@ -178,10 +178,14 @@ export default class DeferredShading {
   /**
    * The buildings and trees in the water in their colors, lit by the lightmap where the rays hit them
    * (REFLECTION_COLORS, see waterReflectionColor.wgsl), else they only darken it. For the ray per water pixel here, and
-   * the colors of the samples of WaterReflectionHalfRes (setWaterReflections), which it blends.
+   * the colors of the samples of WaterReflectionHalfRes (setWaterReflections), which it blends. lit: lit by the
+   * lightmap (REFLECTION_LIGHTMAP), else all in the color of a face the lightmap has no texels of.
    */
-  public setReflectionColors(enabled: boolean): void {
-    for (const m of this.materials) m.setConstant('REFLECTION_COLORS', enabled);
+  public setReflectionColors(enabled: boolean, lit: boolean): void {
+    for (const m of this.materials) {
+      m.setConstant('REFLECTION_COLORS', enabled);
+      m.setConstant('REFLECTION_LIGHTMAP', lit);
+    }
   }
 
   /**

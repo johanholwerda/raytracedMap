@@ -15,6 +15,9 @@
 
 // the colors of what the rays hit. Else the buildings only darken the water
 override REFLECTION_COLORS : bool = false;
+// what the rays hit is lit by the lightmap (the litReflections param), else every hit has the color of a face the
+// lightmap has no texels of (getUnseenReflectionColor): no lookup, no tie, no wall bottoms read
+override REFLECTION_LIGHTMAP : bool = true;
 
 // A linear color (not negative) in 32 bits, for the samples of the reduced pass (waterReflectionHalfRes.wgsl): the half
 // floats of its channels without their sign and the low bits of their mantissa, 11, 11 and 10 bits (as rg11b10ufloat)
@@ -121,7 +124,7 @@ fn getReflectionHitColor(ro : vec3<f32>, rd : vec3<f32>, hit : CityHit, lightmap
   var s = getCityHitSurface(ro, rd, hit);
   let p = ro + rd * hit.t;
   let albedo = select(uniforms.reflectionBuildingAlbedo, uniforms.reflectionTreeAlbedo, isCityHitTree(hit));
-  if (lightmap) {
+  if (REFLECTION_LIGHTMAP && lightmap) {
     var l = getReflectionLightmap(s, p, sun);
     if (l.y == 0. && hit.tie != hit.record) {
       let tie = getCityHitTieSurface(ro, rd, hit);

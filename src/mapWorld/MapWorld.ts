@@ -191,6 +191,8 @@ export default class MapWorld {
   private waterReflection!: WaterReflectionHalfRes;
   // the buildings in the water in their colors, lit by the lightmap (see waterReflectionColor.wgsl)
   private reflectionColors!: ParamBool;
+  // and lit by the lightmap where the rays hit them, else all in the color of a face it has no texels of
+  private litReflections!: ParamBool;
   // the ground in the reflections of the buildings, where it is in reach: see updateTerrainReflection. From its horizon
   // over the water, per block of pixels
   private terrainHorizon!: WaterTerrainHorizon;
@@ -817,6 +819,8 @@ export default class MapWorld {
     // the buildings and trees in the water in their colors, lit by the lightmap where the rays hit them, else they only
     // darken it
     this.reflectionColors = waterGroup.addParamBool('reflectionColors', true, { callback: setDirty });
+    // lit by the lightmap at the hit, else all shaded as a face the lightmap has no texels of (reflectionUnseen)
+    this.litReflections = waterGroup.addParamBool('litReflections', true, { callback: setDirty });
     // how much of the darkening the color of a building gives back, see deferredShading.wgsl
     waterGroup.addParamFloat('reflectionColor', 1, 0, 1, params);
     // the sky light of a building in the water that the lightmap has no texels of (an underside, a side away from the
@@ -1364,10 +1368,11 @@ export default class MapWorld {
       if (reflections && reflectBuildings && this.reflectTerrainInWater) this.terrainHorizon.draw(this.camera, this.gBuffer, this.waterMaterials);
       // their colors, lit by the lightmap where they hit
       const reflectionColors = reflections && reflectBuildings && this.reflectionColors.value;
-      this.deferred.setReflectionColors(reflectionColors);
+      this.deferred.setReflectionColors(reflectionColors, this.litReflections.value);
       if (reflectionPass) {
         reflectionPass.setBlock(blockX, blockY);
-        reflectionPass.draw(this.camera, this.gBuffer, this.waterMaterials, rippleTile, this.taa.enabled.value && isStatic, reflectionColors);
+        reflectionPass.draw(this.camera, this.gBuffer, this.waterMaterials, rippleTile, this.taa.enabled.value && isStatic, reflectionColors,
+          this.litReflections.value);
       }
       this.deferred.setWaterReflections(reflections ? this.waterMaterials : 0, reflectBuildings, this.reflectionDarkening.value, rippleTile,
         this.sunReflection.value, this.sunReflectionPower.value, reflectionPass);
