@@ -18,7 +18,8 @@ import SkyVisibilityLightmap from '../skyVisibilityLightmap/SkyVisibilityLightma
  * The buildings in the water reflections of MapWorld with fewer rays (waterReflectionHalfRes.wgsl): the reflection ray
  * of the deferred shading for 1 pixel per block of blockX x blockY pixels of the gBuffer, into an rg32uint target
  * (hit or not, the ray and the color) the shading blends by how alike the rays are (getHalfResReflection in
- * deferredShading.wgsl, DeferredShading.setWaterReflections).
+ * deferredShading.wgsl, DeferredShading.setWaterReflections). r32uint without the colors (reflectionType solid color):
+ * half the memory, and half of what the shading reads per sample. 1 x 1 while the pass isn't used (release).
  * The rays were more than half of the deferred shading at 4K with a quarter of the screen water (1.05 of 1.7 ms on an
  * RTX 3080). This pass takes .7 ms for half of them and .4 for a quarter: a ray costs about 1.4x as much here as in the
  * shading, whose other work overlaps with it.
@@ -30,7 +31,9 @@ import SkyVisibilityLightmap from '../skyVisibilityLightmap/SkyVisibilityLightma
 export default class WaterReflectionHalfRes {
   private renderer: Renderer;
   private readonly material: VertexFragmentShader;
-  private readonly target: RenderTexture;
+  // made again when the colors go on or off: another format, see createTarget
+  private target: RenderTexture;
+  private targetColors = true;
   // the pixels of a block along x and y, see setBlock
   private _blockX = 2;
   private _blockY = 2;
@@ -50,7 +53,17 @@ export default class WaterReflectionHalfRes {
     this.material.depthCompare = 'always';
     this.dummyCityBuffer = renderer.createBuffer(16, GPUBufferUsage.STORAGE, false, 'dummyCityBuffer');
     this.material.setBuffer('cityBuffer', this.dummyCityBuffer);
-    this.target = new RenderTexture(renderer, 1, 1, { formats: ['rg32uint'], sampleCount: 1 });
+    this.target = this.createTarget(this.targetColors);
+  }
+
+  // the samples: with the colors of what the rays hit in their second word, else only the first
+  private createTarget(colors: boolean): RenderTexture {
+    return new RenderTexture(this.renderer, 1, 1, { formats: [colors ? 'rg32uint' : 'r32uint'], sampleCount: 1 });
+  }
+
+  /** The pass isn't used: no samples are kept. */
+  public release(): void {
+    this.target.setSize(1, 1);
   }
 
   /** The materials that take the params of the shading by name (the light, the fog, the contrast, the exposure), see waterReflectionColor.wgsl. */
@@ -74,7 +87,7 @@ export default class WaterReflectionHalfRes {
     this.material.setSampler('rippleSampler', ripples.sampler);
   }
 
-  // the samples, a texture_2d<u32>
+  // the samples, a texture_2d<u32>. Another one after a draw with or without the colors, or a resize
   public get view(): GPUTextureView {
     return this.target.views[0];
   }
@@ -123,6 +136,11 @@ export default class WaterReflectionHalfRes {
    */
   public draw(camera: Camera, gBuffer: MapGBuffer, waterMaterials: number, rippleTile: number, rotate: boolean, colors: boolean, lit: boolean): void {
     const size = gBuffer.target.size;
+    if (colors !== this.targetColors) {
+      this.target.destruct();
+      this.target = this.createTarget(colors);
+      this.targetColors = colors;
+    }
     // rounded up: the samples cover every pixel
     this.target.setSize(Math.ceil(size.x / this._blockX), Math.ceil(size.y / this._blockY));
     this._phase = rotate ? this.getPhase(this.frame++) : 0;

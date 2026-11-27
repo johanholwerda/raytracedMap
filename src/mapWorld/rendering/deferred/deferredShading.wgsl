@@ -86,8 +86,7 @@ struct Uniforms {
   sunFresnel : f32,
   // how far a point goes off its surface before it is compared with terrainSunMap, see getTerrainSunShadow
   terrainSunOffset : f32,
-  // the ground in the water reflections (REFLECT_BUILDINGS), see terrainHorizonLookup.wgsl: 0 skips it
-  reflectTerrainInWater : u32,
+  // the ground in the water reflections (REFLECT_TERRAIN), see terrainHorizonLookup.wgsl
   terrainReflectionTop : f32,
   terrainReflectionBias : f32,
   // how much of the light the water loses where it reflects a building (reflectionDarkening) the color of the building
@@ -126,6 +125,9 @@ override WATER_REFLECTIONS : bool = false;
 override REFLECT_BUILDINGS : bool = false;
 // the reflections are mirrored on the ripples of rippleTexture, else on the flat water
 override WATER_RIPPLES : bool = false;
+// the ground in the reflections of the buildings (REFLECT_BUILDINGS), where it is high enough above the water to show
+// (most places it isn't): see DeferredShading.setTerrainReflection and getTerrainReflection
+override REFLECT_TERRAIN : bool = false;
 // REFLECT_BUILDINGS from the samples of reflectionTexture (with their colors with REFLECTION_COLORS), 1 traced ray per
 // block of pixels (see getHalfResReflection), instead of a ray per water pixel here
 override REFLECTIONS_HALF_RES : bool = false;
@@ -210,12 +212,15 @@ struct VertexInput {
 
 struct VertexOutput {
   @builtin(position) position : vec4<f32>,
+  // the color the water reflections are fogged to, the same for every pixel: see getReflectionBackground
+  @location(0) @interpolate(flat) reflectionBackground : vec3<f32>,
 }
 
 @vertex
 fn vs_main(input : VertexInput) -> VertexOutput {
   var output : VertexOutput;
   output.position = vec4<f32>(input.position, 1.0);
+  output.reflectionBackground = getReflectionBackground();
   return output;
 }
 
@@ -455,8 +460,13 @@ fn getHalfResReflection(coord : vec2<u32>, rd : vec3<f32>) -> vec4<f32> {
   let f = vec2<f32>(between) / vec2<f32>(block);
   let t00 = textureLoad(reflectionTexture, h0, 0).xy;
   let t10 = textureLoad(reflectionTexture, vec2(h1.x, h0.y), 0).xy;
-  let t01 = textureLoad(reflectionTexture, vec2(h0.x, h1.y), 0).xy;
-  let t11 = textureLoad(reflectionTexture, h1, 0).xy;
+  // blocks of 1 pixel along y: a pixel is between 2 samples of its row, the other 2 have no weight
+  var t01 = t00;
+  var t11 = t10;
+  if (REFLECTION_BLOCK_Y > 1u) {
+    t01 = textureLoad(reflectionTexture, vec2(h0.x, h1.y), 0).xy;
+    t11 = textureLoad(reflectionTexture, h1, 0).xy;
+  }
   let s00 = unpack4x8unorm(t00.x);
   let s10 = unpack4x8unorm(t10.x);
   let s01 = unpack4x8unorm(t01.x);
@@ -615,7 +625,8 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
           let hit = getOcclusionHit(world, rd);
           if (hit.t >= 0.) {
             occluded = 1.;
-            reflected = getReflectionHitColor(world, rd, hit, LIGHTMAP_ENABLED, LIGHTMAP_ENABLED && SUN_SHADOWS == 2u);
+            reflected = getReflectionHitColor(world, rd, hit, LIGHTMAP_ENABLED && SUN_SHADOWS == 2u,
+              input.reflectionBackground);
           }
         } else {
           occluded = select(0., 1., isOccluded(world, rd));
@@ -625,7 +636,7 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
     // the ground in it, where no building is: the buildings and the trees are in front of the hills more often than
     // behind them. Its color (terrainColor.a: how much of the mirror has one) goes in with the sky, below
     var terrainColor = vec4<f32>(0.);
-    if (REFLECT_BUILDINGS) {
+    if (REFLECT_BUILDINGS && REFLECT_TERRAIN) {
       let terrain = getTerrainReflection(coord, world, rd);
       if (terrain.occluded) {
         terrainColor = vec4(terrain.color.rgb, 1.) * (terrain.color.a * (1. - occluded));

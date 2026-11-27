@@ -85,6 +85,11 @@ export default class WaterTerrainHorizon {
     this.renderer.blit(null, this.target, m);
   }
 
+  /** The pass isn't used: no horizons are kept. */
+  public release(): void {
+    this.target.setSize(1, 1);
+  }
+
   public destruct(): void {
     this.target.destruct();
     this.material.destruct();

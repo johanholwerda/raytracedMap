@@ -133,13 +133,13 @@ export default class DeferredShading {
    * are compared with the horizon of the ground around the pixel (getTerrainReflection of terrainHorizonLookup.wgsl),
    * which WaterTerrainHorizon has to draw before the shading then: where a ray hits the ground, the water mirrors its
    * color. A pixel without one marches the height map of
-   * TerrainSunMap.bindHeights itself. enabled false skips it, where no ground is high enough above the water (most
-   * places). top: the highest ground, world y, a ray above it ends. bias: how far above the water the rays start, world
-   * units.
+   * TerrainSunMap.bindHeights itself. enabled false is a shader without it (the override REFLECT_TERRAIN), where no
+   * ground is high enough above the water (most places). top: the highest ground, world y, a ray above it ends. bias:
+   * how far above the water the rays start, world units.
    */
   public setTerrainReflection(enabled: boolean, top: number, bias: number): void {
     for (const m of this.materials) {
-      m.setFloat('reflectTerrainInWater', enabled ? 1 : 0);
+      m.setConstant('REFLECT_TERRAIN', enabled);
       m.setFloat('terrainReflectionTop', top);
       m.setFloat('terrainReflectionBias', bias);
     }
@@ -150,18 +150,19 @@ export default class DeferredShading {
    * MapGBuffer.materialIndex), 0 turns them off. darkening: the part of the light the water loses where it reflects a
    * building. reflectBuildings: trace the rays against the buildings, else only the sun is reflected. rippleTile: the size of the tile of the ripples in world units, 0 for a flat mirror. sun: the brightness
    * of the sun reflected where the ray misses the buildings (0 none), sunPower: the phong exponent of its glints.
-   * halfRes: the buildings from the rays this pass traced for the gBuffer of the frame (drawn before, with the same
-   * waterMaterials and rippleTile) instead of a ray per water pixel, null traces them here
+   * samples: the pass of the rays per block of pixels. halfRes: the buildings from the rays it traced for the gBuffer
+   * of the frame (drawn before, with the same waterMaterials and rippleTile) instead of a ray per water pixel here
    */
   public setWaterReflections(waterMaterials: number, reflectBuildings: boolean, darkening: number, rippleTile: number, sun: number, sunPower: number,
-    halfRes: WaterReflectionHalfRes | null = null): void {
+    samples: WaterReflectionHalfRes, halfRes: boolean): void {
     for (const m of this.materials) {
-      m.setConstant('REFLECTIONS_HALF_RES', halfRes != null);
+      m.setConstant('REFLECTIONS_HALF_RES', halfRes);
+      // also when it isn't read: its target is another one after a release or with another format
+      m.setTexture('reflectionTexture', samples.view);
       if (halfRes) {
-        m.setTexture('reflectionTexture', halfRes.view);
-        m.setFloat('reflectionPhase', halfRes.phase);
-        m.setConstant('REFLECTION_BLOCK_X', halfRes.blockX);
-        m.setConstant('REFLECTION_BLOCK_Y', halfRes.blockY);
+        m.setFloat('reflectionPhase', samples.phase);
+        m.setConstant('REFLECTION_BLOCK_X', samples.blockX);
+        m.setConstant('REFLECTION_BLOCK_Y', samples.blockY);
       }
       // constants: the shader of the water reflections that are off has none of their code
       m.setConstant('WATER_REFLECTIONS', waterMaterials !== 0);
@@ -179,7 +180,8 @@ export default class DeferredShading {
    * The buildings and trees in the water in their colors, lit by the lightmap where the rays hit them
    * (REFLECTION_COLORS, see waterReflectionColor.wgsl), else they only darken it. For the ray per water pixel here, and
    * the colors of the samples of WaterReflectionHalfRes (setWaterReflections), which it blends. lit: lit by the
-   * lightmap (REFLECTION_LIGHTMAP), else all in the color of a face the lightmap has no texels of.
+   * lightmap (REFLECTION_LIGHTMAP), which then has to be readable (SkyVisibilityLightmap.readable), else all in the
+   * color of a face the lightmap has no texels of.
    */
   public setReflectionColors(enabled: boolean, lit: boolean): void {
     for (const m of this.materials) {

@@ -7,7 +7,8 @@
 // waterReflectionColor.wgsl).
 // Out, rg32uint. x: 4 x 8 bits (pack4x8unorm), its first 0 no water (no sample), .5 the ray reaches the sky, 1 it hits a
 // building, then the ray (* .5 + .5): the shading weighs a sample by how alike its ray and the ray of the pixel are.
-// y: the color of the building the ray hits (linear like the shading, packReflectionColor), 0 without one.
+// y: the color of the building the ray hits (linear like the shading, packReflectionColor), 0 without one. Without
+// REFLECTION_COLORS the target is r32uint, which keeps the x only.
 // 1 target: the shading has a texture less to bind, it has the 16 sampled textures a stage has by default
 // Needs cameraRay.wgsl, the includes of the lightmap resolve (SkyVisibilityLightmap.resolveIncludes, its uniforms are set
 // with the deferred shading's: SkyVisibilityLightmap.setResolveUniforms), waterReflection.wgsl,
@@ -94,12 +95,15 @@ struct VertexInput {
 
 struct VertexOutput {
   @builtin(position) position : vec4<f32>,
+  // the color the reflections are fogged to, the same for every pixel: see getReflectionBackground
+  @location(0) @interpolate(flat) reflectionBackground : vec3<f32>,
 }
 
 @vertex
 fn vs_main(input : VertexInput) -> VertexOutput {
   var output : VertexOutput;
   output.position = vec4<f32>(input.position, 1.0);
+  output.reflectionBackground = getReflectionBackground();
   return output;
 }
 
@@ -121,7 +125,7 @@ fn fs_main(input : VertexOutput) -> @location(0) vec2<u32> {
   }
   let hit = getOcclusionHit(world, rd);
   if (hit.t >= 0.) {
-    let color = getReflectionHitColor(world, rd, hit, uniforms.lightmapEnabled != 0u, LIGHTMAP_SUN && uniforms.lightmapEnabled != 0u);
+    let color = getReflectionHitColor(world, rd, hit, LIGHTMAP_SUN, input.reflectionBackground);
     return vec2(pack4x8unorm(vec4(1., rd * .5 + .5)), packReflectionColor(color));
   }
   return vec2(pack4x8unorm(vec4(.5, rd * .5 + .5)), 0u);

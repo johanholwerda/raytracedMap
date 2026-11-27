@@ -351,6 +351,11 @@ export default class SkyVisibilityLightmap {
     return this.enabled.value;
   }
 
+  /** Its texels can be read: it is on and has its buffers (the first update makes them). */
+  public get readable(): boolean {
+    return this.enabled.value && this.lightingBuffer != null;
+  }
+
   /** The debug view of the shading, set by the host (MapWorld's drawMode), see LightmapView. */
   public get view(): LightmapView {
     return this._view;

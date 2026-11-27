@@ -4,7 +4,7 @@ import LogGL from 'webGPU-framework/renderer/core/LogGL';
 import Vector3 from 'webGPU-framework/renderer/math/Vector3';
 import { isMobile } from 'webGPU-framework/renderer/utils/Browser';
 import ModelBVH from './ModelBVH';
-import { CITY_LEAF, CITY_RECORD_VEC4S, TOP_DEPTH_MAX } from './cityLayout';
+import { CITY_LEAF, CITY_RECORD_VEC4S, CITY_TREE_VEC4S, TOP_DEPTH_MAX } from './cityLayout';
 import type { CityTraceBlock } from './cityLayout';
 import { intersectTraceBlock } from './cityPick';
 
@@ -13,10 +13,15 @@ type Box = { min: number[]; max: number[]; reach: number };
 //a part of the map where buildings came or went in frame
 type Change = Box & { frame: number };
 
+//the ground of a map tile in world x and z: min.x, min.z, max.x, max.z
+export type TileRect = [number, number, number, number];
+
 type Tile = {
   block: CityTraceBlock;
   //vec4 index of the block in the city buffer, -1 while it has no place
   offset: number;
+  //the map tile it is of: a cell of the grid, see writeGrid
+  rect?: TileRect;
 };
 
 /*
@@ -24,6 +29,10 @@ The buildings and trees the rays of the sky visibility lightmap hit, see isOcclu
 buffer of vec4s:
 -from 0 the top level BVH over the tiles (TLAS_NODES_MAX nodes at most). Its leaves are the roots of the BVHs of the
  tiles: all are in world space, so the 2 levels are 1 tree and the traversal 1 loop. Made again when a tile comes or goes
+-then the grid of the tiles (GRID_VEC4S), see writeGrid: a ray that goes up from a place where it can only hit the
+ buildings of 1 tile starts at the root of its BVH instead of that of the top level BVH (getCityStart in
+ skyVisibilityTrace.wgsl). With the 17 tiles of a view of Amsterdam 5 of the 13 nodes a water reflection ray visited
+ were of the top level BVH, to end up in the tile the ray starts in
 -then CHANGES_MAX changes: the boxes of the buildings of the tiles that came or went and the frame they did, 2 vec4s
  each: (min.xyz, frame), (max.xyz, reach). A texel that was last sampled before the frame has the lighting of before
  and is reset (see resetStaleTexel in updateSkyVisibilityLightmap.wgsl): its sky visibility within the reach around
@@ -39,8 +48,17 @@ same frame. A tile that doesn't fit gets no place, and its buildings and trees h
 export default class CityScene {
   private static readonly TLAS_NODES_MAX = 1024;
   private static readonly NODE_VEC4S = 4;
+  //the grid of the tiles, after the top level BVH (CITY_GRID_START of skyVisibilityTrace.wgsl): 2 vec4s, and 2 per
+  //cell, see writeGrid
+  private static readonly GRID_HEADER_VEC4S = 2;
+  private static readonly GRID_CELLS_MAX = 32;
+  private static readonly GRID_VEC4S = CityScene.GRID_HEADER_VEC4S + CityScene.GRID_CELLS_MAX * CityScene.GRID_CELLS_MAX * 2;
+  //a child of a cell without a tile, CITY_NONE of skyVisibilityTrace.wgsl
+  private static readonly NONE = 0xFFFFFFFF;
   //the changes that updateSkyVisibilityLightmap.wgsl reads, from CITY_CHANGE_START of skyVisibilityTrace.wgsl
   private static readonly CHANGES_MAX = 16;
+  //how much larger the boxes of the tiles count in the grid, in cells: more than the rounding of a ray's start
+  private static readonly GRID_MARGIN = 1e-4;
   //how far around a tile the sky visibility changes when it comes or goes, in times the height of its tallest
   //building: the sky it hides. Not the sun it hides: that is where its shadows fall, see the class comment
   public static readonly CHANGE_REACH = 2;
@@ -79,8 +97,12 @@ export default class CityScene {
     this.capacity = Math.floor(Math.min(sizeBytes, max) / 16);
   }
 
-  private get changeStart(): number {
+  private get gridStart(): number {
     return CityScene.TLAS_NODES_MAX * CityScene.NODE_VEC4S;
+  }
+
+  private get changeStart(): number {
+    return this.gridStart + CityScene.GRID_VEC4S;
   }
 
   private get heapStart(): number {
@@ -113,10 +135,11 @@ export default class CityScene {
     shader.setFloat('changeEnd', this.changes.reduce((end, c) => Math.max(end, c.frame), 0));
   }
 
-  public addTile(key: string, block: CityTraceBlock | null): void {
+  /** rect: the ground of the map tile the block is of, a cell of the grid (see writeGrid). */
+  public addTile(key: string, block: CityTraceBlock | null, rect?: TileRect): void {
     this.removeTile(key);
     if (!block) return;
-    const tile: Tile = { block, offset: -1 };
+    const tile: Tile = { block, offset: -1, rect };
     this.tiles.set(key, tile);
     if (this.buffer) this.place(key, tile);
   }
@@ -153,16 +176,18 @@ export default class CityScene {
         words[w] = child >= CITY_LEAF ? (((child & ~CITY_LEAF) + offset) | CITY_LEAF) >>> 0 : child + offset;
       }
     }
-    //the starts of the edges and tree shapes of the records, of their atlas words (a word index), their header and
-    //their wall bottoms (a half word index)
+    //the starts of the edges of the building records, of their atlas words (a word index), their header and their
+    //wall bottoms (a half word index), and the header of the tree records
     const recordStart = block.nodeCount * 4;
-    for (let r = 0; r < block.buildingCount + block.treeCount; r++) {
+    for (let r = 0; r < block.buildingCount; r++) {
       const w = (recordStart + r * CITY_RECORD_VEC4S) * 4;
       words[w + 2] += offset;
       words[w + 4] += offset * 4;
       words[w + 6] += offset;
       words[w + 7] += offset * 8;
     }
+    const treeStart = recordStart + block.buildingCount * CITY_RECORD_VEC4S;
+    for (let r = 0; r < block.treeCount; r++) words[(treeStart + r * CITY_TREE_VEC4S) * 4 + 11] += offset;
     this.renderer.device.queue.writeBuffer(this.buffer!, offset * 16, words.buffer, words.byteOffset, words.byteLength);
     this.tlasDirty = true;
     this.addChange(block);
@@ -288,10 +313,99 @@ export default class CityScene {
       }
       this.renderer.device.queue.writeBuffer(this.buffer, 0, data);
     }
+    this.writeGrid(placed);
     for (const shader of this.shaders) {
       shader.setFloat('cityTileCount', this.tileCount);
       shader.setFloat('cityRoot', this.root);
     }
+  }
+
+  /**
+   * The grid of the tiles, for the rays that can only hit the buildings of 1 tile (getCityStart in
+   * skyVisibilityTrace.wgsl): they start at the root of its BVH, not at the root of the top level BVH.
+   * -2 vec4s: (origin.x, origin.z, 1 / cell size.x, 1 / cell size.z), (cells along x, cells along z, the top of the
+   *  highest building of all tiles, 0)
+   * -2 vec4s per cell, row by row along x: (the part of the cell that only the box of its tile reaches into: min.x,
+   *  min.z, max.x, max.z in world units, min above max when there is none), (the vec4 index of the root of the BVH of
+   *  that tile, NONE where no box reaches into the cell, 0, 0, 0)
+   * The cells are the map tiles (their rects), a whole number of cells from the first one's corner. The buildings of
+   * a tile reach a few meters over its edges (the buffer of the vector tiles), into the cells around it: a strip
+   * along the sides of a cell is of 2 tiles or more. A ray that goes up from the rest of the cell, and is above the
+   * highest building before it leaves it, can only hit the tile of the cell.
+   * No cells (every ray takes the top level BVH) without the rects, or with more cells than GRID_CELLS_MAX along a
+   * side.
+   */
+  private writeGrid(placed: Tile[]): void {
+    const start = this.gridStart * 16;
+    const header = new ArrayBuffer(CityScene.GRID_HEADER_VEC4S * 16);
+    const rects = placed.map(tile => tile.rect);
+    let minX = Infinity, minZ = Infinity, maxX = -Infinity, maxZ = -Infinity, top = -Infinity;
+    for (const { block } of placed) {
+      minX = Math.min(minX, block.min[0]); maxX = Math.max(maxX, block.max[0]);
+      minZ = Math.min(minZ, block.min[2]); maxZ = Math.max(maxZ, block.max[2]);
+      top = Math.max(top, block.max[1]);
+    }
+    const first = rects[0];
+    let dimX = 0, dimZ = 0, sizeX = 1, sizeZ = 1, originX = 0, originZ = 0;
+    if (first && rects.every(rect => rect)) {
+      sizeX = Math.max(rects.reduce((sum, r) => sum + r![2] - r![0], 0) / rects.length, 1e-6);
+      sizeZ = Math.max(rects.reduce((sum, r) => sum + r![3] - r![1], 0) / rects.length, 1e-6);
+      // on the edges of the tiles, and around every box
+      originX = first[0] - Math.ceil((first[0] - minX) / sizeX) * sizeX;
+      originZ = first[1] - Math.ceil((first[1] - minZ) / sizeZ) * sizeZ;
+      dimX = Math.ceil((maxX - originX) / sizeX);
+      dimZ = Math.ceil((maxZ - originZ) / sizeZ);
+      if (Math.max(dimX, dimZ) > CityScene.GRID_CELLS_MAX) dimX = dimZ = 0;
+    }
+    const hf = new Float32Array(header), hu = new Uint32Array(header);
+    hf[0] = originX; hf[1] = originZ; hf[2] = 1 / sizeX; hf[3] = 1 / sizeZ;
+    hu[4] = dimX; hu[5] = dimZ; hf[6] = top;
+    this.renderer.device.queue.writeBuffer(this.buffer!, start, header);
+    if (dimX * dimZ === 0) return;
+
+    // the boxes count this much larger: the rounding of the rays
+    const grow = CityScene.GRID_MARGIN * Math.max(sizeX, sizeZ);
+    // the tiles whose box reaches into each cell
+    const cells: Tile[][] = Array.from({ length: dimX * dimZ }, () => []);
+    for (const tile of placed) {
+      const { min, max } = tile.block;
+      const x0 = Math.max(Math.floor((min[0] - grow - originX) / sizeX), 0), x1 = Math.min(Math.floor((max[0] + grow - originX) / sizeX), dimX - 1);
+      const z0 = Math.max(Math.floor((min[2] - grow - originZ) / sizeZ), 0), z1 = Math.min(Math.floor((max[2] + grow - originZ) / sizeZ), dimZ - 1);
+      for (let z = z0; z <= z1; z++) for (let x = x0; x <= x1; x++) cells[z * dimX + x].push(tile);
+    }
+    const data = new ArrayBuffer(cells.length * 2 * 16);
+    const f = new Float32Array(data), u = new Uint32Array(data);
+    cells.forEach((cell, c) => {
+      const x0 = originX + (c % dimX) * sizeX, z0 = originZ + Math.floor(c / dimX) * sizeZ;
+      const x1 = x0 + sizeX, z1 = z0 + sizeZ;
+      // the tile of the cell: the one with the most of it
+      const area = ({ block: { min, max } }: Tile) =>
+        Math.max(Math.min(max[0], x1) - Math.max(min[0], x0), 0) * Math.max(Math.min(max[2], z1) - Math.max(min[2], z0), 0);
+      cell.sort((a, b) => area(b) - area(a));
+      f.set(CityScene.getAloneRect(cell.slice(1).map(tile => tile.block), x0, z0, x1, z1, grow), c * 8);
+      u[c * 8 + 4] = cell.length > 0 ? cell[0].offset : CityScene.NONE;
+    });
+    this.renderer.device.queue.writeBuffer(this.buffer!, start + header.byteLength, data);
+  }
+
+  /**
+   * The part of a cell (x0, z0 to x1, z1) that none of the boxes of others reach into, as a rect (min.x, min.z, max.x,
+   * max.z): each box cuts off the side of what is left that loses the least to it. Nothing left: min above max.
+   * grow: the boxes count this much larger, see writeGrid
+   */
+  private static getAloneRect(others: CityTraceBlock[], x0: number, z0: number, x1: number, z1: number, grow: number): number[] {
+    const rect = [x0, z0, x1, z1];
+    for (const { min, max } of others) {
+      const bx0 = min[0] - grow, bz0 = min[2] - grow, bx1 = max[0] + grow, bz1 = max[2] + grow;
+      if (bx0 >= rect[2] || bx1 <= rect[0] || bz0 >= rect[3] || bz1 <= rect[1]) continue;
+      // the part of what is left each cut takes: the west side up to the east of the box, the north, the east, the south
+      const width = rect[2] - rect[0], depth = rect[3] - rect[1];
+      const cuts = [(bx1 - rect[0]) / width, (bz1 - rect[1]) / depth, (rect[2] - bx0) / width, (rect[3] - bz0) / depth];
+      let best = 0;
+      for (let k = 1; k < 4; k++) if (cuts[k] < cuts[best]) best = k;
+      rect[best] = [bx1, bz1, bx0, bz0][best];
+    }
+    return rect;
   }
 
   /**

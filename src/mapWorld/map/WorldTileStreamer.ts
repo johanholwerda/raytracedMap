@@ -22,7 +22,7 @@ import OpenFreeMapTileService from './OpenFreeMapTileService';
 import WorldWorkerPool from './WorldWorkerPool';
 import type ElevationClient from './ElevationClient';
 import type TerrainHeightField from './TerrainHeightField';
-import CityScene from '../city/CityScene';
+import CityScene, { type TileRect } from '../city/CityScene';
 import type TerrainLayerBuffer from '../rendering/TerrainLayerBuffer';
 import { jobClock } from './jobTimes';
 import type { JobTimes } from './jobTimes';
@@ -546,6 +546,15 @@ export default class WorldTileStreamer {
     return Math.sqrt(dx * dx + dz * dz);
   }
 
+  // the ground of the city tile x, y in world x and z, for the grid of CityScene
+  private tileRect(x: number, y: number): TileRect {
+    const bounds = this.tiles.tileBounds({ z: this.tiles.maxZoom, x, y });
+    const sw = this.swScratch, ne = this.neScratch;
+    this.projection.latLngToWorldInto(bounds.south, bounds.west, sw);
+    this.projection.latLngToWorldInto(bounds.north, bounds.east, ne);
+    return [Math.min(sw.x, ne.x), Math.min(sw.z, ne.z), Math.max(sw.x, ne.x), Math.max(sw.z, ne.z)];
+  }
+
   private tileVisible(tile: TileCoord, bounds: LatLngBounds, maxHeightMeters: number, frustum: Frustum = this.frustum): boolean {
     const sw = this.swScratch, ne = this.neScratch;
     this.projection.latLngToWorldInto(bounds.south, bounds.west, sw);
@@ -885,7 +894,7 @@ export default class WorldTileStreamer {
       this.loadedCityTiles.set(key, {
         mesh, slot, wallTile: result.wallTile, quantization: result.quantization, treeIndexStart: result.treeIndexStart, treeSize: result.treeSize,
       });
-      this.cityScene?.addTile(key, result.trace);
+      this.cityScene?.addTile(key, result.trace, this.tileRect(result.wallTile[0], result.wallTile[1]));
       // A tile ahead of the view whose buildings change nothing in it: the image goes on converging (the lightmap resets
       // the texels around it when it updates next, see CityScene). Else the accumulation of the image starts over
       if (!margin || this.reachesView(result.min, result.max)) this.cityTilesChanged = true;

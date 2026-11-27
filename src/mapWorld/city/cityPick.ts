@@ -1,4 +1,4 @@
-import { CITY_LEAF, CITY_RECORD_VEC4S, CITY_TREE } from './cityLayout';
+import { CITY_LEAF, CITY_RECORD_VEC4S, CITY_TREE, CITY_TREE_VEC4S } from './cityLayout';
 import type { CityTraceBlock } from './cityLayout';
 
 /*
@@ -60,10 +60,10 @@ function intersectBuilding(f: Float32Array, u: Uint32Array, r0: number, ro: numb
 }
 
 //the distance to the crown or trunk of the tree of record r0, Infinity when it misses. See hitsTree in skyVisibilityTrace.wgsl
-function intersectTree(f: Float32Array, u: Uint32Array, r0: number, ro: number[], rd: number[]): number {
-  const s = u[r0 * 4 + 2] * 4;
+function intersectTree(f: Float32Array, r0: number, ro: number[], rd: number[]): number {
+  const s = r0 * 4 + 4;
   const cx = f[s], cz = f[s + 1], ux = f[s + 2], uz = f[s + 3];
-  const crownBase = f[s + 4], k = f[s + 5];
+  const crownBase = f[r0 * 4 + 2], k = -f[r0 * 4 + 3];
   //the frame of the crown: x along u, z along u turned by 90 degrees, y stays
   const vx = -uz, vz = ux;
   const wx = ro[0] - cx, wz = ro[2] - cz;
@@ -86,6 +86,7 @@ export function intersectTraceBlock(block: CityTraceBlock, ro: number[], rd: num
   const u = block.words;
   const f = new Float32Array(u.buffer, u.byteOffset, u.length);
   const recordStart = block.nodeCount * 4;
+  const treeStart = recordStart + block.buildingCount * CITY_RECORD_VEC4S;
   const ix = inverse(rd[0]), iy = inverse(rd[1]), iz = inverse(rd[2]);
   let best = tMax;
   let bestRecord = -1;
@@ -104,10 +105,11 @@ export function intersectTraceBlock(block: CityTraceBlock, ro: number[], rd: num
       if (span.far < near || near >= best) continue;
       if (child >= CITY_LEAF) {
         const record = (child & ~CITY_LEAF) >>> 0;
-        const t = u[record * 4 + 3] === CITY_TREE ? intersectTree(f, u, record, ro, rd) : intersectBuilding(f, u, record, ro, rd);
+        const tree = u[record * 4 + 3] >= CITY_TREE;
+        const t = tree ? intersectTree(f, record, ro, rd) : intersectBuilding(f, u, record, ro, rd);
         if (t < best) {
           best = t;
-          bestRecord = (record - recordStart) / CITY_RECORD_VEC4S;
+          bestRecord = tree ? block.buildingCount + (record - treeStart) / CITY_TREE_VEC4S : (record - recordStart) / CITY_RECORD_VEC4S;
         }
       } else if (nearChild < 0) {
         nearChild = child;

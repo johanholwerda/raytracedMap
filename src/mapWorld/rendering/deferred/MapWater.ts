@@ -220,8 +220,9 @@ export default class MapWater {
   /**
    * Before the shading: the passes of the reflections, and their params into the shading.
    * @param rotate the traced pixel of the blocks rotates, for the TAA to average (in a static view only)
+   * @param lightmapReadable the lightmap has its buffers (SkyVisibilityLightmap.readable): what the rays hit can be lit by it
    */
-  public draw(frame: WaterFrame, camera: Camera, gBuffer: MapGBuffer, metersToNorm: number, rotate: boolean): void {
+  public draw(frame: WaterFrame, camera: Camera, gBuffer: MapGBuffer, metersToNorm: number, rotate: boolean, lightmapReadable: boolean): void {
     const { reflections, reflectBuildings, rippling } = frame;
     const rippleTile = rippling ? this.ripples.tileSize * metersToNorm : 0;
     // The rays of the buildings in the water: 1 per block of pixels, traced here for the shading to blend, or a ray per
@@ -231,17 +232,18 @@ export default class MapWater {
     const reflectionPass = reflections && reflectBuildings && blockX * blockY > 1 ? this.waterReflection : null;
     // the ground in them: its horizon over the water, which the rays are compared with
     if (reflections && reflectBuildings && this.reflectTerrainInWater) this.terrainHorizon.draw(camera, gBuffer, this.waterMaterials);
+    else this.terrainHorizon.release();
     // their colors, lit by the lightmap where they hit
     const reflectionType = this.reflectionType.value as ReflectionType;
     const reflectionColors = reflections && reflectBuildings && reflectionType !== ReflectionType.SolidColor;
-    const litReflections = reflectionType === ReflectionType.Lightmap;
+    const litReflections = reflectionColors && reflectionType === ReflectionType.Lightmap && lightmapReadable;
     this.deferred.setReflectionColors(reflectionColors, litReflections);
     if (reflectionPass) {
       reflectionPass.setBlock(blockX, blockY);
       reflectionPass.draw(camera, gBuffer, this.waterMaterials, rippleTile, rotate, reflectionColors, litReflections);
-    }
+    } else this.waterReflection.release();
     this.deferred.setWaterReflections(reflections ? this.waterMaterials : 0, reflectBuildings, this.reflectionDarkening.value, rippleTile,
-      this.sunReflection.value, this.sunReflectionPower.value, reflectionPass);
+      this.sunReflection.value, this.sunReflectionPower.value, this.waterReflection, reflectionPass != null);
   }
 
   destruct(): void {

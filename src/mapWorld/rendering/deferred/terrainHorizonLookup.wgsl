@@ -3,7 +3,8 @@
 // Needs terrainReflection.wgsl, the binding
 //   terrainHorizon : texture_2d<f32> (a: the horizon of the water pixel of the block, -1 where it isn't water. rgb: the
 //   shaded color of the ground it mirrors, linear, with a horizon above 0)
-// and the uniform reflectTerrainInWater (u32, 0: no ground above the water in reach, most places)
+// Only called with the override REFLECT_TERRAIN of the shading: without ground above the water in reach (most places)
+// its shader has none of this
 
 // the pixels of a block along x and y, and the one that has the horizon: mirrors WaterTerrainHorizon.ts
 const TERRAIN_HORIZON_BLOCK = 4;
@@ -24,7 +25,7 @@ struct TerrainReflection {
 // does, which on a hill is about the same color.
 // Without a water block around it (a creek, the last pixels at a shore) the pixel marches its own ray, without a color
 fn getTerrainReflection(coord : vec2<u32>, ro : vec3<f32>, rd : vec3<f32>) -> TerrainReflection {
-  if (uniforms.reflectTerrainInWater == 0u || rd.y <= 0.0) {
+  if (rd.y <= 0.0) {
     return TerrainReflection(false, vec4<f32>(0.0));
   }
   let last = vec2<i32>(textureDimensions(terrainHorizon)) - 1;

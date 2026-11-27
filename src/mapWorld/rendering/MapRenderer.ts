@@ -577,7 +577,7 @@ export default class MapRenderer {
       this.geometry.drawOverdraw(camera, city);
     } else if (renderMap) {
       lightmap.setResolveUniforms(camera, blur, metersToNorm, this.taa.enabled.value);
-      this.water.draw(plan.water, camera, this.gBuffer, metersToNorm, this.taa.enabled.value && plan.isStatic);
+      this.water.draw(plan.water, camera, this.gBuffer, metersToNorm, this.taa.enabled.value && plan.isStatic, lightmap.readable);
       if (lightmap.halfResActive) lightmap.halfResPass.draw(camera, this.gBuffer);
       this.deferred.setSSAO(this.ssao, plan.ssaoInShading);
       this.deferred.draw(camera, this.gBuffer, this.sceneColorRT, lightmap.halfResPass);

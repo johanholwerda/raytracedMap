@@ -5,7 +5,8 @@
 
 //the offset of a ray from the surface it starts on, about 2 cm (a world unit is about 900 m, see MapProjection)
 const MIN_DIST: f32 = 2e-5;
-//a child of a node that is a record, and the count of a tree record, see CityTraceBlock in cityLayout.ts
+//a child of a node that is a record, and the bit of the last word of r0 that a tree record has set (the sign of its
+//-k), see CityTraceBlock in cityLayout.ts
 const CITY_LEAF = 0x80000000u;
 const CITY_TREE = 0x80000000u;
 //the top level BVH (the tiles) and the BVH of a tile (a dense one is about 16 deep) on 1 stack. Only 32 is safe (the
@@ -16,10 +17,15 @@ const CITY_TREE = 0x80000000u;
 #ifndef CITY_STACK_SIZE
 #define CITY_STACK_SIZE 16
 #endif
-//the changes of CityScene: after the top level BVH (TLAS_NODES_MAX nodes of 4 vec4s), 2 vec4s each
-const CITY_CHANGE_START = 4096u;
+//the grid of the tiles of CityScene (see writeGrid there): after the top level BVH (TLAS_NODES_MAX nodes of 4 vec4s).
+//2 header vec4s, then 2 per cell
+const CITY_GRID_START = 4096u;
+//the changes of CityScene: after the grid (GRID_VEC4S), 2 vec4s each
+const CITY_CHANGE_START = 6146u;
+//no node: a ray that can't hit anything, see getCityStart
+const CITY_NONE = 0xFFFFFFFFu;
 
-//the nodes, records, edges and tree shapes (see CityTraceBlock) are in cityBuffer: array<vec4<f32>>, which the including shader
+//the nodes, records and edges (see CityTraceBlock) are in cityBuffer: array<vec4<f32>>, which the including shader
 //declares at a binding of its own (updateSkyVisibilityLightmap.wgsl, deferredShading.wgsl)
 
 //large instead of infinite for axis aligned rays, so a ray in the plane of a box side gives no NaN
@@ -94,21 +100,18 @@ whether the ray hits a tree: its trunk or its crown, 2 square boxes around the s
 angle (see TraceTree in cityLayout.ts). In the frame of the crown, where it is [-1, 1] in x and z (the trunk [-k, k]) and
 y stays: the distances along the ray are the same as in the world. Like hitsBuilding a ray that leaves a box from its
 side or top, or misses it, doesn't hit it: the distance where it leaves has to be over MIN_DIST.
-r0: the tree record (base, top, shapeStart, CITY_TREE)
+r0, r1: the tree record (base, top, crown base, -k), (center.xz, u.xz)
  */
-fn hitsTree(ro: vec3<f32>, rd: vec3<f32>, r0: vec4<f32>) -> bool {
-	let shape = bitcast<u32>(r0.z);
-	let s0 = cityBuffer[shape];
-	let s1 = cityBuffer[shape + 1u];
-	let u = s0.zw;
+fn hitsTree(ro: vec3<f32>, rd: vec3<f32>, r0: vec4<f32>, r1: vec4<f32>) -> bool {
+	let u = r1.zw;
 	let v = vec2(-u.y, u.x);
-	let w = ro.xz - s0.xy;
+	let w = ro.xz - r1.xy;
 	let p = vec3(dot(w, u), ro.y, dot(w, v));
 	let d = vec3(dot(rd.xz, u), rd.y, dot(rd.xz, v));
 	let invD = getInverseDirection(d);
 	let pInvD = p * invD;
-	let crownBase = s1.x;
-	let k = s1.y;
+	let crownBase = r0.z;
+	let k = -r0.w;
 	let crown = intersectAABB(pInvD, invD, vec3(-1., crownBase, -1.), vec3(1., r0.y, 1.));
 	let trunk = intersectAABB(pInvD, invD, vec3(-k, r0.x, -k), vec3(k, crownBase, k));
 	return (crown.y > MIN_DIST && crown.x <= crown.y) || (trunk.y > MIN_DIST && trunk.x <= trunk.y);
@@ -117,10 +120,35 @@ fn hitsTree(ro: vec3<f32>, rd: vec3<f32>, r0: vec4<f32>) -> bool {
 //whether the ray hits the building or tree of a record
 fn hitsRecord(ro: vec3<f32>, rd: vec3<f32>, record: u32) -> bool {
 	let r0 = cityBuffer[record];
-	if(bitcast<u32>(r0.w) == CITY_TREE){
-		return hitsTree(ro, rd, r0);
+	if(bitcast<u32>(r0.w) >= CITY_TREE){
+		return hitsTree(ro, rd, r0, cityBuffer[record + 1u]);
 	}
 	return hitsBuilding(ro, rd, r0);
+}
+
+//The node a ray from ro along rd starts at (invRd: getInverseDirection): the root of the top level BVH, or the root of
+//the BVH of 1 tile for a ray that can only hit its buildings, CITY_NONE where that is no tile. That is a ray that goes
+//up and is above the highest building of the city before it leaves the part of the cell of the grid (the map tile it
+//starts over) that no other tile reaches into, see CityScene.writeGrid. It saves those rays the top level BVH: 85% of
+//the water reflection rays of a view over the IJ in Amsterdam (17 tiles, the highest building 120 m), which made the
+//shading with a ray per water pixel .1 ms faster at 4K (1.31 to 1.23 ms). The trace pass of the lightmap, whose paths go
+//all ways over the hemisphere, took as long with it as without
+fn getCityStart(ro: vec3<f32>, rd: vec3<f32>, invRd: vec3<f32>) -> u32 {
+	let h0 = cityBuffer[CITY_GRID_START];
+	let h1 = cityBuffer[CITY_GRID_START + 1u];
+	let size = vec2<i32>(bitcast<vec2<u32>>(h1.xy));
+	let cell = vec2<i32>(floor((ro.xz - h0.xy) * h0.zw));
+	if(rd.y <= 0. || any(cell < vec2(0)) || any(cell >= size)){
+		return uniforms.cityRoot;
+	}
+	let index = CITY_GRID_START + 2u + u32(cell.y * size.x + cell.x) * 2u;
+	let alone = cityBuffer[index];
+	//where the ray is above the highest building
+	let end = ro.xz + rd.xz * (max(h1.z - ro.y, 0.) * invRd.y);
+	if(any(min(ro.xz, end) < alone.xy) || any(max(ro.xz, end) > alone.zw)){
+		return uniforms.cityRoot;
+	}
+	return bitcast<u32>(cityBuffer[index + 1u].x);
 }
 
 //whether the ray hits a building or tree, through the BVH of the tiles and of the buildings in a tile (see CityScene). Any hit
@@ -134,7 +162,10 @@ fn isOccluded(ro: vec3<f32>, rd: vec3<f32>) -> bool {
 	let roInvRd = ro * invRd;
 	var stack: array<u32, CITY_STACK_SIZE>;
 	var stackSize = 0u;
-	var node = uniforms.cityRoot;
+	var node = getCityStart(ro, rd, invRd);
+	if(node == CITY_NONE){
+		return false;
+	}
 	loop {
 		let n0 = cityBuffer[node];
 		let n1 = cityBuffer[node + 1u];
