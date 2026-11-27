@@ -39,12 +39,15 @@ export default class UncappedFrames {
     UncappedFrames.nativeRequest = window.requestAnimationFrame.bind(window);
     UncappedFrames.nativeCancel = window.cancelAnimationFrame.bind(window);
 
-    const requestDevice = GPUAdapter.prototype.requestDevice;
-    GPUAdapter.prototype.requestDevice = async function (this: GPUAdapter, descriptor?: GPUDeviceDescriptor) {
-      const device = await requestDevice.call(this, descriptor);
-      UncappedFrames.device = device;
-      return device;
-    };
+    //without WebGPU (e.g. Firefox Android) GPUAdapter doesn't exist; the renderer then shows its "not supported" message
+    if (typeof GPUAdapter !== 'undefined') {
+      const requestDevice = GPUAdapter.prototype.requestDevice;
+      GPUAdapter.prototype.requestDevice = async function (this: GPUAdapter, descriptor?: GPUDeviceDescriptor) {
+        const device = await requestDevice.call(this, descriptor);
+        UncappedFrames.device = device;
+        return device;
+      };
+    }
 
     //a macrotask, so input, timers and rendering still get a turn between frames
     UncappedFrames.channel = new MessageChannel();

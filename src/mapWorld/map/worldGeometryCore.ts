@@ -631,9 +631,10 @@ export function buildBuildings(
 
       const { base, top } = buildingHeights(p, tile, i);
 
-      readRings(f, features.rings);
-      classifyPolygons(features.rings);
-      for (let poly = 0; poly < features.rings.polyCount; poly++) {
+      const rings = features.rings;
+      readRings(f, rings);
+      classifyPolygons(rings);
+      for (let poly = 0; poly < rings.polyCount; poly++) {
         if (!features.polygonToMap(poly, extent)) continue;
         const flat = features.polygon;
         // the points in the scratch of the polygon, its first `length` numbers (no view of them: an object each)
@@ -652,7 +653,21 @@ export function buildBuildings(
         // out of the scratch of the polygon, at its size
         const ringEnds = ringStarts.slice(1);
         ringEnds.push(length / 2);
-        parts.push({ coords: view.slice(0, length), holes: flat.holes.slice(), ringStarts: ringStarts.slice(), ringEnds, area, base, top });
+        const coords = view.slice(0, length);
+        // the outer ring the ground is found under: past the edge of the tile as far as the data has it (its buffer),
+        // so the pieces of a building the edge cuts stand on the same ground in both tiles, see partGrounds
+        let groundRing = coords.subarray(0, ringEnds[0] * 2);
+        if (terrain) {
+          const r = rings.polyRings[rings.polyStarts[poly]], from = rings.ringStart(r) * 2, n = rings.ringLength(r);
+          const pts = rings.points;
+          let crosses = false;
+          for (let k = from; k < from + n * 2 && !crosses; k++) crosses = pts[k] < 0 || pts[k] > extent;
+          if (crosses) {
+            groundRing = new Float64Array(n * 2);
+            features.projector.project(pts, from, n, extent, groundRing, 0);
+          }
+        }
+        parts.push({ coords, holes: flat.holes.slice(), ringStarts: ringStarts.slice(), ringEnds, area, base, top, groundRing });
       }
     }
 
@@ -986,11 +1001,12 @@ function buildingHeights(p: Props, tile: TileCoord, index: number): { base: numb
 /**
  * The ground (world units) under each building part: the lowest under its footprint, so no wall stops above the slope.
  * A part over the ground (render_min_height > 0, the upper part of a tower) stands on the ground of the part on the ground
- * around its center, so the parts of a building stack without a step. Without one, its own.
+ * around its center, so the parts of a building stack without a step. Without one, its own. The footprints here are the
+ * ground rings, not clipped to the tile: the 2 tiles of a building on their edge find the same ground for it.
  */
 function partGrounds(parts: BuildingPart[], terrain: TerrainGrid): Float64Array {
   const own = new Float64Array(parts.length);
-  parts.forEach((p, i) => own[i] = terrain.minHeight(p.coords, p.ringStarts[0], p.ringEnds[0]));
+  parts.forEach((p, i) => own[i] = terrain.minHeight(p.groundRing, 0, p.groundRing.length / 2));
   if (parts.every((p) => p.base <= 0)) return own;
 
   // the parts on the ground in a grid of buckets over the tile, by their boxes
@@ -1001,8 +1017,8 @@ function partGrounds(parts: BuildingPart[], terrain: TerrainGrid): Float64Array 
   const boxes = new Float64Array(parts.length * 4);
   parts.forEach((p, i) => {
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-    for (let k = p.ringStarts[0]; k < p.ringEnds[0]; k++) {
-      const x = p.coords[k * 2], y = p.coords[k * 2 + 1];
+    for (let k = 0; k < p.groundRing.length; k += 2) {
+      const x = p.groundRing[k], y = p.groundRing[k + 1];
       x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y);
     }
     boxes[i * 4] = x0; boxes[i * 4 + 1] = y0; boxes[i * 4 + 2] = x1; boxes[i * 4 + 3] = y1;
@@ -1013,13 +1029,13 @@ function partGrounds(parts: BuildingPart[], terrain: TerrainGrid): Float64Array 
   const grounds = Float64Array.from(own);
   parts.forEach((p, i) => {
     if (p.base <= 0) return;
-    const s = p.ringStarts[0], e = p.ringEnds[0];
+    const ring = p.groundRing, count = ring.length / 2;
     let cx = 0, cy = 0;
-    for (let k = s; k < e; k++) { cx += p.coords[k * 2]; cy += p.coords[k * 2 + 1]; }
-    cx /= e - s; cy /= e - s;
+    for (let k = 0; k < count; k++) { cx += ring[k * 2]; cy += ring[k * 2 + 1]; }
+    cx /= count; cy /= count;
     for (const q of buckets[by(cy) * B + bx(cx)]) {
       if (cx < boxes[q * 4] || cx > boxes[q * 4 + 2] || cy < boxes[q * 4 + 1] || cy > boxes[q * 4 + 3]) continue;
-      if (!insideRing(parts[q].coords, parts[q].ringStarts[0], parts[q].ringEnds[0], cx, cy)) continue;
+      if (!insideRing(parts[q].groundRing, 0, parts[q].groundRing.length / 2, cx, cy)) continue;
       grounds[i] = own[q];
       break;
     }
@@ -1027,9 +1043,14 @@ function partGrounds(parts: BuildingPart[], terrain: TerrainGrid): Float64Array 
   return grounds;
 }
 
-/** A building polygon before mergeCoincidentParts: map coords (rings normalised), base and top in meters. */
+/**
+ * A building polygon before mergeCoincidentParts: map coords (rings normalised), base and top in meters. groundRing: the
+ * outer ring the ground under it is found under (see partGrounds), x and north per point: the outer ring of coords, or
+ * where the data's ring crosses the edge of the tile that ring unclipped (any winding).
+ */
 type BuildingPart = {
   coords: Float64Array; holes: number[]; ringStarts: number[]; ringEnds: number[]; area: number; base: number; top: number;
+  groundRing: Float64Array;
 };
 
 // Height ranges this close (m) touch, see mergeCoincidentParts
