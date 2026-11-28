@@ -77,7 +77,9 @@ export default function remoteDebugPlugin() {
 
         if (route === '/clients') {
           const now = Date.now();
-          return json(res, 200, [...clients.values()].map((c) => ({ ...c, secondsAgo: (now - c.lastSeen) / 1000 })));
+          // the pages of the last minute: every reload is a new client
+          return json(res, 200, [...clients.values()].filter((c) => now - c.lastSeen < 60000)
+            .map((c) => ({ ...c, secondsAgo: (now - c.lastSeen) / 1000 })));
         }
         if (route === '/log') {
           const since = parseInt(url.searchParams.get('since') ?? '0') || 0;

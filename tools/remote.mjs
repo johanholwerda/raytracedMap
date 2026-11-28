@@ -8,6 +8,7 @@
  *   node tools/remote.mjs eval "return 1+1"       run the body of an async function on the page, print the result
  *   node tools/remote.mjs eval -f script.js       the same from a file
  *   node tools/remote.mjs clear                   empty the log
+ *   node tools/remote.mjs screenshot out.jpg      the next frame of the canvas (through the P key screenshot of MapWorld)
  *
  * Options: --ua iPhone (the most recent page whose user agent has it; default the most recent page), --timeout 60,
  * --port 5173.
@@ -51,6 +52,34 @@ if (command === 'clients') {
   }
 } else if (command === 'clear') {
   console.log(JSON.stringify(await get('/clear')));
+} else if (command === 'screenshot') {
+  // MapWorld saves the canvas right after the frame's submit (a WebGPU canvas is empty in a later task): its toBlob
+  // hands over a JPEG instead of a download
+  const code = `const mw = window.__mapWorld; const canvas = mw.renderer.canvas;
+    return await new Promise((resolve, reject) => {
+      const original = HTMLCanvasElement.prototype.toBlob;
+      canvas.toBlob = () => {
+        delete canvas.toBlob;
+        original.call(canvas, (blob) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.readAsDataURL(blob);
+        }, 'image/jpeg', .85);
+      };
+      mw.screenshotRequested = true;
+      mw.mapRenderer.markDirty();
+      setTimeout(() => { delete canvas.toBlob; reject(new Error('no frame in 10 s')); }, 10000);
+    });`;
+  const res = await fetch(`${base}/eval?ua=${encodeURIComponent(ua)}&timeout=${timeout}`, { method: 'POST', body: code });
+  const reply = await res.json();
+  if (reply.error) {
+    console.error(`[${reply.client ?? '-'}] error: ${reply.error}`);
+    process.exitCode = 1;
+  } else {
+    const out = rest[0] ?? 'screenshot.jpg';
+    fs.writeFileSync(out, Buffer.from(reply.result.split(',')[1], 'base64'));
+    console.log(`[${reply.client}] ${out}`);
+  }
 } else if (command === 'eval') {
   const code = file ? fs.readFileSync(file, 'utf8') : rest.join(' ');
   const res = await fetch(`${base}/eval?ua=${encodeURIComponent(ua)}&timeout=${timeout}`, { method: 'POST', body: code });
@@ -62,5 +91,5 @@ if (command === 'clients') {
     console.log(typeof reply.result === 'string' ? reply.result : JSON.stringify(reply.result, null, 2));
   }
 } else {
-  console.log('commands: clients | log [since] | tail | clear | eval <code> | eval -f <file>   options: --ua --timeout --port');
+  console.log('commands: clients | log [since] | tail | clear | screenshot <out.jpg> | eval <code> | eval -f <file>   options: --ua --timeout --port');
 }
