@@ -158,7 +158,7 @@ export default class MapWorld {
       (window as any).__mapWorld = this;
     }
     // for video/tileLatency.mjs, which reads the timings and moves the camera
-    if (urlParams.has('tileTimings')) (window as any).__mapWorld = this;
+    if (urlParams.has('tileTimings') || urlParams.has('remote')) (window as any).__mapWorld = this;
     if (urlParams.has('video')) this.video = this.createVideo();
     this.renderer.setClearColor(0, 0, 0, 1);
 

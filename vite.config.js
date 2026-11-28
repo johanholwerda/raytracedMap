@@ -1,6 +1,7 @@
 import {defineConfig} from 'vite';
 import path from 'path';
 import mkcert from 'vite-plugin-mkcert';
+import remoteDebug from './tools/remoteDebugPlugin.js';
 
 export default defineConfig({
     base: './',
@@ -17,6 +18,8 @@ export default defineConfig({
     },
     server: {
         https: true,
+        // tools/remoteDebugPlugin.js through a cloudflared quick tunnel
+        allowedHosts: ['.trycloudflare.com'],
     },
-    plugins: [mkcert()],
+    plugins: [mkcert(), remoteDebug()],
 });

@@ -83,14 +83,14 @@ export default class SunShadows {
     material.setBuffer('shadowMapData', this.shadowMap.shadowMapDataBuffer);
   }
 
-  /** The sun and shadow params into pgShading; they go to the materials by name. */
-  public initParams(pgShading: ParamGroup, materials: VertexFragmentShader[], onChange: () => void): void {
+  /** The sun angles into sunAndSky, the shadow params into pgShading; they go to the materials by name. */
+  public initParams(pgShading: ParamGroup, sunAndSky: ParamGroup, materials: VertexFragmentShader[], onChange: () => void): void {
     this.materials = materials;
     this.onChange = onChange;
     const params = { materials, callback: onChange };
     const sunParams = { callback: () => this.updateLightDirection() };
-    this.sunAngleX = pgShading.addParamFloat('sunAngleX', 1, -0.05, Math.PI * .5, sunParams);
-    this.sunAngleY = pgShading.addParamFloat('sunAngleY', .5, -Math.PI, Math.PI, sunParams);
+    this.sunAngleX = sunAndSky.addParamFloat('sunAngleX', 1, -0.05, Math.PI * .5, sunParams);
+    this.sunAngleY = sunAndSky.addParamFloat('sunAngleY', .5, -Math.PI, Math.PI, sunParams);
     this.updateLightDirection();
 
     this.mode = pgShading.addParamSelect('shadowMode', ShadowMode.ShadowMap, SHADOW_MODES, { callback: onChange });
