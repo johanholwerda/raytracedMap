@@ -282,7 +282,7 @@ export default class MapRenderer {
     // the sun in the sky (deferred only, the forward pass clears to the background color)
     sunAndSky.addParamFloat('sunSize', .02, 0, .1, params);
     sunAndSky.addParamFloat('sunGlow', .4, 0, 1, params);
-    this.sun.initParams(pgShading, this.shadingMaterials, setDirty);
+    this.sun.initParams(pgShading, sunAndSky, this.shadingMaterials, setDirty);
   }
 
   /** The groups of the passes, after the shading params. */
