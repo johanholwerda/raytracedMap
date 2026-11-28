@@ -2,6 +2,10 @@ import WebGPUPreLoader from 'webGPU-framework/renderer/core/WebGPUPreLoader';
 import UncappedFrames from 'webGPU-framework/utils/UncappedFrames';
 import MapWorld from './mapWorld/MapWorld';
 import './main.css';
+import { installRemoteDebug } from './mapWorld/debug/RemoteDebug';
+
+// ?remote on the dev server: console, errors and timings to tools/remote.mjs (before anything asks for the GPU)
+installRemoteDebug();
 
 // Always installed, so the profile checkbox next to the fps counter can untie the frames from vsync; ?uncapped starts with it on.
 UncappedFrames.install(new URLSearchParams(window.location.search).has('uncapped'));
