@@ -114,6 +114,80 @@ const PACKED_SUN_RAYS_MAX = 16u;
 //and the odd frames, and in 6 the ones of them whose texel has less than convergedPaths paths. 7 is unused
 @group(0) @binding(13) var<storage, read_write> traceArgs : array<atomic<u32>, 8>;
 
+/*
+The compare exchanges of the word at index of tileBuffer, lightingBuffer and claimBuffer (no pointer parameters: core
+WGSL only takes them to function and private memory). Without HAS_ATOMIC_CAS (WebKit of iOS 27.2, see Renderer) an
+atomicMax toward a larger value, an atomicMin toward a smaller one. Exact when the word is compare (it becomes value) or
+outside compare..value (it stays). Only a word that another thread changed to between the 2 (since the caller loaded
+compare) is overwritten: the value goes in over that update, and it counts as exchanged. So at worst a sample is lost
+or 2 tiles race for 1 slot in a frame, never a hang: a spinlock on atomicExchange lost the device on an iPhone
+ */
+struct CasResult {
+	old_value : u32,
+	exchanged : bool,
+}
+
+fn emulatedCasResult(old: u32, compare: u32, value: u32) -> CasResult {
+	return CasResult(old, old == compare || (old > min(compare, value) && old < max(compare, value)));
+}
+
+fn casTile(index: u32, compare: u32, value: u32) -> CasResult {
+#ifdef HAS_ATOMIC_CAS
+	let r = atomicCompareExchangeWeak(&tileBuffer[index], compare, value);
+	return CasResult(r.old_value, r.exchanged);
+#else
+	if(value == compare){
+		let old = atomicLoad(&tileBuffer[index]);
+		return CasResult(old, old == compare);
+	}
+	var old : u32;
+	if(value > compare){
+		old = atomicMax(&tileBuffer[index], value);
+	} else {
+		old = atomicMin(&tileBuffer[index], value);
+	}
+	return emulatedCasResult(old, compare, value);
+#endif
+}
+
+fn casLighting(index: u32, compare: u32, value: u32) -> CasResult {
+#ifdef HAS_ATOMIC_CAS
+	let r = atomicCompareExchangeWeak(&lightingBuffer[index], compare, value);
+	return CasResult(r.old_value, r.exchanged);
+#else
+	if(value == compare){
+		let old = atomicLoad(&lightingBuffer[index]);
+		return CasResult(old, old == compare);
+	}
+	var old : u32;
+	if(value > compare){
+		old = atomicMax(&lightingBuffer[index], value);
+	} else {
+		old = atomicMin(&lightingBuffer[index], value);
+	}
+	return emulatedCasResult(old, compare, value);
+#endif
+}
+
+fn casClaim(index: u32, compare: u32, value: u32) -> CasResult {
+#ifdef HAS_ATOMIC_CAS
+	let r = atomicCompareExchangeWeak(&claimBuffer[index], compare, value);
+	return CasResult(r.old_value, r.exchanged);
+#else
+	if(value == compare){
+		let old = atomicLoad(&claimBuffer[index]);
+		return CasResult(old, old == compare);
+	}
+	var old : u32;
+	if(value > compare){
+		old = atomicMax(&claimBuffer[index], value);
+	} else {
+		old = atomicMin(&claimBuffer[index], value);
+	}
+	return emulatedCasResult(old, compare, value);
+#endif
+}
+
 //whether a ray from p to a point on the disc of the sun can pass through a box: the buildings in it can be in front of
 //the sun there. The box as wide as the disc at the farthest such a ray can enter it, under its top
 fn sunPassesBox(p: vec3<f32>, boxMin: vec3<f32>, boxMax: vec3<f32>) -> bool {
@@ -216,7 +290,7 @@ fn findOrInsert(surface: u32, level: u32, tile: vec2<u32>, stamp: u32) -> u32 {
 
 	if(evictIndex != TILE_NONE){
 		for(var j = 0u; j < 4u; j++){
-			let cmp = atomicCompareExchangeWeak(&tileBuffer[evictIndex], evictKey, key);
+			let cmp = casTile(evictIndex, evictKey, key);
 			if(cmp.exchanged){
 				markUsed(evictIndex, stamp);
 				let start = evictIndex * TILE_SIZE * TILE_SIZE;
@@ -239,7 +313,7 @@ fn findOrInsert(surface: u32, level: u32, tile: vec2<u32>, stamp: u32) -> u32 {
 	}
 
 	for(; i < uniforms.searchCount; i++){
-		let cmp = atomicCompareExchangeWeak(&tileBuffer[index], 0u, key);
+		let cmp = casTile(index, 0u, key);
 		if(cmp.exchanged){
 			atomicAdd(&tileCount, 1u);
 		}
@@ -326,7 +400,7 @@ fn addTexelSample(index: u32, visibility: f32, weight: f32, prior: vec2<f32>, co
 			texel = vec2(prior.x, min(prior.y, uniforms.seedCount));
 		}
 		texel = vec2(mix(texel.x, visibility, weight / (texel.y + weight)), min(texel.y + weight, countMax));
-		let cmp = atomicCompareExchangeWeak(texelWord, old, pack2x16float(texel));
+		let cmp = casLighting(index, old, pack2x16float(texel));
 		if(cmp.exchanged){
 			result = texel;
 			break;
@@ -561,7 +635,7 @@ fn setTexelStale(index: u32) -> bool {
 		if(v.y <= STALE_COUNT){
 			return false;
 		}
-		let cmp = atomicCompareExchangeWeak(texelWord, old, pack2x16float(vec2(v.x, STALE_COUNT)));
+		let cmp = casLighting(index, old, pack2x16float(vec2(v.x, STALE_COUNT)));
 		if(cmp.exchanged){
 			return true;
 		}
@@ -611,7 +685,7 @@ fn setPackedTexelStale(index: u32, sky: bool, sun: bool) -> bool {
 		if(stale == old){
 			return false;
 		}
-		let cmp = atomicCompareExchangeWeak(texelWord, old, stale);
+		let cmp = casLighting(index, old, stale);
 		if(cmp.exchanged){
 			return true;
 		}
@@ -718,7 +792,7 @@ fn addPackedBatch(indices: array<u32, ANCESTOR_LEVELS_MAX + 1u>, levels: u32, ba
 			if(all(next == texel)){
 				break;
 			}
-			let cmp = atomicCompareExchangeWeak(texelWord, old, packTexelRays(next));
+			let cmp = casLighting(index, old, packTexelRays(next));
 			if(cmp.exchanged){
 				texel = next;
 				break;
@@ -797,7 +871,7 @@ fn claim_main(@builtin(global_invocation_id) GlobalInvocationID : vec3<u32>) {
 			let ancestorClaim = &claimBuffer[indices[i]];
 			let ancestorOld = atomicLoad(ancestorClaim);
 			if((ancestorOld >> CLAIM_FRAME_SHIFT) != (stamp >> CLAIM_FRAME_SHIFT)){
-				atomicCompareExchangeWeak(ancestorClaim, ancestorOld, stamp);
+				casClaim(indices[i], ancestorOld, stamp);
 			}
 		}
 	}
@@ -809,7 +883,7 @@ fn claim_main(@builtin(global_invocation_id) GlobalInvocationID : vec3<u32>) {
 		if((old >> CLAIM_FRAME_SHIFT) == (key >> CLAIM_FRAME_SHIFT) && old >= key){
 			return;
 		}
-		let cmp = atomicCompareExchangeWeak(claim, old, key);
+		let cmp = casClaim(texelIndex, old, key);
 		if(cmp.exchanged){
 			return;
 		}

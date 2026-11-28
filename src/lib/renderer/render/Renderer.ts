@@ -163,6 +163,9 @@ export default class Renderer {
   //HAS_SUBGROUPS: the device has the "subgroups" feature, so "enable subgroups;" compiles
   //HAS_SUBGROUP_ID: also the subgroup_id and num_subgroups builtins (WGSL language feature subgroup_id, Chrome 144).
   //  the shader then needs "requires subgroup_id;" as well
+  //HAS_ATOMIC_CAS: atomicCompareExchangeWeak compiles. Not on WebKit of iOS 27.2: its Metal for it has
+  //  __atomic_compare_exchange_result<decltype(compare)>, which Metal takes as "thread uint", and a field may not have
+  //  an address space. ?emulateCas leaves it out, to test the emulation on desktop
   public readonly shaderDefines: Map<string, boolean> = new Map();
 
   public init = async (canvasParent: HTMLElement, options: Partial<RendererOptions> = {}) => {
@@ -228,6 +231,8 @@ export default class Renderer {
     const hasSubgroups = this.device.features.has('subgroups');
     this.shaderDefines.set('HAS_SUBGROUPS', hasSubgroups);
     this.shaderDefines.set('HAS_SUBGROUP_ID', hasSubgroups && navigator.gpu.wgslLanguageFeatures.has('subgroup_id'));
+    const emulateCas = typeof location !== 'undefined' && new URLSearchParams(location.search).has('emulateCas');
+    this.shaderDefines.set('HAS_ATOMIC_CAS', !emulateCas && await this.compilesAtomicCompareExchange());
     LogGL.log('Renderer: shaderDefines', Object.fromEntries(this.shaderDefines));
 
     //@ts-ignore
@@ -834,6 +839,25 @@ export default class Renderer {
   }
 
   //when the requested limit is higher than the supported limit: the supported limit is used
+  //whether a compute pipeline with atomicCompareExchangeWeak compiles, see HAS_ATOMIC_CAS of shaderDefines
+  private async compilesAtomicCompareExchange(): Promise<boolean> {
+    this.device.pushErrorScope('validation');
+    let compiles = true;
+    try {
+      const module = this.device.createShaderModule({
+        label: 'atomicCompareExchangeTest',
+        code: `@group(0) @binding(0) var<storage, read_write> b: array<atomic<u32>>;
+          @compute @workgroup_size(1) fn main() { let r = atomicCompareExchangeWeak(&b[0], 0u, 1u); if (r.exchanged) { atomicAdd(&b[1], 1u); } }`,
+      });
+      await this.device.createComputePipelineAsync({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+    } catch (e) {
+      compiles = false;
+    }
+    if (await this.device.popErrorScope()) compiles = false;
+    if (!compiles) LogGL.log('Renderer: atomicCompareExchangeWeak does not compile, the shaders emulate it');
+    return compiles;
+  }
+
   private checkRequiredLimitsAgainstAdapterLimits(adapter: GPUAdapter, requiredLimits: Record<string, GPUSize64>) {
     const adapterLimits = adapter.limits;
 
